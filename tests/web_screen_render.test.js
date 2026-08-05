@@ -291,6 +291,32 @@ test("features list renders from the routed URL", { skip: SKIP }, async () => {
   }
 });
 
+test("Goals cold-load hydrates Reporter and Assignee filters before rendering", { skip: SKIP }, async () => {
+  const requests = [];
+  const app = await openApp({
+    onRequest(pathname) {
+      requests.push(pathname);
+    },
+  });
+  try {
+    await assertScreenRenders(app, {
+      route: "#/goals",
+      marker: '[data-testid="goals-table"]',
+    });
+    assert.ok(requests.includes("/api/reporters"));
+    assert.deepEqual(
+      await app.page.locator('[data-testid="goals-reporter-filter"] option').allTextContents(),
+      ["all reporters", "Reporter"],
+    );
+    assert.deepEqual(
+      await app.page.locator('[data-testid="goals-assignee-filter"] option').allTextContents(),
+      ["all assignees", "Reporter"],
+    );
+  } finally {
+    await app.close();
+  }
+});
+
 test("feature detail renders from the routed URL", { skip: SKIP }, async () => {
   const app = await openApp();
   try {
@@ -380,6 +406,42 @@ test("a toolbar Agent's morphed Start button dispatches Stop", { skip: SKIP }, a
         ["POST", "/api/terminal/browser-agent-session/stop"],
       ],
     );
+    assert.deepEqual(app.pageErrors, []);
+  } finally {
+    await app.close();
+  }
+});
+
+test("Agent terminal renders transported ANSI control sequences through xterm", { skip: SKIP }, async () => {
+  const app = await openApp();
+  try {
+    await assertScreenRenders(app, { route: "#/", marker: "#dash" });
+    const rendered = await app.page.evaluate(async () => {
+      chatState.tabs = {
+        agent: normalizeInteractiveTerminalTab({
+          goalId: null,
+          label: "Agent",
+          mode: "agent",
+          sessionId: null,
+        }),
+      };
+      chatState.activeTabId = "agent";
+      chatState.open = true;
+      chatState.bodyHeight = 420;
+      drawToolbar();
+      const terminal = terminalStateFor("agent");
+      terminalReceiveOutput("\\u001b[31mANSI-RED\\u001b[0m plain", terminal);
+      await new Promise((resolve) => terminal.term.write("", resolve));
+      const rows = document.querySelector(".terminal-output .xterm-rows");
+      return {
+        text: rows?.textContent || "",
+        html: rows?.innerHTML || "",
+      };
+    });
+
+    assert.match(rendered.text, /ANSI-RED plain/);
+    assert.doesNotMatch(rendered.text, /(?:\\u001b|\[31m|\[0m)/);
+    assert.match(rendered.html, /color:\s*#b91c1c|color:\s*rgb\(185,\s*28,\s*28\)/i);
     assert.deepEqual(app.pageErrors, []);
   } finally {
     await app.close();

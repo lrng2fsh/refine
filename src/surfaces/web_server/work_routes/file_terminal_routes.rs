@@ -97,27 +97,34 @@ impl InProcessWebServer {
                 "unknown terminal profile {profile}"
             )));
         }
+        let goal_id = body
+            .get("goal_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         if profile == "goal" {
-            let Some(goal_id) = body
-                .get("goal_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
+            let Some(goal_id) = goal_id.as_deref() else {
                 return error_response(RefineError::InvalidInput(
                     "goal_id is required to open a Goal Agent".to_string(),
                 ));
             };
-            return match find_goal_agent_session(&runtime_root, goal_id).and_then(|snapshot| {
-                serde_json::to_value(snapshot).map_err(|error| {
-                    RefineError::Serialization(format!(
-                        "failed to encode Goal Agent session: {error}"
-                    ))
-                })
-            }) {
-                Ok(value) => ApiResponse::json(200, value),
-                Err(error) => error_response(error),
-            };
+            match find_goal_agent_session(&runtime_root, goal_id) {
+                Ok(snapshot) => {
+                    return match serde_json::to_value(snapshot) {
+                        Ok(value) => ApiResponse::json(200, value),
+                        Err(error) => error_response(RefineError::Serialization(format!(
+                            "failed to encode Goal Agent session: {error}"
+                        ))),
+                    };
+                }
+                // No workflow-owned session is attachable. Continue into the
+                // context-only diagnostic profile regardless of the Goal's
+                // lifecycle label; its metadata deliberately carries
+                // `attached_goal_id`, never workflow ownership.
+                Err(RefineError::NotFound(_)) => {}
+                Err(error) => return error_response(error),
+            }
         }
 
         let refine_dir = match self.current_refine_dir() {
@@ -125,12 +132,6 @@ impl InProcessWebServer {
             Ok(None) => return target_root_unavailable("start managed terminal sessions"),
             Err(error) => return error_response(error),
         };
-        let goal_id = body
-            .get("goal_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
         let feature_id = body
             .get("feature_id")
             .and_then(Value::as_str)
@@ -147,7 +148,15 @@ impl InProcessWebServer {
         let mut metadata = serde_json::Map::new();
         metadata.insert("profile".to_string(), json!(&profile));
         if let Some(goal_id) = &goal_id {
-            metadata.insert("goal_id".to_string(), json!(goal_id));
+            let key = if profile == "goal" {
+                // This association is context only. Workflow process control
+                // must not treat stopping a diagnostic session as Goal
+                // cancellation or requeue authority.
+                "attached_goal_id"
+            } else {
+                "goal_id"
+            };
+            metadata.insert(key.to_string(), json!(goal_id));
         }
         if let Some(feature_id) = &feature_id {
             metadata.insert("feature_id".to_string(), json!(feature_id));
