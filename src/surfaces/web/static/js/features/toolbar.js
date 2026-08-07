@@ -1554,6 +1554,43 @@ function handleTerminalClipboardKeydown(e, terminal = terminalStateFor()) {
   return true;
 }
 
+function handleTerminalNewlineKeydown(e, terminal = terminalStateFor()) {
+  if (!terminal?.sessionId || terminal.exited) return false;
+  if (e.type && e.type !== "keydown") return false;
+  if (
+    e.key !== "Enter"
+    || !e.ctrlKey
+    || e.altKey
+    || e.metaKey
+  ) return false;
+  e.preventDefault();
+  // Browser key events can distinguish Ctrl+Enter even when xterm's legacy
+  // keyboard encoding cannot. Both supported agent TUIs treat Ctrl+J (LF) as
+  // an editor newline, so forward that semantic input instead of plain Enter.
+  queueTerminalInput("\n", terminal);
+  return true;
+}
+
+function handleAgentTerminalSuspendKeydown(
+  e,
+  tab = currentToolbarTab(),
+  terminal = terminalStateFor(),
+) {
+  if (!terminal?.sessionId || terminal.exited || tab?.mode === "terminal") return false;
+  if (!toolbarTabUsesTerminal(tab) || (e.type && e.type !== "keydown")) return false;
+  if (
+    String(e.key || "").toLowerCase() !== "z"
+    || !e.ctrlKey
+    || e.altKey
+    || e.metaKey
+  ) return false;
+  // Agent sessions have no useful foreground shell to resume a stopped TUI.
+  // Consume the VSUSP keystroke before xterm can emit SUB (0x1a) to the PTY;
+  // ordinary Terminal tabs keep standard shell job-control behavior.
+  e.preventDefault();
+  return true;
+}
+
 function terminalSelection(terminal) {
   if (!terminal?.term?.hasSelection?.()) return "";
   return terminal.term.getSelection?.() || "";
@@ -1600,12 +1637,33 @@ function handleTerminalPaste(e, terminal = terminalStateFor()) {
     return false;
   }
   if (!text) return false;
+  if (!pasteTerminalText(text, terminal)) return false;
   e.preventDefault();
   // This listener runs during capture above xterm's textarea. Once the shared
   // terminal path accepts the paste, keep xterm from processing the same event
-  // through onData and appending the clipboard text to the input buffer again.
+  // a second time after Terminal.paste has emitted its terminal-native input.
   e.stopPropagation();
-  queueTerminalInput(text, terminal);
+  return true;
+}
+
+function pasteTerminalText(
+  text,
+  terminal = terminalStateFor(),
+  sessionId = terminal?.sessionId,
+) {
+  if (
+    typeof text !== "string"
+    || !text
+    || !terminal
+    || terminal.exited
+    || !sessionId
+    || terminal.sessionId !== sessionId
+    || typeof terminal.term?.paste !== "function"
+  ) return false;
+  // Let xterm normalize line endings and honor the PTY application's
+  // bracketed-paste mode. Agent TUIs use that framing to preserve multiline
+  // content as one editable prompt rather than submitting embedded lines.
+  terminal.term.paste(text);
   return true;
 }
 
@@ -1653,7 +1711,7 @@ function readTerminalClipboard(terminal) {
           && terminal.sessionId === sessionId
           && !terminal.exited
         ) {
-          queueTerminalInput(text, terminal, sessionId);
+          pasteTerminalText(text, terminal, sessionId);
         }
       })
       .catch((error) => showTerminalClipboardError("paste", error, terminal));
@@ -1775,6 +1833,64 @@ function terminalPrependOutput(text, terminal = terminalStateFor()) {
   terminal.term.write(replay, () => terminal.term?.scrollToBottom?.());
 }
 
+function terminalColorTheme() {
+  if (document.documentElement?.dataset?.theme === "dark") {
+    return {
+      background: "#0f172a",
+      foreground: "#e5e7eb",
+      cursor: "#f8fafc",
+      selectionBackground: "#334155",
+      black: "#111827",
+      red: "#f87171",
+      green: "#4ade80",
+      yellow: "#fbbf24",
+      blue: "#60a5fa",
+      magenta: "#c084fc",
+      cyan: "#22d3ee",
+      white: "#e5e7eb",
+      brightBlack: "#94a3b8",
+      brightRed: "#fca5a5",
+      brightGreen: "#86efac",
+      brightYellow: "#fde68a",
+      brightBlue: "#93c5fd",
+      brightMagenta: "#d8b4fe",
+      brightCyan: "#67e8f9",
+      brightWhite: "#ffffff",
+    };
+  }
+  return {
+    background: "#fbfbf7",
+    foreground: "#111827",
+    cursor: "#111827",
+    selectionBackground: "#dbeafe",
+    black: "#111827",
+    red: "#b91c1c",
+    green: "#047857",
+    yellow: "#a16207",
+    blue: "#1d4ed8",
+    magenta: "#7e22ce",
+    cyan: "#0e7490",
+    white: "#f8fafc",
+    brightBlack: "#64748b",
+    brightRed: "#dc2626",
+    brightGreen: "#059669",
+    brightYellow: "#ca8a04",
+    brightBlue: "#2563eb",
+    brightMagenta: "#9333ea",
+    brightCyan: "#0891b2",
+    brightWhite: "#ffffff",
+  };
+}
+
+function refreshTerminalColorThemes() {
+  const theme = terminalColorTheme();
+  for (const terminal of terminalStates.values()) {
+    if (terminal.term?.options) terminal.term.options.theme = theme;
+  }
+}
+
+window.addEventListener("refine-theme-change", refreshTerminalColorThemes);
+
 function ensureTerminalRenderer(output, tab = currentToolbarTab()) {
   if (!output || !window.Terminal) return;
   const terminal = terminalStateFor(
@@ -1802,28 +1918,7 @@ function ensureTerminalRenderer(output, tab = currentToolbarTab()) {
     fontSize: TERMINAL_FONT_SIZE,
     lineHeight: TERMINAL_LINE_HEIGHT,
     scrollback: 2000,
-    theme: {
-      background: "#fbfbf7",
-      foreground: "#111827",
-      cursor: "#111827",
-      selectionBackground: "#dbeafe",
-      black: "#111827",
-      red: "#b91c1c",
-      green: "#047857",
-      yellow: "#a16207",
-      blue: "#1d4ed8",
-      magenta: "#7e22ce",
-      cyan: "#0e7490",
-      white: "#f8fafc",
-      brightBlack: "#64748b",
-      brightRed: "#dc2626",
-      brightGreen: "#059669",
-      brightYellow: "#ca8a04",
-      brightBlue: "#2563eb",
-      brightMagenta: "#9333ea",
-      brightCyan: "#0891b2",
-      brightWhite: "#ffffff",
-    },
+    theme: terminalColorTheme(),
   });
   // The output host survives toolbar morphs, but each tab owns its own xterm.
   // Detach the inactive renderer before opening a new one so the preserved host
@@ -1833,7 +1928,9 @@ function ensureTerminalRenderer(output, tab = currentToolbarTab()) {
   if (terminal.display) term.write(terminal.display);
   term.onData((data) => queueTerminalInput(data, terminal));
   term.attachCustomKeyEventHandler?.(
-    (event) => !handleTerminalClipboardKeydown(event, terminal),
+    (event) => !handleTerminalClipboardKeydown(event, terminal)
+      && !handleTerminalNewlineKeydown(event, terminal)
+      && !handleAgentTerminalSuspendKeydown(event, tab, terminal),
   );
   term.element?.addEventListener?.(
     "copy",

@@ -37,7 +37,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::process::agent_sessions::find_agent_session;
 #[cfg(not(test))]
 use crate::process::runner::{
-    FileRunnerWorkerService, GIT_SYNC_RUNNER, WORKFLOW_RUNNER, WORKTREE_CLEANUP_RUNNER,
+    DEVELOPMENT_REQUEST_RUNNER, FileRunnerWorkerService, GIT_SYNC_RUNNER, WORKFLOW_RUNNER,
+    WORKTREE_CLEANUP_RUNNER,
 };
 #[cfg(test)]
 use crate::process::supervisor::config::{ConfigService, FileSettingsService};
@@ -49,6 +50,8 @@ use crate::process::supervisor::operations::FileOperationRegistry;
 use crate::tools::host::quality::QualityOperationRunner;
 use crate::tools::observability::activity::{ActivityService, FileActivityService};
 use crate::tools::observability::metrics::FileMetricsService;
+#[cfg(not(test))]
+use crate::tools::product::development_requests::load_self_development_email_config;
 use crate::tools::product::project_state::ProjectionQuery;
 #[cfg(test)]
 use crate::workflow::WorkflowEngine;

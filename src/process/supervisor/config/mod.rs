@@ -1,22 +1,30 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::model::JsonObject;
-use crate::model::node::Node;
+use crate::model::node::{Node, NodeDisplayNameAuthority};
 use crate::process::subprocess::write_json_atomically;
+use crate::process::supervisor::coordination::{
+    record_lock_key, replace_file_durably, with_record_lock,
+};
 use crate::process::supervisor::errors::RefineError;
 use crate::process::supervisor::errors::RefineResult;
 use crate::tools::product::nodes::FileNodeRegistryService;
+use crate::tools::product::project_state::ActiveGoalIndex;
 use crate::tools::product::todos::FileTodoService;
 
 pub const SETTINGS_FILE: &str = "settings.json";
 pub const GOVERNANCE_FILE: &str = "governance.json";
 pub const GUIDANCE_FILE: &str = "guidance.json";
 pub const REPORTERS_FILE: &str = "reporters.json";
+const REPORTER_CASCADE_FILE: &str = "reporter-cascade.json";
 const QUALITY_SETTINGS_FILE: &str = "quality/settings.json";
 const QUALITY_TIMING_KEY: &str = "quality_timing";
 const RETIRED_SUPERVISOR_STALL_KEY: &str = "supervisor_agent_stall_seconds";
@@ -57,6 +65,7 @@ fn settings_node(id: &str, now: &str) -> Node {
         } else {
             id.to_string()
         },
+        display_name_authority: Some(NodeDisplayNameAuthority::System),
         created_at: now.to_string(),
         updated_at: now.to_string(),
         settings: JsonObject::new(),
@@ -90,5 +99,7 @@ fn now_timestamp() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+#[cfg(test)]
+mod reporter_tests;
 #[cfg(test)]
 mod tests;

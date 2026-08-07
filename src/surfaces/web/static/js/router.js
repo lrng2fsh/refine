@@ -59,6 +59,14 @@ function parseHash() {
 
 function navigate() {
   const r = parseHash();
+  const destinationHash = location.hash || "#/";
+  if (
+    r.route !== "goals_new" &&
+    typeof guardNewGoalNavigation === "function" &&
+    guardNewGoalNavigation({ destinationHash, continueNavigation: navigate })
+  ) {
+    return;
+  }
   if (r.route === "chat_redirect") {
     // Legacy `#/chat[?goal=...]` deep links now open the dock and bounce to
     // the dashboard so the URL no longer points at a removed screen.
@@ -95,6 +103,7 @@ function navigate() {
     } catch { /* keep prior state.underlayHash */ }
     state.currentRoute = "goals_detail";
     state.currentGoal = r.id;
+    syncNodeScopeNavigation(state.underlayHash);
     highlightNav("goals");
     openGoalDetailModal(r.id);
     return;
@@ -122,6 +131,7 @@ function navigate() {
   // since we're already moving to a different one).
   if (_goalModalRoot) closeGoalDetailModal({ navigateAway: false });
   if (_featureModalRoot) closeFeatureModal({ navigateAway: false });
+  syncNodeScopeNavigation(destinationHash);
 
   if (
     prevRoute === r.route &&

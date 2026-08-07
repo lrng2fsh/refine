@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>refine</title>
   <link rel="icon" href="/static/images/favicon.svg" type="image/svg+xml">
+  <script src="/static/js/theme.js"></script>
   <link rel="stylesheet" href="/static/css/base.css">
   <link rel="stylesheet" href="/static/css/dashboard.css">
   <link rel="stylesheet" href="/static/css/common.css">
@@ -14,17 +15,18 @@
   <link rel="stylesheet" href="/static/css/toolbar.css">
   <link rel="stylesheet" href="/static/css/toolbar-todo.css">
   <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
+  <link rel="stylesheet" href="/static/css/theme.css">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="#/" data-route="dashboard" aria-label="Refine dashboard">
+    <a class="brand" href="#/" data-route="dashboard" data-node-scope-destination="dashboard" aria-label="Refine dashboard">
       <img class="brand-logo" src="/static/images/refine_logo_transparent.png" alt="refine">
       <div class="brand-node" id="active-node-label">-</div>
     </a>
     <nav class="nav" data-testid="primary-nav">
-      <a href="#/" data-route="dashboard" data-testid="nav-dashboard">Dashboard</a>
+      <a href="#/" data-route="dashboard" data-node-scope-destination="dashboard" data-testid="nav-dashboard">Dashboard</a>
       <a href="#/features" data-route="features" data-testid="nav-features">Features</a>
-      <a href="#/goals" data-route="goals" data-testid="nav-goals">Goals</a>
+      <a href="#/goals" data-route="goals" data-node-scope-destination="goals" data-testid="nav-goals">Goals</a>
       <a href="#/changes" data-route="changes" data-testid="nav-changes">Changes</a>
       <a href="#/logs" data-route="logs" data-testid="nav-logs">Logs</a>
     </nav>
@@ -102,6 +104,19 @@
               <span class="nav-control-status nav-source-update-status">Checking for updates</span>
             </span>
           </button>
+          <button class="nav-menu-item nav-control-item nav-management-item nav-theme-toggle" id="btn-theme-toggle"
+                  data-testid="nav-theme-toggle"
+                  type="button"
+                  aria-label="Use dark mode"
+                  aria-pressed="false">
+            <svg class="nav-menu-icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+              <path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2Z"></path>
+            </svg>
+            <span class="nav-control-copy">
+              <span>Dark mode</span>
+              <span class="nav-control-status nav-theme-status">Off</span>
+            </span>
+          </button>
           <a class="nav-menu-item nav-management-item" href="#/guide" id="nav-guide-open" data-route="guide" data-testid="nav-guide-open">
             <svg class="nav-menu-icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
               <path d="M12 7v14"></path>
@@ -158,11 +173,13 @@
   </template>
 
   <script src="/static/js/common.js"></script>
+  <script src="/static/js/node-scope-navigation.js"></script>
   <script src="/static/vendor/idiomorph/idiomorph.min.js"></script>
   <script src="/static/js/dom-morph.js"></script>
   <script src="/static/vendor/xterm/xterm.js"></script>
   <script src="/static/js/command-registry.js"></script>
   <script src="/static/js/workflow-visualization.js"></script>
+  <script src="/static/js/table-column-resize.js"></script>
   <script src="/static/js/features/dashboard.js"></script>
   <script src="/static/js/features/feature-goal-inline.js"></script>
   <script src="/static/js/features/features.js"></script>

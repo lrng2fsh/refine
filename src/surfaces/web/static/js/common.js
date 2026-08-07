@@ -123,7 +123,8 @@ function updateActiveNodeLabel() {
   const project = state.project || {};
   const active = project.active_node || null;
   const activeId = project.active_node_id || "";
-  const label = active?.display_name || active?.name || activeId || "none";
+  const label = (typeof active === "string" ? active : (active?.display_name || active?.name))
+    || activeId || "none";
   const visibleLabel = project.attached === false ? "none" : label;
   if (el) {
     el.textContent = visibleLabel;
@@ -1193,13 +1194,18 @@ async function applyProjectAttachResult(result, options = {}) {
 //
 // Keyboard: Enter submits, Escape cancels. Clicking the backdrop cancels.
 
-function _openModal(buildBody, onResolveDefault, focusSel) {
+function _openModal(buildBody, onResolveDefault, focusSel, {
+  role = "dialog", ariaLabel = "",
+} = {}) {
   return new Promise((resolve) => {
     const root = document.createElement("div");
     root.className = "modal-backdrop";
     root.dataset.testid = "modal-backdrop";
     const body = buildBody();
-    root.innerHTML = `<div class="modal" role="dialog" aria-modal="true" data-testid="modal-dialog">${body}</div>`;
+    const ariaLabelAttr = ariaLabel
+      ? ` aria-label="${htmlEscape(ariaLabel)}"`
+      : "";
+    root.innerHTML = `<div class="modal" role="${htmlEscape(role)}" aria-modal="true"${ariaLabelAttr} data-testid="modal-dialog">${body}</div>`;
     document.body.appendChild(root);
 
     let resolved = false;
@@ -1260,6 +1266,7 @@ function modalPrompt(label, defaultValue = "", {
 
 function modalConfirm(message, {
   title = null, okLabel = "OK", cancelLabel = "Cancel", danger = false,
+  focusCancel = false,
 } = {}) {
   const body = () => `
     ${title ? `<div class="modal-title">${htmlEscape(title)}</div>` : ""}
@@ -1268,7 +1275,12 @@ function modalConfirm(message, {
       <button class="secondary" data-cancel data-testid="modal-cancel">${htmlEscape(cancelLabel)}</button>
       <button ${danger ? 'class="danger"' : ""} data-ok data-testid="modal-ok">${htmlEscape(okLabel)}</button>
     </div>`;
-  return _openModal(body, { cancel: false, ok: true }, "[data-ok]");
+  return _openModal(
+    body,
+    { cancel: false, ok: true },
+    focusCancel ? "[data-cancel]" : "[data-ok]",
+    { role: "alertdialog", ariaLabel: title || message },
+  );
 }
 
 function modalAlert(message, {

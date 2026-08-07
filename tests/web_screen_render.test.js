@@ -255,6 +255,52 @@ async function assertScreenRenders(app, { route, marker, forbiddenText }) {
   );
 }
 
+test("Controls switches to dark mode and restores the stored theme on reload", { skip: SKIP }, async () => {
+  const app = await openApp();
+  try {
+    await app.page.emulateMedia({ colorScheme: "light" });
+    await app.page.goto(`${app.origin}/#/`);
+    await app.page.waitForSelector('[data-testid="context-menu-toggle"]');
+    await app.page.evaluate(() => localStorage.removeItem("refine_color_theme"));
+    await app.page.reload();
+    await app.page.locator('[data-testid="context-menu-toggle"]').click();
+    await app.page.locator('[data-testid="nav-theme-toggle"]').click();
+
+    const dark = await app.page.evaluate(() => {
+      const toggle = document.getElementById("btn-theme-toggle");
+      const bodyStyle = getComputedStyle(document.body);
+      return {
+        theme: document.documentElement.dataset.theme,
+        stored: localStorage.getItem("refine_color_theme"),
+        pressed: toggle.getAttribute("aria-pressed"),
+        label: toggle.getAttribute("aria-label"),
+        status: toggle.querySelector(".nav-theme-status").textContent,
+        background: bodyStyle.backgroundColor,
+        color: bodyStyle.color,
+      };
+    });
+    assert.deepEqual(dark, {
+      theme: "dark",
+      stored: "dark",
+      pressed: "true",
+      label: "Use light mode",
+      status: "On",
+      background: "rgb(11, 17, 32)",
+      color: "rgb(229, 231, 235)",
+    });
+
+    await app.page.reload();
+    assert.equal(
+      await app.page.getAttribute("html", "data-theme"),
+      "dark",
+      "reload should apply the stored theme before app initialization",
+    );
+    assert.deepEqual(app.pageErrors, []);
+  } finally {
+    await app.close();
+  }
+});
+
 test("goal detail renders from the routed URL", { skip: SKIP }, async () => {
   const app = await openApp();
   try {
@@ -312,6 +358,64 @@ test("Goals cold-load hydrates Reporter and Assignee filters before rendering", 
       await app.page.locator('[data-testid="goals-assignee-filter"] option').allTextContents(),
       ["all assignees", "Reporter"],
     );
+  } finally {
+    await app.close();
+  }
+});
+
+test("primary Dashboard and Goals navigation preserves current and all node scope", { skip: SKIP }, async () => {
+  const app = await openApp();
+  const hash = () => new URL(app.page.url()).hash;
+  try {
+    await assertScreenRenders(app, { route: "#/", marker: "#dash" });
+
+    // Keyboard activation follows the real primary Goals link and makes the
+    // Dashboard's default current scope explicit in the Goals URL.
+    await app.page.locator('[data-testid="nav-goals"]').focus();
+    await app.page.locator('[data-testid="nav-goals"]').press("Enter");
+    await app.page.waitForSelector('[data-testid="goals-table"]');
+    assert.equal(hash(), "#/goals?node=current");
+    assert.equal(await app.page.locator('[data-testid="goals-node-filter"]').inputValue(), "current");
+
+    await app.page.locator('[data-testid="nav-dashboard"]').click();
+    await app.page.waitForSelector("#dash");
+    assert.equal(hash(), "#/");
+    await app.page.locator('[data-testid="nav-goals"]').click();
+    await app.page.waitForSelector('[data-testid="goals-table"]');
+    assert.equal(hash(), "#/goals?node=current");
+
+    await app.page.goBack();
+    await app.page.waitForSelector("#dash");
+    assert.equal(hash(), "#/");
+    await app.page.goForward();
+    await app.page.waitForSelector('[data-testid="goals-table"]');
+    assert.equal(hash(), "#/goals?node=current");
+    await app.page.reload();
+    await app.page.waitForSelector('[data-testid="goals-table"]');
+    assert.equal(await app.page.locator('[data-testid="goals-node-filter"]').inputValue(), "current");
+
+    await app.page.locator('[data-testid="nav-dashboard"]').click();
+    await app.page.waitForSelector("#dash");
+    await app.page.locator('[data-testid="dashboard-scope-all"]').click();
+    await app.page.waitForFunction(() => location.hash === "#/?node=all");
+    assert.equal(hash(), "#/?node=all");
+
+    await app.page.locator('[data-testid="nav-goals"]').click();
+    await app.page.waitForSelector('[data-testid="goals-table"]');
+    assert.equal(hash(), "#/goals?node=all");
+    assert.equal(await app.page.locator('[data-testid="goals-node-filter"]').inputValue(), "all");
+
+    // The brand is another ordinary Dashboard entry point and must carry All.
+    await app.page.locator(".brand").click();
+    await app.page.waitForSelector("#dash");
+    assert.equal(hash(), "#/?node=all");
+    await app.page.locator('[data-testid="nav-goals"]').click();
+    await app.page.waitForSelector('[data-testid="goals-table"]');
+    assert.equal(hash(), "#/goals?node=all");
+    await app.page.reload();
+    await app.page.waitForSelector('[data-testid="goals-table"]');
+    assert.equal(await app.page.locator('[data-testid="goals-node-filter"]').inputValue(), "all");
+    assert.deepEqual(app.pageErrors, []);
   } finally {
     await app.close();
   }
@@ -737,9 +841,10 @@ test("every converted screen boots and paints", { skip: SKIP }, async () => {
   }
 });
 
-test("Goals truncate long Node names without overflowing Updated", { skip: SKIP }, async () => {
+test("Goals Node column has a readable default without overflowing Updated", { skip: SKIP }, async () => {
   const app = await openApp();
   try {
+    await app.page.setViewportSize({ width: 1280, height: 800 });
     await assertScreenRenders(app, {
       route: "#/goals",
       marker: ".goals-node-value",
@@ -748,20 +853,146 @@ test("Goals truncate long Node names without overflowing Updated", { skip: SKIP 
       const nodeRect = node.getBoundingClientRect();
       const updatedRect = node.closest("tr").querySelector('[data-label="Updated"]')
         .getBoundingClientRect();
+      const cellRect = node.closest("td").getBoundingClientRect();
       return {
         fullName: node.title,
+        nodeColumnWidth: Math.round(cellRect.width),
         textOverflow: getComputedStyle(node).textOverflow,
         whiteSpace: getComputedStyle(node).whiteSpace,
         isTruncated: node.scrollWidth > node.clientWidth,
         staysBeforeUpdated: nodeRect.right <= updatedRect.left,
       };
     });
-    assert.deepEqual(layout, {
-      fullName: GOAL.node_display_name,
-      textOverflow: "ellipsis",
-      whiteSpace: "nowrap",
-      isTruncated: true,
+    assert.equal(layout.fullName, GOAL.node_display_name);
+    assert.ok(layout.nodeColumnWidth >= 220, `Node column was only ${layout.nodeColumnWidth}px`);
+    assert.equal(layout.textOverflow, "ellipsis");
+    assert.equal(layout.whiteSpace, "nowrap");
+    assert.equal(layout.isTruncated, true);
+    assert.equal(layout.staysBeforeUpdated, true);
+    assert.equal(
+      await app.page.locator('[data-testid="goals-node-resize"]').getAttribute("aria-valuenow"),
+      "220",
+    );
+    assert.deepEqual(app.pageErrors, []);
+  } finally {
+    await app.close();
+  }
+});
+
+test("Goals Node column widens accessibly, stays bounded, and survives rerenders", { skip: SKIP }, async () => {
+  const app = await openApp();
+  try {
+    await app.page.setViewportSize({ width: 1280, height: 800 });
+    await assertScreenRenders(app, {
+      route: "#/goals",
+      marker: '[data-testid="goals-node-resize"]',
+    });
+    const handle = app.page.locator('[data-testid="goals-node-resize"]');
+
+    const box = await handle.boundingBox();
+    assert.ok(box, "Node resize handle has no pointer target");
+    const hitTarget = await app.page.evaluate(({ x, y }) => {
+      const element = document.elementFromPoint(x, y);
+      return `${element?.tagName || "none"}.${element?.className || ""}`;
+    }, { x: box.x + box.width / 2, y: box.y + box.height / 2 });
+    assert.match(hitTarget, /table-column-resize-handle/);
+    await app.page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await app.page.mouse.down();
+    await app.page.mouse.move(box.x + box.width / 2 + 96, box.y + box.height / 2);
+    await app.page.mouse.up();
+    assert.equal(await handle.getAttribute("aria-valuenow"), "316");
+
+    await handle.focus();
+    await handle.press("End");
+    assert.equal(await handle.getAttribute("aria-valuenow"), "480");
+    await handle.press("ArrowRight");
+    assert.equal(await handle.getAttribute("aria-valuenow"), "480");
+    assert.equal(new URL(app.page.url()).hash, "#/goals");
+
+    const widened = await app.page.locator(".goals-node-value").evaluate((node) => {
+      const nodeRect = node.getBoundingClientRect();
+      const updatedRect = node.closest("tr").querySelector('[data-label="Updated"]')
+        .getBoundingClientRect();
+      const scroll = node.closest(".goals-table-scroll");
+      return {
+        isTruncated: node.scrollWidth > node.clientWidth,
+        staysBeforeUpdated: nodeRect.right <= updatedRect.left,
+        scrollsHorizontally: scroll.scrollWidth > scroll.clientWidth,
+      };
+    });
+    assert.deepEqual(widened, {
+      isTruncated: false,
       staysBeforeUpdated: true,
+      scrollsHorizontally: true,
+    });
+
+    await handle.press("Home");
+    assert.equal(await handle.getAttribute("aria-valuenow"), "144");
+    await handle.press("ArrowLeft");
+    assert.equal(await handle.getAttribute("aria-valuenow"), "144");
+    await handle.press("End");
+
+    // Expanding selection and changing page both redraw the table. The width and
+    // selection controls must survive alongside the existing list behavior.
+    await app.page.locator('[data-testid="goals-filter-summary"]').click();
+    assert.equal(
+      await app.page.locator('[data-testid="goals-node-resize"]').getAttribute("aria-valuenow"),
+      "480",
+    );
+    await app.page.waitForSelector('[data-testid="goals-row-select"]');
+    assert.equal(await app.page.locator('[data-testid="goals-row-select"]').count(), 1);
+    await app.page.evaluate(() => updateGoalsFilter({ page: 2 }));
+    await app.page.waitForFunction(() => (
+      location.hash.includes("page=2")
+      &&
+      document.querySelector('[data-testid="goals-node-resize"]')?.getAttribute("aria-valuenow") === "480"
+    ));
+
+    await app.page.locator('[data-testid="goals-sort-node"] .goals-column-heading').click();
+    await app.page.waitForFunction(() => location.hash.includes("sort=node"));
+    assert.equal(
+      await app.page.locator('[data-testid="goals-node-resize"]').getAttribute("aria-valuenow"),
+      "480",
+    );
+
+    // sessionStorage also carries the preference across a same-tab refresh.
+    await app.page.reload();
+    await app.page.waitForSelector('[data-testid="goals-node-resize"]');
+    assert.equal(
+      await app.page.locator('[data-testid="goals-node-resize"]').getAttribute("aria-valuenow"),
+      "480",
+    );
+    assert.deepEqual(app.pageErrors, []);
+  } finally {
+    await app.close();
+  }
+});
+
+test("Goals mobile cards ignore desktop Node width and show the complete label", { skip: SKIP }, async () => {
+  const app = await openApp();
+  try {
+    await app.page.setViewportSize({ width: 700, height: 800 });
+    await assertScreenRenders(app, {
+      route: "#/goals",
+      marker: ".goals-node-value",
+    });
+    const mobile = await app.page.locator(".goals-node-value").evaluate((node) => {
+      const table = node.closest("table");
+      const scroll = node.closest(".goals-table-scroll");
+      return {
+        text: node.textContent,
+        overflow: getComputedStyle(node).overflow,
+        textOverflow: getComputedStyle(node).textOverflow,
+        whiteSpace: getComputedStyle(node).whiteSpace,
+        tableFitsViewport: table.getBoundingClientRect().width <= scroll.getBoundingClientRect().width,
+      };
+    });
+    assert.deepEqual(mobile, {
+      text: GOAL.node_display_name,
+      overflow: "visible",
+      textOverflow: "clip",
+      whiteSpace: "normal",
+      tableFitsViewport: true,
     });
     assert.deepEqual(app.pageErrors, []);
   } finally {

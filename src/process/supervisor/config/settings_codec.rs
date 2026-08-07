@@ -132,6 +132,19 @@ pub(super) fn legacy_setting_key(key: &str) -> Option<&'static str> {
     }
 }
 
+pub(super) fn is_retired_development_request_setting(key: &str) -> bool {
+    matches!(
+        key,
+        "development_request_email_enabled"
+            | "development_request_address"
+            | "development_request_mailbox"
+            | "development_request_allowed_senders"
+            | "development_request_poll_seconds"
+            | "development_request_auto_approve_after_seconds"
+            | "development_request_agent_cli"
+    )
+}
+
 pub(super) fn normalize_setting(key: &str, value: &Value) -> RefineResult<String> {
     match key {
         "agent_cli" => {
