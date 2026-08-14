@@ -1,5 +1,5 @@
 mod dashboard;
-mod nodes_cluster;
+mod nodes_fleet;
 mod projects;
 mod settings_governance;
 mod target_app;
@@ -24,12 +24,12 @@ use crate::process::supervisor::operations::{
 };
 use crate::prompts::{PromptTemplate, render};
 use crate::tools::host::agent_providers::{AgentProviderService, ProviderInvocation};
-use crate::tools::host::cluster::{ClusterService, FileClusterService, NodeRemoteUpdate};
+use crate::tools::host::fleet::{FileFleetService, FleetService, NodeRemoteUpdate};
 use crate::tools::host::target_apps::TargetAppGeneratedConfig;
 use crate::tools::product::next_actions::FileNextActionsService;
 use crate::tools::product::nodes::{FileNodeRegistryService, NodeUpdate, detached_nodes_response};
+use crate::tools::product::project_projection::{DashboardProjectionQuery, ProjectionQuery};
 use crate::tools::product::project_registry::{ProjectRegistryService, registry_apps_array};
-use crate::tools::product::project_state::{DashboardProjectionQuery, ProjectionQuery};
 use crate::tools::product::todos::FileTodoService;
 use crate::tools::product::work_items::BulkGoalSelection;
 use crate::tools::product::worktree_cleanup::{FileWorktreeCleanupService, WorktreeCleanupOptions};
@@ -38,7 +38,7 @@ use crate::workflow::WorkflowEngine;
 use super::support::*;
 use super::*;
 
-fn configured_provider_from_settings(
+pub(in crate::surfaces::web_server) fn configured_provider_from_settings(
     refine_dir: &std::path::Path,
     active_root: Option<&std::path::Path>,
     body: &Value,
@@ -77,8 +77,8 @@ fn configured_provider_from_settings(
 
 pub(super) fn dashboard_attention_items(
     indicators: &[String],
-    preparation_failures: &[crate::workflow::WorkflowClaim],
     runner_reachable: bool,
+    workflow_paused: bool,
 ) -> Vec<Value> {
     let mut items = indicators
         .iter()
@@ -93,27 +93,13 @@ pub(super) fn dashboard_attention_items(
             })
         })
         .collect::<Vec<_>>();
-    items.extend(preparation_failures.iter().map(|claim| {
-        let reason = claim
-            .failure_message
-            .as_deref()
-            .unwrap_or("claim preparation failed");
-        json!({
-            "kind": "filter",
-            "severity": "error",
-            "message": format!(
-                "Goal {} needs attention: {}",
-                claim.goal_id, reason
-            ),
-            "filter": {
-                "status": "todo"
-            },
-            "goal_id": claim.goal_id,
-            "claim_id": claim.claim_id,
-            "reason": reason
-        })
-    }));
-    if !runner_reachable {
+    if workflow_paused {
+        items.push(json!({
+            "kind": "banner",
+            "severity": "info",
+            "message": "Workflow is paused."
+        }));
+    } else if !runner_reachable {
         items.push(json!({
             "kind": "banner",
             "severity": "error",
@@ -326,6 +312,18 @@ fn todo_list_id_from_path(path: &str) -> Option<&str> {
         .filter(|id| !id.is_empty() && !id.contains('/'))
 }
 
+fn guidance_id_from_path(path: &str) -> Option<&str> {
+    path.strip_prefix("/guidance/")
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+}
+
+fn guidance_id_required() -> ApiResponse {
+    ApiResponse::json(
+        404,
+        json!({"error": {"code": "not_found", "message": "Guidance route requires a valid entry id"}}),
+    )
+}
+
 fn todo_item_collection_list_id(path: &str) -> Option<&str> {
     path.strip_prefix("/todos/lists/")
         .and_then(|path| path.strip_suffix("/items"))
@@ -349,6 +347,63 @@ fn todo_route_not_found() -> ApiResponse {
             }
         }),
     )
+}
+
+/// Ranks contributors by delivered volume weighted by delivery rate.
+///
+/// A plain completion percentage made two-for-two look better than forty
+/// delivered out of a hundred twenty filed, and a plain count rewarded filing
+/// volume regardless of what shipped. The score multiplies the two:
+/// `delivered × (delivered / reported)` — shipping more raises it linearly,
+/// and the share of your filed work that ships scales it. Cancelled Goals are
+/// withdrawn work, so they count toward neither side. Ties fall back to
+/// delivered volume, then reported volume, then name.
+fn contributor_ranking_rows(
+    reporter_stats: &BTreeMap<String, BTreeMap<GoalStatus, usize>>,
+) -> Vec<Value> {
+    let mut rows = reporter_stats
+        .iter()
+        .filter(|(reporter, _)| reporter.as_str() != "unknown")
+        .map(|(reporter, counts)| {
+            let cancelled = counts
+                .get(&GoalStatus::Cancelled)
+                .copied()
+                .unwrap_or_default();
+            let reported = counts
+                .values()
+                .copied()
+                .sum::<usize>()
+                .saturating_sub(cancelled);
+            let delivered = counts.get(&GoalStatus::Done).copied().unwrap_or_default();
+            let delivery_rate = if reported == 0 {
+                0.0
+            } else {
+                delivered as f64 / reported as f64
+            };
+            let score = delivered as f64 * delivery_rate;
+            (reporter.clone(), reported, delivered, delivery_rate, score)
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        b.4.partial_cmp(&a.4)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, (reporter, reported, delivered, delivery_rate, score))| {
+            json!({
+                "rank": index + 1,
+                "contributor": reporter,
+                "reported": reported,
+                "delivered": delivered,
+                "delivery_rate": delivery_rate * 100.0,
+                "score": score,
+            })
+        })
+        .collect()
 }
 
 fn assignee_stats_rows(
@@ -383,4 +438,55 @@ fn assignee_stats_rows(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod contributor_ranking_tests {
+    use super::*;
+
+    fn counts(pairs: &[(GoalStatus, usize)]) -> BTreeMap<GoalStatus, usize> {
+        pairs.iter().cloned().collect()
+    }
+
+    #[test]
+    fn volume_outranks_a_perfect_but_tiny_record() {
+        let mut stats = BTreeMap::new();
+        // Two filed, two delivered: perfect rate, little contribution.
+        stats.insert(
+            "reporter-a".to_string(),
+            counts(&[(GoalStatus::Done, 2)]),
+        );
+        // 120 filed, 40 delivered: far more shipped work despite the lower rate.
+        stats.insert(
+            "reporter-b".to_string(),
+            counts(&[
+                (GoalStatus::Done, 40),
+                (GoalStatus::Backlog, 60),
+                (GoalStatus::Failed, 20),
+            ]),
+        );
+        // Cancelled work is withdrawn: it must not dilute the rate.
+        stats.insert(
+            "reporter-c".to_string(),
+            counts(&[(GoalStatus::Done, 10), (GoalStatus::Cancelled, 90)]),
+        );
+        stats.insert("unknown".to_string(), counts(&[(GoalStatus::Done, 99)]));
+
+        let rows = contributor_ranking_rows(&stats);
+
+        let order: Vec<&str> = rows
+            .iter()
+            .map(|row| row["contributor"].as_str().unwrap())
+            .collect();
+        assert_eq!(order, vec!["reporter-b", "reporter-c", "reporter-a"]);
+        assert_eq!(rows[0]["rank"], 1);
+        assert_eq!(rows[0]["reported"], 120);
+        assert_eq!(rows[0]["delivered"], 40);
+        assert!((rows[0]["score"].as_f64().unwrap() - 40.0 * (40.0 / 120.0)).abs() < 1e-9);
+        // reporter-c's 90 cancelled Goals leave a perfect 10-of-10 record.
+        assert_eq!(rows[1]["reported"], 10);
+        assert_eq!(rows[1]["delivery_rate"], 100.0);
+        assert_eq!(rows[1]["score"], 10.0);
+        assert_eq!(rows[2]["score"], 2.0);
+    }
 }

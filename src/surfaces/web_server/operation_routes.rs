@@ -4,10 +4,11 @@ use std::sync::{Mutex, OnceLock};
 
 use serde_json::{Value, json};
 
+use crate::process::runner::{BackgroundWorkerEnsure, FileRunnerWorkerService};
 use crate::process::subprocess::FileProcessSupervisor;
 use crate::process::supervisor::errors::{RefineError, RefineResult};
 use crate::process::supervisor::lifecycle::BackgroundDaemonConfig;
-use crate::process::supervisor::operations::FileOperationRegistry;
+use crate::process::supervisor::operations::{FileOperationRegistry, OperationRegistry};
 use crate::process::supervisor::runtime::RuntimeRoot;
 use crate::process::supervisor::security::{NativeSecretStore, SecretStore};
 use crate::tools::host::agent_providers::{
@@ -17,17 +18,19 @@ use crate::tools::host::daemon_lifecycle::{
     DaemonLifecycleAction, FileDaemonLifecycleOperationService, FileHostDaemonLifecycleService,
     execute_daemon_lifecycle,
 };
-use crate::tools::host::deployed_update::{discover_refine_checkout, is_refine_checkout};
+use crate::tools::host::deployed_update::is_refine_checkout;
 use crate::tools::host::installation::{FileInstallationService, InstallationService};
 use crate::tools::host::release::{FileReleaseService, ReleaseBump};
 use crate::tools::host::source_promotion::{
-    FileSourcePromotionService, SourcePromotionSnapshot, source_promotion_affordance,
+    FileSourcePromotionService, source_promotion_affordance,
 };
 use crate::tools::observability::diagnostics::{DiagnosticsService, FileDiagnosticsService};
-use crate::tools::observability::processes::FileProcessStatusService;
+use crate::tools::observability::processes::{
+    FileProcessStatusService, enrich_process_resource_usage, repository_disk_usage_value,
+};
 use crate::tools::observability::support_bundle::{FileSupportBundleService, SupportBundleService};
 use crate::tools::product::process_control::FileProcessControlService;
-use crate::workflow::{WorkflowAutomation, WorkflowEngine};
+use crate::workflow::WorkflowEngine;
 
 use super::support::*;
 use super::*;
@@ -48,6 +51,5 @@ mod operations;
 mod pause;
 mod processes;
 mod releases;
-mod workflow;
 
 use helpers::*;

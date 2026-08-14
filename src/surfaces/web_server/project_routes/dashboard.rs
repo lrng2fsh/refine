@@ -7,7 +7,7 @@ impl InProcessWebServer {
             Err(error) => return error_response(error),
         };
         let attached = current_target_root.is_some();
-        let projection = match self.current_projection_with_runtime() {
+        let projection = match self.current_projection_with_runtime_shared() {
             Ok(projection) => projection,
             Err(error) => return error_response(error),
         };
@@ -56,43 +56,33 @@ impl InProcessWebServer {
             .get("runner_reachable")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
-        let preparation_failures = match (&self.runtime_root, &current_target_root) {
-            (Some(runtime_root), Some(target_root)) => {
-                match WorkflowEngine::with_target_root(runtime_root, target_root)
-                    .preparation_failures_needing_attention()
-                {
-                    Ok(failures) => failures
-                        .into_iter()
-                        .filter(|claim| node_filter == "all" || claim.node_id == active_node_id)
-                        .collect::<Vec<_>>(),
-                    Err(error) => return error_response(error),
-                }
-            }
-            _ => Vec::new(),
-        };
+        let workflow_paused = process
+            .get("workflow_paused")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
         ApiResponse::json(
             200,
             json!({
                 "counts": dashboard.counts,
                 "all_node_counts": dashboard.all_node_counts,
                 "running": [],
-                "merger": null,
+                "governance_integrator": null,
                 "governance": null,
                 "preflight": preflight,
                 "activity": activity,
                 "runner_reachable": runner_reachable,
                 "assignee_stats": assignee_stats_rows(&dashboard.assignee_stats),
                 "reporter_stats": assignee_stats_rows(&dashboard.reporter_stats),
+                "contributor_rankings": contributor_ranking_rows(&dashboard.reporter_stats),
                 "node_scope": dashboard.node_filter,
                 "node_filter": dashboard.node_filter,
-                "quality_timing": self.quality_timing_setting(),
                 "active_node_id": dashboard.current_node_id,
                 "active_node_display_name": active_node_identity.display_name,
                 "active_node_diagnostics": active_node_identity.diagnostics,
                 "needs_attention": dashboard_attention_items(
                     &dashboard.attention_indicators,
-                    &preparation_failures,
-                    runner_reachable
+                    runner_reachable,
+                    workflow_paused
                 ),
                 "attached": attached
             }),

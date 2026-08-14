@@ -1,5 +1,12 @@
 use super::*;
 
+use sha2::{Digest, Sha256};
+
+use crate::model::goal::{
+    IMPLEMENTATION_PLAN_SCHEMA_VERSION, ImplementationPlan, ImplementationPlanBinding,
+    ImplementationPlanPhase, ImplementationPlanState,
+};
+
 #[test]
 fn file_work_item_service_edits_notes_and_deletes_goal_json() {
     let temp_root = unique_temp_dir("work-item-edit-note-delete");
@@ -76,6 +83,63 @@ fn file_work_item_service_appends_and_edits_latest_round() {
     assert!(written.contains("\"prompt\": \"New prompt\""));
     assert!(written.contains("\"rule_state\": \"unclassified\""));
 
+    let error = service
+        .update_goal_round_evaluation_summary(
+            "GOAL1",
+            0,
+            &json!({"implementation_plan": {"state": "completed"}}),
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("Workflow-owned evidence"),
+        "{error}"
+    );
+    assert!(
+        service.show_goal_detail("GOAL1").unwrap()["rounds"][0]["implementation_plan"].is_null()
+    );
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn file_work_item_service_retains_quality_recovery_evidence() {
+    let temp_root = unique_temp_dir("work-item-quality-recovery-evidence");
+    let refine_dir = temp_root.join(".refine");
+    let service = FileWorkItemService::new(&refine_dir);
+    service
+        .create_goal_summary("Quality recovery evidence", Some("GOAL1"))
+        .unwrap();
+    service
+        .append_goal_round_summary("GOAL1", "Reporter", "Prompt")
+        .unwrap();
+
+    service
+        .update_goal_round_evaluation_summary(
+            "GOAL1",
+            0,
+            &json!({
+                "quality_agent_report": "Reviewed and corrected the candidate.",
+                "quality_candidate_commit": "candidate123",
+                "quality_recovery_analysis": "The configured check still fails.",
+                "quality_recovery_round_prompt": "Correct the check and add a regression test.",
+                "quality_recovery_details": {"phase": "quality_recovery"},
+                "quality_recovery_checked_at": "2026-08-13T12:00:00Z"
+            }),
+        )
+        .unwrap();
+
+    let detail = service.show_goal_detail("GOAL1").unwrap();
+    let round = &detail["rounds"][0];
+    assert_eq!(round["quality_candidate_commit"], "candidate123");
+    assert_eq!(
+        round["quality_recovery_details"]["phase"],
+        "quality_recovery"
+    );
+    assert_eq!(
+        round["quality_recovery_round_prompt"],
+        "Correct the check and add a regression test."
+    );
+
     fs::remove_dir_all(temp_root).unwrap();
 }
 
@@ -114,6 +178,141 @@ fn file_work_item_service_records_latest_round_implementation_report() {
         service
             .update_latest_goal_round_implementation_report("GOAL1", "   ")
             .is_err()
+    );
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn implementation_plan_round_trips_and_rejects_stale_or_rebound_updates() {
+    let temp_root = unique_temp_dir("work-item-implementation-plan");
+    let refine_dir = temp_root.join(".refine");
+    let service = FileWorkItemService::new(&refine_dir);
+    service
+        .create_goal_summary("Planned Goal", Some("GOAL1"))
+        .unwrap();
+    service
+        .append_goal_round_summary("GOAL1", "Reporter", "Implement it")
+        .unwrap();
+    service
+        .transition_goal_status("GOAL1", GoalStatus::Todo)
+        .unwrap();
+    service
+        .advance_automated_goal_status("GOAL1", GoalStatus::Plan)
+        .unwrap();
+    service
+        .update_goal_git_refs("GOAL1", "refine/GOAL1/round-1", "main", "base123", None)
+        .unwrap();
+    let context = json!({
+        "version": 1,
+        "goal": {"id": "GOAL1"},
+        "previous_rounds": [],
+        "current_round": {"round": 1, "prompt": "Implement it"}
+    });
+    service
+        .update_goal_round_evaluation_summary("GOAL1", 0, &json!({"agent_context": context}))
+        .unwrap();
+    let context_digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&context).unwrap())
+    );
+    let initial = ImplementationPlan {
+        schema_version: IMPLEMENTATION_PLAN_SCHEMA_VERSION,
+        state: ImplementationPlanState::InProgress,
+        phase: ImplementationPlanPhase::Plan,
+        binding: ImplementationPlanBinding {
+            goal_id: "GOAL1".to_string(),
+            round_idx: 0,
+            context_version: 1,
+            context_digest,
+            implementation_branch: "refine/GOAL1/round-1".to_string(),
+            target_branch: "main".to_string(),
+            base_commit: "base123".to_string(),
+        },
+        started_at: "2026-08-11T10:00:00Z".to_string(),
+        phase_started_at: "2026-08-11T10:00:00Z".to_string(),
+        updated_at: "2026-08-11T10:00:00Z".to_string(),
+        completed_at: None,
+        proposal: None,
+        criticism: None,
+        final_plan: None,
+        implementation: None,
+        failure: None,
+    };
+    service
+        .replace_goal_round_implementation_plan("GOAL1", 0, None, &initial)
+        .unwrap();
+    assert_eq!(
+        service.show_goal_detail("GOAL1").unwrap()["rounds"][0]["implementation_plan"]["phase"],
+        "plan"
+    );
+
+    let mut criticized = initial.clone();
+    criticized.phase = ImplementationPlanPhase::Criticize;
+    criticized.updated_at = "2026-08-11T10:01:00Z".to_string();
+    service
+        .replace_goal_round_implementation_plan("GOAL1", 0, Some(&initial), &criticized)
+        .unwrap();
+    let mut stale = initial.clone();
+    stale.phase = ImplementationPlanPhase::Revise;
+    assert!(
+        service
+            .replace_goal_round_implementation_plan("GOAL1", 0, Some(&initial), &stale)
+            .unwrap_err()
+            .to_string()
+            .contains("authority changed")
+    );
+
+    service
+        .update_goal_git_refs("GOAL1", "refine/GOAL1/rebound", "main", "base123", None)
+        .unwrap();
+    assert!(
+        service
+            .replace_goal_round_implementation_plan("GOAL1", 0, Some(&criticized), &stale)
+            .unwrap_err()
+            .to_string()
+            .contains("branch_name changed")
+    );
+    service
+        .update_goal_git_refs("GOAL1", "refine/GOAL1/round-1", "main", "base456", None)
+        .unwrap();
+    assert!(
+        service
+            .replace_goal_round_implementation_plan("GOAL1", 0, Some(&criticized), &stale)
+            .unwrap_err()
+            .to_string()
+            .contains("base_commit changed")
+    );
+    service
+        .update_goal_git_refs("GOAL1", "refine/GOAL1/round-1", "main", "base123", None)
+        .unwrap();
+    service
+        .update_goal_git_refs("GOAL1", "refine/GOAL1/round-1", "release", "base123", None)
+        .unwrap();
+    assert!(
+        service
+            .replace_goal_round_implementation_plan("GOAL1", 0, Some(&criticized), &stale)
+            .unwrap_err()
+            .to_string()
+            .contains("target_branch changed")
+    );
+    service
+        .update_goal_git_refs("GOAL1", "refine/GOAL1/round-1", "main", "base123", None)
+        .unwrap();
+
+    service
+        .update_goal_round_evaluation_summary(
+            "GOAL1",
+            0,
+            &json!({"agent_context": {"version": 2, "goal": {"id": "GOAL1"}}}),
+        )
+        .unwrap();
+    assert!(
+        service
+            .replace_goal_round_implementation_plan("GOAL1", 0, Some(&criticized), &stale)
+            .unwrap_err()
+            .to_string()
+            .contains("context changed")
     );
 
     fs::remove_dir_all(temp_root).unwrap();

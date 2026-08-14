@@ -9,6 +9,8 @@ fn operation_cancel_route_is_a_thin_shared_capability_adapter() {
         .unwrap();
 
     assert!(handler.contains("registry.cancel_supervised"));
+    assert!(handler.contains("maintenance:source-upgrade"));
+    assert!(handler.contains("cancel_operation"));
     assert!(!handler.contains("current_projection_with_runtime"));
     assert!(!handler.contains("request_termination"));
     assert!(!handler.contains("fail_with_error"));
@@ -16,7 +18,44 @@ fn operation_cancel_route_is_a_thin_shared_capability_adapter() {
 }
 
 #[test]
-fn web_server_reads_and_cancels_runtime_operations() {
+fn source_upgrade_operation_cancel_route_delegates_to_typed_owner() {
+    let temp_root = unique_temp_dir("http-source-upgrade-cancel");
+    let refine_dir = temp_root.join(".refine");
+    let runtime_root = temp_root.join("run/8080");
+    fs::create_dir_all(&refine_dir).unwrap();
+    let registry = FileOperationRegistry::new(&runtime_root);
+    let operation = registry
+        .register_exclusive_with_request(
+            "maintenance:source-upgrade",
+            json!({
+                "checkout": std::env::current_dir().unwrap(),
+                "restart_recovery": "capability",
+                "defer_cancellation_terminal": true
+            }),
+        )
+        .unwrap();
+    let mut server = server_with_projection();
+    server.target_root = Some(refine_dir.parent().unwrap().to_path_buf());
+    server.runtime_root = Some(runtime_root.clone());
+    server.product_paths =
+        Some(RefineCheckoutPaths::from_source_checkout(env!("CARGO_MANIFEST_DIR")).unwrap());
+
+    let cancel = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: format!("/api/operations/{}/cancel", operation.id),
+        body: None,
+    });
+    assert_eq!(cancel.status, 200, "{:#}", cancel.body);
+    assert_eq!(cancel.body["operation"]["status"], "cancelled");
+    assert_eq!(
+        registry.status(&operation.id).unwrap().state,
+        OperationState::Cancelled
+    );
+    remove_temp_dir(&temp_root);
+}
+
+#[test]
+fn web_server_reads_and_cancels_runtime_operations_without_persisting_derived_state() {
     let temp_root = unique_temp_dir("http-operations");
     let refine_dir = temp_root.join(".refine");
     let runtime_root = temp_root.join("run/8080");
@@ -34,12 +73,17 @@ fn web_server_reads_and_cancels_runtime_operations() {
     });
     assert_eq!(status.status, 200, "{:#}", status.body);
     assert_eq!(status.body["operation"]["status"], "running");
-    let cached = FileProjectStateStore::new(&refine_dir)
+    let cached = FileProjectProjectionStore::new(&refine_dir)
         .load_projection_snapshot(&runtime_root.join("cache"))
         .unwrap()
         .unwrap();
-    assert_eq!(cached.runtime.background_operations[0]["id"], operation.id);
-    assert_eq!(cached.runtime.background_operations[0]["status"], "running");
+    assert!(cached.runtime.background_operations.is_empty());
+    let current = server.current_projection_with_runtime_shared().unwrap();
+    assert_eq!(current.runtime.background_operations[0]["id"], operation.id);
+    assert_eq!(
+        current.runtime.background_operations[0]["status"],
+        "running"
+    );
 
     let cancel = server.handle(ApiRequest {
         method: "POST".to_string(),
@@ -62,12 +106,14 @@ fn web_server_reads_and_cancels_runtime_operations() {
             .iter()
             .any(|entry| entry["message"] == "Operation cancelled")
     );
-    let cached = FileProjectStateStore::new(&refine_dir)
+    let cached = FileProjectProjectionStore::new(&refine_dir)
         .load_projection_snapshot(&runtime_root.join("cache"))
         .unwrap()
         .unwrap();
+    assert!(cached.runtime.background_operations.is_empty());
+    let current = server.current_projection_with_runtime_shared().unwrap();
     assert_eq!(
-        cached.runtime.background_operations[0]["status"],
+        current.runtime.background_operations[0]["status"],
         "cancelled"
     );
 

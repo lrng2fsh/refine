@@ -1,5 +1,5 @@
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::process::subprocess::{FileProcessSupervisor, ProcessOwner, ProcessSupervisor};
 use crate::process::supervisor::errors::{RefineError, RefineResult};
@@ -43,18 +43,20 @@ fn stop_direct_runtime(lifecycle: &FileDaemonLifecycleService, port: u16) -> Ref
             ));
             continue;
         }
-        thread::sleep(Duration::from_millis(100));
-        let still_running = match supervisor.wait(&process.id) {
-            Ok(observed) => observed.state == "running",
-            Err(RefineError::NotFound(_)) => false,
-            Err(error) => {
-                failures.push(format!(
-                    "failed to confirm process {} after terminate: {error}",
-                    process.id
-                ));
-                continue;
-            }
-        };
+        // Poll until the process is actually gone: a fixed sleep per process
+        // made every stop pay its worst case regardless of how quickly the
+        // process died.
+        let still_running =
+            match wait_until_stopped(&supervisor, &process.id, DIRECT_STOP_TERMINATE_WAIT) {
+                Ok(still_running) => still_running,
+                Err(error) => {
+                    failures.push(format!(
+                        "failed to confirm process {} after terminate: {error}",
+                        process.id
+                    ));
+                    continue;
+                }
+            };
         if !still_running {
             continue;
         }
@@ -62,14 +64,12 @@ fn stop_direct_runtime(lifecycle: &FileDaemonLifecycleService, port: u16) -> Ref
             failures.push(format!("failed to kill process {}: {error}", process.id));
             continue;
         }
-        thread::sleep(Duration::from_millis(100));
-        match supervisor.wait(&process.id) {
-            Ok(observed) if observed.state == "running" => failures.push(format!(
+        match wait_until_stopped(&supervisor, &process.id, DIRECT_STOP_KILL_WAIT) {
+            Ok(true) => failures.push(format!(
                 "process {} remained running after terminate and kill",
                 process.id
             )),
-            Ok(_) => {}
-            Err(RefineError::NotFound(_)) => {}
+            Ok(false) => {}
             Err(error) => failures.push(format!(
                 "failed to confirm process {} after kill: {error}",
                 process.id
@@ -86,6 +86,55 @@ fn stop_direct_runtime(lifecycle: &FileDaemonLifecycleService, port: u16) -> Ref
     }
 }
 
+const DIRECT_STOP_TERMINATE_WAIT: Duration = Duration::from_secs(2);
+const DIRECT_STOP_KILL_WAIT: Duration = Duration::from_secs(1);
+const DIRECT_STOP_POLL: Duration = Duration::from_millis(10);
+
+/// Returns whether the process is still running once the deadline passes;
+/// exits as soon as it stops.
+fn wait_until_stopped(
+    supervisor: &FileProcessSupervisor,
+    process_id: &str,
+    deadline: Duration,
+) -> RefineResult<bool> {
+    let started = Instant::now();
+    loop {
+        match supervisor.wait(process_id) {
+            Ok(observed) if observed.state == "running" => {}
+            Ok(_) => return Ok(false),
+            Err(RefineError::NotFound(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        if started.elapsed() >= deadline {
+            return Ok(true);
+        }
+        thread::sleep(DIRECT_STOP_POLL);
+    }
+}
+
+/// How long the post-stop probe may retry an ambiguous observation. A freshly
+/// killed daemon's listening socket can accept-then-reset a connection for a
+/// few milliseconds while the kernel tears it down; stop now confirms process
+/// exit fast enough to probe inside that window, which read as "reachability
+/// unknown" and turned every successful stop into a reported failure. The
+/// socket settles to a clean refusal almost immediately, so retrying while
+/// ambiguous makes the outcome deterministic.
+const STOP_PROBE_SETTLE_WINDOW: Duration = Duration::from_secs(2);
+const STOP_PROBE_SETTLE_POLL: Duration = Duration::from_millis(100);
+
+fn settled_stop_reachability(
+    port: u16,
+    probe: &mut impl FnMut(u16) -> DaemonReachability,
+) -> DaemonReachability {
+    let deadline = Instant::now() + STOP_PROBE_SETTLE_WINDOW;
+    let mut observation = probe(port);
+    while matches!(observation, DaemonReachability::Unknown(_)) && Instant::now() < deadline {
+        thread::sleep(STOP_PROBE_SETTLE_POLL);
+        observation = probe(port);
+    }
+    observation
+}
+
 fn stop_direct_daemon_with(
     lifecycle: &FileDaemonLifecycleService,
     port: u16,
@@ -93,7 +142,7 @@ fn stop_direct_daemon_with(
     mut probe: impl FnMut(u16) -> DaemonReachability,
 ) -> RefineResult<DaemonStatus> {
     let control_result = control();
-    let observation = probe(port);
+    let observation = settled_stop_reachability(port, &mut probe);
     let command_error = control_result.as_ref().err().map(ToString::to_string);
     match observation {
         DaemonReachability::Unreachable(_) => {
@@ -212,6 +261,42 @@ mod tests {
             supervisor.wait("direct-daemon"),
             Err(RefineError::NotFound(_))
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transient_connection_reset_during_socket_teardown_still_confirms_stop() {
+        let (root, lifecycle) = lifecycle("teardown-reset");
+        lifecycle.mark_ready(running_status(4557)).unwrap();
+        // First probe lands in the kernel's socket-teardown window and reads a
+        // reset; the retry observes the settled refusal.
+        let mut probes = 0;
+        let status = stop_direct_daemon_with(
+            &lifecycle,
+            4557,
+            || Ok(()),
+            |_| {
+                probes += 1;
+                if probes == 1 {
+                    DaemonReachability::Unknown(
+                        "failed to read daemon probe: Connection reset by peer".to_string(),
+                    )
+                } else {
+                    DaemonReachability::Unreachable("connection refused".to_string())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(status.worker_state, "stopped");
+        assert_eq!(
+            status
+                .lifecycle_evidence
+                .as_ref()
+                .unwrap()
+                .outcome
+                .as_str(),
+            "direct_stop_confirmed"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

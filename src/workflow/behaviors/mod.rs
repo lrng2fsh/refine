@@ -1,27 +1,37 @@
+use std::time::Duration;
+
 use serde_json::{Value, json};
 
 use crate::model::workflow::GoalStatus;
-use crate::process::agent_sessions::{GoalAgentLaunch, run_goal_agent};
+use crate::process::agent_sessions::{GoalAgentLaunch, run_goal_agent_with_settlement};
 use crate::process::supervisor::config::{FileGovernanceService, FileGuidanceService};
 use crate::process::supervisor::errors::{RefineError, RefineResult};
+use crate::prompts::{PromptEngine, PromptTemplate};
 use crate::tools::host::agent_providers::{
     AgentProviderService, HostAgentProviderService, ProviderInvocation,
 };
 use crate::tools::host::git_sync::with_repository_git_lock;
 use crate::tools::host::git_worktrees::{FileGitWorktreeService, GitWorktreeService};
 use crate::tools::host::quality::{
-    POST_BUILD, QualityCheckResult, QualityOperationRunner, is_quality_harness_fault,
-    quality_error_summary,
+    QualityCheckResult, QualityOperationRunner, is_quality_harness_fault, quality_error_summary,
 };
-use crate::tools::host::target_apps::FileTargetAppService;
-use crate::tools::product::merging::{FileMergerService, ReconciliationRequest};
+use crate::tools::product::governance_integration::{
+    FileGovernanceIntegrationService, ReconciliationRequest,
+};
 use crate::workflow::behavior::{WorkflowAdvanceOutcome, WorkflowBehavior};
+use crate::workflow::candidate_handoff::{
+    find_candidate_handoff, record_candidate_handoff_commit, record_candidate_handoff_governance,
+    register_candidate_handoff, retain_candidate_handoff_after_failure, settle_candidate_handoff,
+};
 use crate::workflow::context::WorkflowContext;
+use crate::workflow::implementation_planning::begin_implementation_phase;
 use crate::workflow::{
-    GovernanceEvaluation, agent_worktree_cwd, goal_agent_prompt, implementation_branch_name,
-    json_object, now_timestamp, parse_governance_provider_output,
-    post_implementation_governance_prompt, round_agent_context, selected_agent_context,
-    setting_string,
+    GovernanceEvaluation, QualityRecoveryInvestigation, agent_worktree_cwd,
+    complete_implementation_planning, fail_implementation_phase, governed_implementation_prompt,
+    implementation_branch_name, json_object, now_timestamp, parse_governance_provider_output,
+    parse_quality_recovery_provider_output, post_implementation_governance_prompt,
+    quality_recovery_prompt, round_agent_context, run_governed_implementation_planning,
+    selected_agent_context, setting_string, setting_usize,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -31,16 +41,16 @@ pub struct WorkflowBacklog;
 pub struct WorkflowTodo;
 
 #[derive(Clone, Debug, Default)]
+pub struct WorkflowPlan;
+
+#[derive(Clone, Debug, Default)]
 pub struct WorkflowImplementation;
 
 #[derive(Clone, Debug, Default)]
-pub struct WorkflowQa;
+pub struct WorkflowQuality;
 
 #[derive(Clone, Debug, Default)]
-pub struct WorkflowReadyMerge;
-
-#[derive(Clone, Debug, Default)]
-pub struct WorkflowBuild;
+pub struct WorkflowGovernance;
 
 #[derive(Clone, Debug, Default)]
 pub struct WorkflowReview;
@@ -87,14 +97,14 @@ impl WorkflowBehavior for WorkflowTodo {
             Err(error) => return fail(ctx, "branch", error),
         };
         // Todo is a queue, not an execution workspace. The scheduler has already
-        // acquired capacity for this Running claim before this transition, and
-        // the durable Goal state must cross into in-progress before Git is
-        // allowed to materialize a repository copy.
-        ctx.request_transition(GoalStatus::Todo, GoalStatus::InProgress)?;
-        let worktree_path = match materialize_in_progress_worktree(ctx, &app_git, &branch) {
-            Ok(path) => path,
-            Err(error) => return fail(ctx, "branch", error),
-        };
+        // selected this Goal using observed local capacity, and durable Goal state
+        // must cross into Plan before Git may materialize a repository copy.
+        ctx.request_transition(GoalStatus::Todo, GoalStatus::Plan)?;
+        let (worktree_path, handoff) =
+            match materialize_plan_worktree(ctx, &app_git, &branch, &base_commit) {
+                Ok(materialized) => materialized,
+                Err(error) => return fail(ctx, "branch", error),
+            };
         ctx.log(
             "git",
             &format!("Created implementation worktree for {branch}"),
@@ -114,10 +124,11 @@ impl WorkflowBehavior for WorkflowTodo {
         }
         ctx.branch = Some(branch);
         ctx.worktree_path = Some(worktree_path);
+        ctx.candidate_handoff_operation_id = Some(handoff.id);
         Ok(WorkflowAdvanceOutcome::Transition {
             from: GoalStatus::Todo,
-            to: GoalStatus::InProgress,
-            reason: "Goal entered implementation".to_string(),
+            to: GoalStatus::Plan,
+            reason: "Goal entered planning".to_string(),
         })
     }
 }
@@ -144,7 +155,7 @@ fn prepare_already_merged_reconciliation(
         serde_json::from_value::<crate::model::goal::RoundIntegration>(integration_value.clone())
             .map_err(|error| {
             RefineError::Serialization(format!(
-                "Goal {} has invalid Ready Merge evidence: {error}",
+                "Goal {} has invalid Governance evidence: {error}",
                 ctx.goal_id
             ))
         })?;
@@ -314,24 +325,28 @@ fn prepare_already_merged_reconciliation(
     ctx.merge = Some(integration.merge.clone());
     ctx.reconciliation = Some(integration);
     ctx.reconciliation_state = Some("detected".to_string());
-    ctx.start_status = GoalStatus::Qa;
-    ctx.request_transition(GoalStatus::Todo, GoalStatus::Qa)?;
+    ctx.start_status = GoalStatus::Quality;
+    ctx.request_transition(GoalStatus::Todo, GoalStatus::Quality)?;
     Ok(Some(WorkflowAdvanceOutcome::Transition {
         from: GoalStatus::Todo,
-        to: GoalStatus::Qa,
+        to: GoalStatus::Quality,
         reason: "Already-merged candidate requires reconciliation".to_string(),
     }))
 }
 
-fn materialize_in_progress_worktree(
+fn materialize_plan_worktree(
     ctx: &WorkflowContext<'_>,
     app_git: &FileGitWorktreeService,
     branch: &str,
-) -> RefineResult<String> {
+    base_commit: &str,
+) -> RefineResult<(
+    String,
+    crate::process::supervisor::operations::OperationHandle,
+)> {
     let status = ctx.work_items.show_goal_summary(&ctx.goal_id)?.goal.status;
-    if status != GoalStatus::InProgress {
+    if status != GoalStatus::Plan {
         return Err(RefineError::Conflict(format!(
-            "refusing to create an implementation worktree for Goal {} while it is {}; worktrees are materialized only after admission to in-progress",
+            "refusing to create a workflow worktree for Goal {} while it is {}; worktrees are materialized only after admission to plan",
             ctx.goal_id,
             status.as_str()
         )));
@@ -340,13 +355,62 @@ fn materialize_in_progress_worktree(
         .git_path("refine-worktrees")?
         .join(branch.replace('/', "-"));
     with_repository_git_lock(ctx.target_root, || {
-        app_git.ensure_worktree(branch, &worktree_target)
+        let worktree_path = app_git.ensure_worktree(branch, &worktree_target)?;
+        let handoff = register_candidate_handoff(
+            ctx.runtime_root,
+            ctx.target_root,
+            &ctx.goal_id,
+            ctx.round_idx,
+            &ctx.node_id,
+            branch,
+            &worktree_path,
+            base_commit,
+        )?;
+        Ok((worktree_path, handoff))
     })
+}
+
+impl WorkflowBehavior for WorkflowPlan {
+    fn observes(&self) -> GoalStatus {
+        GoalStatus::Plan
+    }
+
+    fn advance(&self, ctx: &mut WorkflowContext<'_>) -> RefineResult<WorkflowAdvanceOutcome> {
+        let branch = ctx.require_branch()?.to_string();
+        let worktree_path = ctx.require_worktree_path()?.to_string();
+        let goal = match ctx.work_items.show_goal_detail(&ctx.goal_id) {
+            Ok(goal) => goal,
+            Err(error) => return fail(ctx, "plan", error),
+        };
+        let agent_context = match ensure_goal_agent_context(ctx, &goal) {
+            Ok(context) => context,
+            Err(error) => return fail(ctx, "agent_context", error),
+        };
+        let agent_cwd = match agent_worktree_cwd(
+            &worktree_path,
+            setting_string(&ctx.settings, "agent_subpath", "").as_str(),
+        ) {
+            Ok(cwd) => cwd,
+            Err(error) => return fail(ctx, "plan", error),
+        };
+        if let Err(error) =
+            run_governed_implementation_planning(ctx, &goal, &agent_context, &agent_cwd, &branch)
+        {
+            return fail(ctx, "plan", error);
+        }
+        ctx.agent_cwd = Some(agent_cwd);
+        ctx.request_transition(GoalStatus::Plan, GoalStatus::Implement)?;
+        Ok(WorkflowAdvanceOutcome::Transition {
+            from: GoalStatus::Plan,
+            to: GoalStatus::Implement,
+            reason: "Plan was proposed, criticized, and finalized".to_string(),
+        })
+    }
 }
 
 impl WorkflowBehavior for WorkflowImplementation {
     fn observes(&self) -> GoalStatus {
-        GoalStatus::InProgress
+        GoalStatus::Implement
     }
 
     fn advance(&self, ctx: &mut WorkflowContext<'_>) -> RefineResult<WorkflowAdvanceOutcome> {
@@ -360,10 +424,6 @@ impl WorkflowBehavior for WorkflowImplementation {
             Ok(context) => context,
             Err(error) => return fail(ctx, "agent_context", error),
         };
-        let prompt = match goal_agent_prompt(&ctx.goal_id, &agent_context) {
-            Ok(prompt) => prompt,
-            Err(error) => return fail(ctx, "agent", error),
-        };
         let agent_cwd = match agent_worktree_cwd(
             &worktree_path,
             setting_string(&ctx.settings, "agent_subpath", "").as_str(),
@@ -371,19 +431,39 @@ impl WorkflowBehavior for WorkflowImplementation {
             Ok(cwd) => cwd,
             Err(error) => return fail(ctx, "agent", error),
         };
+        let final_plan = match begin_implementation_phase(ctx) {
+            Ok(plan) => plan,
+            Err(error) => return fail(ctx, "implement", error),
+        };
+        let prompt = match governed_implementation_prompt(&ctx.goal_id, &agent_context, &final_plan)
+        {
+            Ok(prompt) => prompt,
+            Err(error) => return fail(ctx, "implementation_planning", error),
+        };
         let mut process_metadata =
-            ctx.workflow_process_metadata("in-progress", "WorkflowImplementation");
+            ctx.workflow_process_metadata("implement", "WorkflowImplementation");
+        process_metadata.insert("implementation_phase".to_string(), json!("implement"));
+        process_metadata.insert(
+            "operation_id".to_string(),
+            json!(uuid::Uuid::new_v4().to_string()),
+        );
         process_metadata.insert(
             "worktree".to_string(),
             json!({"path": worktree_path, "branch": branch}),
         );
-        let agent_result = match run_goal_agent(
+        let implementation_started_at = now_timestamp();
+        let agent_result = match run_goal_agent_with_settlement(
             GoalAgentLaunch {
                 runtime_root: ctx.runtime_root.to_path_buf(),
                 cwd: agent_cwd.clone(),
                 provider: ctx.provider.clone(),
                 prompt,
                 metadata: process_metadata,
+                completion_timeout: Some(Duration::from_secs(setting_usize(
+                    &ctx.settings,
+                    "agent_hard_cap_seconds",
+                    7200,
+                ) as u64)),
             },
             |attention| {
                 let _ = ctx.log(
@@ -397,11 +477,23 @@ impl WorkflowBehavior for WorkflowImplementation {
                     }))),
                 );
             },
+            |_| Ok(()),
         ) {
             Ok(result) => result,
-            Err(error) => return fail(ctx, "agent", error),
+            Err(error) => {
+                let failure = fail_implementation_phase(ctx, "provider", &error);
+                return fail(ctx, "agent", failure);
+            }
         };
         let provider_output = agent_result.output;
+        if let Err(error) = complete_implementation_planning(
+            ctx,
+            implementation_started_at,
+            provider_output.clone(),
+            agent_result.implementation_evidence.clone(),
+        ) {
+            return fail(ctx, "implementation_planning", error);
+        }
         if let Err(error) = ctx
             .work_items
             .update_latest_goal_round_implementation_report(&ctx.goal_id, &provider_output)
@@ -438,6 +530,33 @@ impl WorkflowBehavior for WorkflowImplementation {
         {
             return fail(ctx, "commit", error);
         }
+        let handoff_id = ctx
+            .candidate_handoff_operation_id
+            .clone()
+            .or_else(|| {
+                find_candidate_handoff(
+                    ctx.runtime_root,
+                    ctx.target_root,
+                    &ctx.goal_id,
+                    ctx.round_idx,
+                )
+                .ok()
+                .flatten()
+                .map(|operation| operation.id)
+            })
+            .ok_or_else(|| {
+                RefineError::Conflict(format!(
+                    "Goal {} Round {} has no active candidate handoff after commit",
+                    ctx.goal_id,
+                    ctx.round_idx + 1
+                ))
+            })?;
+        if let Err(error) =
+            record_candidate_handoff_commit(ctx.runtime_root, &handoff_id, &commit.commit)
+        {
+            return fail(ctx, "candidate_handoff", error);
+        }
+        ctx.candidate_handoff_operation_id = Some(handoff_id.clone());
         let changed_paths = match worktree_git.changed_paths_since(&target_branch, &commit.commit) {
             Ok(paths) => paths,
             Err(error) => return fail(ctx, "guidance", error),
@@ -480,67 +599,60 @@ impl WorkflowBehavior for WorkflowImplementation {
             )?;
         }
 
-        let governance =
-            match evaluate_workflow_governance(ctx, &worktree_path, &agent_cwd, &agent_context) {
-                Ok(evaluation) => evaluation,
-                Err(error) => return fail(ctx, "governance", error),
-            };
-        record_governance(ctx, &governance)?;
-        if governance.failed {
-            let error = RefineError::Conflict(
-                governance
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| "governance checks failed".to_string()),
-            );
-            return fail(ctx, "governance", error);
-        }
-
-        let remote = match ctx.git_remote() {
-            Ok(remote) => remote,
-            Err(error) => return fail(ctx, "git", error),
-        };
-        if worktree_git.remote_exists(&remote)? {
-            if let Err(error) =
-                with_repository_git_lock(ctx.target_root, || worktree_git.push(&remote, &branch))
-            {
-                return fail(ctx, "git", error);
-            }
-            ctx.log(
-                "git",
-                &format!("Published implementation candidate {branch}"),
-                Some(json_object(json!({
-                    "branch": branch,
-                    "remote": remote,
-                    "commit": commit.commit
-                }))),
-            )?;
-        }
-
         ctx.agent_cwd = Some(agent_cwd);
         ctx.provider_output = Some(provider_output);
         ctx.implementation_changed = commit.has_changes_since_base;
-        ctx.commit = Some(commit.commit);
-        let next = match ctx.quality_timing(GoalStatus::InProgress) {
-            Ok(timing) if timing == POST_BUILD => GoalStatus::ReadyMerge,
-            Ok(_) => GoalStatus::Qa,
-            Err(error) => return fail(ctx, "quality", error),
-        };
-        ctx.request_transition(GoalStatus::InProgress, next.clone())?;
+        ctx.commit = Some(commit.commit.clone());
+        if let Err(error) = ctx.request_transition(GoalStatus::Implement, GoalStatus::Quality) {
+            retain_candidate_handoff_after_failure(
+                ctx.runtime_root,
+                &handoff_id,
+                "candidate_handoff_transition_failed",
+                &error,
+            );
+            return fail(ctx, "candidate_handoff", error);
+        }
         Ok(WorkflowAdvanceOutcome::Transition {
-            from: GoalStatus::InProgress,
-            to: next,
+            from: GoalStatus::Implement,
+            to: GoalStatus::Quality,
             reason: "Implementation completed".to_string(),
         })
     }
 }
 
-impl WorkflowBehavior for WorkflowQa {
+impl WorkflowBehavior for WorkflowQuality {
     fn observes(&self) -> GoalStatus {
-        GoalStatus::Qa
+        GoalStatus::Quality
     }
 
     fn advance(&self, ctx: &mut WorkflowContext<'_>) -> RefineResult<WorkflowAdvanceOutcome> {
+        let (quality_report, quality_commit) = if ctx.reconciliation.is_some() {
+            (
+                "Legacy integrated candidate retained; Quality ran against the exact integrated target."
+                    .to_string(),
+                ctx.require_commit()?.to_string(),
+            )
+        } else {
+            match run_quality_correction_agent(ctx) {
+                Ok(result) => result,
+                Err(error) => return fail(ctx, "quality", error),
+            }
+        };
+        ctx.commit = Some(quality_commit.clone());
+        if let Err(error) = ctx
+            .work_items
+            .update_goal_candidate_commit(&ctx.goal_id, &quality_commit)
+        {
+            return fail(ctx, "quality", error);
+        }
+        ctx.work_items.update_goal_round_evaluation_summary(
+            &ctx.goal_id,
+            ctx.round_idx,
+            &json!({
+                "quality_agent_report": quality_report,
+                "quality_candidate_commit": quality_commit
+            }),
+        )?;
         let quality = match run_workflow_quality(ctx) {
             Ok(result) => result,
             Err(error) if ctx.reconciliation.is_some() => {
@@ -552,11 +664,14 @@ impl WorkflowBehavior for WorkflowQa {
                 return Err(error);
             }
             Err(error) => {
-                let category = if is_quality_harness_fault(&error) {
-                    "quality_harness"
-                } else {
-                    "quality"
-                };
+                let category =
+                    if crate::tools::host::quality::is_quality_candidate_infrastructure(&error) {
+                        "quality_candidate_infrastructure"
+                    } else if is_quality_harness_fault(&error) {
+                        "quality_harness"
+                    } else {
+                        "quality"
+                    };
                 return fail(
                     ctx,
                     category,
@@ -589,15 +704,15 @@ impl WorkflowBehavior for WorkflowQa {
                     }))),
                 )?;
                 ctx.reconciliation_state = Some("completed".to_string());
-                ctx.request_transition(GoalStatus::Qa, GoalStatus::Done)?;
+                ctx.request_transition(GoalStatus::Quality, GoalStatus::Done)?;
                 return Ok(WorkflowAdvanceOutcome::Transition {
-                    from: GoalStatus::Qa,
+                    from: GoalStatus::Quality,
                     to: GoalStatus::Done,
                     reason: "Already-merged candidate passed reconciliation Quality".to_string(),
                 });
             }
 
-            let merger = FileMergerService::with_target_root(
+            let integration_service = FileGovernanceIntegrationService::with_target_root(
                 ctx.runtime_root,
                 ctx.refine_dir(),
                 ctx.target_root,
@@ -608,15 +723,11 @@ impl WorkflowBehavior for WorkflowQa {
             ));
             let goal_id = ctx.goal_id.clone();
             let round_idx = ctx.round_idx;
-            let claim_id = ctx.claim_id.clone();
-            let execution_id = ctx.execution_id.clone();
             let node_id = ctx.node_id.clone();
-            let reverted = match merger.revert_reconciled_candidate_and_settle(
+            let reverted = match integration_service.revert_reconciled_candidate_and_settle(
                 ReconciliationRequest {
                     goal_id: &goal_id,
                     round_idx,
-                    claim_id: &claim_id,
-                    execution_id: &execution_id,
                     node_id: &node_id,
                     integration: &integration,
                     expected_target_commit: &quality.candidate_commit,
@@ -695,227 +806,142 @@ impl WorkflowBehavior for WorkflowQa {
             return Err(reconciliation_failure);
         }
         if !quality.ok {
-            return fail(ctx, "quality", RefineError::Conflict(quality.summary));
+            let recovery = match investigate_quality_failure(ctx, &quality_report, &quality) {
+                Ok(recovery) => recovery,
+                Err(error) => return fail(ctx, "quality_recovery", error),
+            };
+            return handle_quality_finding(ctx, &recovery);
         }
-        let next = if ctx.quality_timing(GoalStatus::Qa)? == POST_BUILD {
-            GoalStatus::Review
-        } else {
-            GoalStatus::ReadyMerge
-        };
-        ctx.request_transition(GoalStatus::Qa, next.clone())?;
+        ctx.request_transition(GoalStatus::Quality, GoalStatus::Governance)?;
+        if let Some(handoff) = find_candidate_handoff(
+            ctx.runtime_root,
+            ctx.target_root,
+            &ctx.goal_id,
+            ctx.round_idx,
+        )? {
+            record_candidate_handoff_governance(
+                ctx.runtime_root,
+                &handoff.id,
+                &quality.candidate_commit,
+            )?;
+        }
         Ok(WorkflowAdvanceOutcome::Transition {
-            from: GoalStatus::Qa,
-            to: next,
+            from: GoalStatus::Quality,
+            to: GoalStatus::Governance,
             reason: "Quality checks passed".to_string(),
         })
     }
 }
 
-impl WorkflowBehavior for WorkflowReadyMerge {
+impl WorkflowBehavior for WorkflowGovernance {
     fn observes(&self) -> GoalStatus {
-        GoalStatus::ReadyMerge
+        GoalStatus::Governance
     }
 
     fn advance(&self, ctx: &mut WorkflowContext<'_>) -> RefineResult<WorkflowAdvanceOutcome> {
         let branch = ctx.require_branch()?.to_string();
         let commit = ctx.require_commit()?.to_string();
+        let worktree_path = ctx.require_worktree_path()?.to_string();
+        let goal = ctx.work_items.show_goal_detail(&ctx.goal_id)?;
+        let agent_context = ensure_goal_agent_context(ctx, &goal)?;
+        let agent_cwd = agent_worktree_cwd(
+            &worktree_path,
+            setting_string(&ctx.settings, "agent_subpath", "").as_str(),
+        )?;
+        let governance =
+            evaluate_workflow_governance(ctx, &worktree_path, &agent_cwd, &agent_context)?;
+        record_governance(ctx, &governance)?;
+        if governance.failed {
+            return handle_governance_finding(ctx, &governance);
+        }
         let remote = ctx.git_remote()?;
-        let timing = ctx.quality_timing(GoalStatus::ReadyMerge)?;
-        let next = GoalStatus::Build;
-        let merger = FileMergerService::with_target_root(
+        let worktree_git =
+            FileGitWorktreeService::with_runtime_root(&worktree_path, ctx.runtime_root);
+        if worktree_git.remote_exists(&remote)? {
+            with_repository_git_lock(ctx.target_root, || worktree_git.push(&remote, &branch))?;
+        }
+        let next = GoalStatus::Review;
+        let integration_service = FileGovernanceIntegrationService::with_target_root(
             ctx.runtime_root,
             ctx.refine_dir(),
             ctx.target_root,
         );
         let goal_id = ctx.goal_id.clone();
-        let claim_id = ctx.claim_id.clone();
-        let execution_id = ctx.execution_id.clone();
         let node_id = ctx.node_id.clone();
         let round_idx = ctx.round_idx;
-        let integration = match merger.integrate_workflow_candidate_and_settle(
-            &goal_id,
-            round_idx,
-            &claim_id,
-            &execution_id,
-            &node_id,
-            &branch,
-            &commit,
-            &remote,
-            |integration| {
-                ctx.log(
-                    "merge",
-                    &format!("Ready Merge integrated implementation candidate {branch}"),
-                    Some(json_object(json!({
-                        "branch": branch,
-                        "quality_timing": timing,
-                        "integration": integration
-                    }))),
-                )?;
-                ctx.request_transition(GoalStatus::ReadyMerge, next.clone())
-            },
-        ) {
-            Ok((integration, _)) => integration,
-            Err(RefineError::StaleCandidate {
-                candidate_commit,
-                recorded_base,
-                target_branch,
-                target_commit,
-            }) => {
-                let stale_error = RefineError::StaleCandidate {
-                    candidate_commit: candidate_commit.clone(),
-                    recorded_base: recorded_base.clone(),
-                    target_branch: target_branch.clone(),
-                    target_commit: target_commit.clone(),
-                };
-                if let Err(recovery_error) = ctx.work_items.queue_stale_candidate_recovery_summary(
-                    &ctx.goal_id,
-                    ctx.round_idx,
-                    &candidate_commit,
-                    &recorded_base,
-                    &target_branch,
-                    &target_commit,
-                    &stale_error.to_string(),
-                ) {
-                    return fail(
-                        ctx,
-                        "merge",
-                        RefineError::Conflict(format!(
-                            "{stale_error}; automatic fresh-round recovery failed: {recovery_error}"
-                        )),
-                    );
-                }
-                ctx.log(
-                    "merge",
-                    "Ready Merge rejected a stale candidate and queued a fresh recovery round",
-                    Some(json_object(json!({
-                        "candidate_commit": candidate_commit,
-                        "recorded_base": recorded_base,
-                        "target_branch": target_branch,
-                        "target_commit": target_commit,
-                        "successor_round": ctx.round_idx + 2,
-                        "error": stale_error.to_string()
-                    }))),
-                )?;
-                ctx.final_status = Some(GoalStatus::Todo);
-                return Ok(WorkflowAdvanceOutcome::Completed {
-                    final_status: GoalStatus::Todo,
-                    reason:
-                        "Stale candidate preserved; fresh recovery round queued from current target"
-                            .to_string(),
-                });
+        let (integration, transitioned) = match integration_service
+            .integrate_workflow_candidate_and_settle(
+                &goal_id,
+                round_idx,
+                &node_id,
+                &branch,
+                &commit,
+                &remote,
+                |integration| {
+                    ctx.log(
+                        "governance_integration",
+                        &format!(
+                            "Governance integrated approved implementation candidate {branch}"
+                        ),
+                        Some(json_object(json!({
+                            "branch": branch,
+                            "integration": integration
+                        }))),
+                    )?;
+                    let current = ctx.work_items.show_goal_summary(&ctx.goal_id)?;
+                    if current.goal.status == GoalStatus::Cancelled {
+                        Ok(false)
+                    } else {
+                        ctx.request_transition(GoalStatus::Governance, GoalStatus::Review)?;
+                        Ok(true)
+                    }
+                },
+            ) {
+            Ok(settled) => settled,
+            Err(error @ RefineError::StaleCandidate { .. }) => {
+                return fail(ctx, "governance_integration", error);
             }
             Err(error)
-                if error.to_string().contains("Ready Merge execution")
-                    && error.to_string().contains("was cancelled") =>
+                if ctx
+                    .work_items
+                    .show_goal_summary(&ctx.goal_id)
+                    .is_ok_and(|goal| goal.goal.status == GoalStatus::Cancelled) =>
             {
                 return Err(error);
             }
-            Err(error) => return fail(ctx, "merge", error),
+            Err(error) => return fail(ctx, "governance_integration", error),
         };
         ctx.merge = Some(integration.merge);
+        if let Some(handoff) = find_candidate_handoff(
+            ctx.runtime_root,
+            ctx.target_root,
+            &ctx.goal_id,
+            ctx.round_idx,
+        )? {
+            settle_candidate_handoff(
+                ctx.runtime_root,
+                &handoff.id,
+                "candidate_integrated",
+                json!({
+                    "candidate_commit": commit,
+                    "round_idx": ctx.round_idx
+                }),
+            )?;
+        }
+        if !transitioned {
+            ctx.final_status = Some(GoalStatus::Cancelled);
+            return Ok(WorkflowAdvanceOutcome::Completed {
+                final_status: GoalStatus::Cancelled,
+                reason: "Governance finished after Goal cancellation; integration evidence was preserved"
+                    .to_string(),
+            });
+        }
         Ok(WorkflowAdvanceOutcome::Transition {
-            from: GoalStatus::ReadyMerge,
+            from: GoalStatus::Governance,
             to: next,
-            reason: "Ready Merge integrated the implementation candidate".to_string(),
+            reason: "Governance passed and integrated the implementation candidate".to_string(),
         })
     }
-}
-
-impl WorkflowBehavior for WorkflowBuild {
-    fn observes(&self) -> GoalStatus {
-        GoalStatus::Build
-    }
-
-    fn advance(&self, ctx: &mut WorkflowContext<'_>) -> RefineResult<WorkflowAdvanceOutcome> {
-        if let Err(error) = verify_integrated_target_checkout(ctx, "before build") {
-            return fail(ctx, "build", error);
-        }
-        let target_app =
-            FileTargetAppService::new(ctx.refine_dir(), ctx.runtime_root, ctx.target_root);
-        let build = match target_app
-            .build_with_metadata(ctx.workflow_process_metadata("build", "WorkflowBuild"))
-        {
-            Ok(snapshot) if snapshot.ok => snapshot,
-            Ok(snapshot) => {
-                let error = RefineError::Conflict(snapshot.message.clone());
-                ctx.log(
-                    "build",
-                    "Target app build failed",
-                    Some(json_object(json!({"target_app": &snapshot}))),
-                )?;
-                return fail(ctx, "build", error);
-            }
-            Err(error) => return fail(ctx, "build", error),
-        };
-        if let Err(error) = verify_integrated_target_checkout(ctx, "after build") {
-            return fail(ctx, "build", error);
-        }
-        let skipped = build.last_operation.is_none();
-        ctx.log(
-            "build",
-            if skipped {
-                "Target app rebuild skipped"
-            } else {
-                "Target app rebuild passed"
-            },
-            Some(json_object(json!({
-                "target_app": &build,
-                "skipped": skipped,
-                "checkout": ctx.target_root.display().to_string()
-            }))),
-        )?;
-        let next = if ctx.quality_timing(GoalStatus::Build)? == POST_BUILD {
-            GoalStatus::Qa
-        } else {
-            GoalStatus::Review
-        };
-        ctx.request_transition(GoalStatus::Build, next.clone())?;
-        Ok(WorkflowAdvanceOutcome::Transition {
-            from: GoalStatus::Build,
-            to: next,
-            reason: if skipped {
-                "Target app rebuild was not configured".to_string()
-            } else {
-                "Target app rebuild passed".to_string()
-            },
-        })
-    }
-}
-
-fn verify_integrated_target_checkout(ctx: &WorkflowContext<'_>, phase: &str) -> RefineResult<()> {
-    let detail = ctx.work_items.show_goal_detail(&ctx.goal_id)?;
-    let expected_commit = detail
-        .get("rounds")
-        .and_then(Value::as_array)
-        .and_then(|rounds| rounds.get(ctx.round_idx))
-        .and_then(|round| round.get("workflow_integration"))
-        .and_then(|integration| integration.get("target_commit"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|commit| !commit.is_empty())
-        .ok_or_else(|| {
-            RefineError::Conflict(format!(
-                "Goal {} has no integrated target commit for {phase}",
-                ctx.goal_id
-            ))
-        })?;
-    let git = FileGitWorktreeService::new(ctx.target_root);
-    let head = git.head_ref()?;
-    if head.commit.as_deref() != Some(expected_commit) {
-        return Err(RefineError::Conflict(format!(
-            "integrated-target {phase} found HEAD {}, expected {expected_commit}; checkout was preserved",
-            head.commit.as_deref().unwrap_or("<unborn>")
-        )));
-    }
-    let status = git.inspect("")?;
-    if status.dirty_user_changes {
-        return Err(RefineError::Conflict(format!(
-            "integrated-target {phase} found a dirty index or worktree at {}; residue remains attributed to Goal {}",
-            ctx.target_root.display(),
-            ctx.goal_id
-        )));
-    }
-    Ok(())
 }
 
 impl WorkflowBehavior for WorkflowReview {
@@ -970,17 +996,121 @@ impl WorkflowBehavior for WorkflowCancelled {
     }
 }
 
-fn run_workflow_quality(ctx: &WorkflowContext<'_>) -> RefineResult<QualityCheckResult> {
-    QualityOperationRunner::new(ctx.refine_dir(), ctx.runtime_root, ctx.target_root)
-        .run_goal_checks(
-            &ctx.goal_id,
-            &ctx.provider,
-            ctx.workflow_process_metadata("qa", "WorkflowQa"),
+fn run_quality_correction_agent(ctx: &mut WorkflowContext<'_>) -> RefineResult<(String, String)> {
+    let worktree_path = ctx.require_worktree_path()?.to_string();
+    let goal = ctx.work_items.show_goal_detail(&ctx.goal_id)?;
+    let agent_context = ensure_goal_agent_context(ctx, &goal)?;
+    let round = goal
+        .get("rounds")
+        .and_then(Value::as_array)
+        .and_then(|rounds| rounds.get(ctx.round_idx))
+        .ok_or_else(|| {
+            RefineError::NotFound(format!(
+                "Goal {} has no round {} for Quality",
+                ctx.goal_id,
+                ctx.round_idx + 1
+            ))
+        })?;
+    let plan = round
+        .get("implementation_plan")
+        .and_then(|plan| plan.get("final_plan"))
+        .and_then(|artifact| artifact.get("result"))
+        .cloned()
+        .unwrap_or_else(|| json!({
+            "summary": "Validate an imported implementation candidate.",
+            "checklist": [{
+                "id": "IMPORTED",
+                "description": round.get("prompt").and_then(Value::as_str).unwrap_or("Review the imported candidate")
+            }]
+        }));
+    let implementation_report = round
+        .get("implementation_report")
+        .and_then(Value::as_str)
+        .unwrap_or("No implementation report was recorded.");
+    let context_json = serde_json::to_string_pretty(&agent_context).map_err(|error| {
+        RefineError::Serialization(format!("failed to encode Quality context: {error}"))
+    })?;
+    let plan_json = serde_json::to_string_pretty(&plan).map_err(|error| {
+        RefineError::Serialization(format!("failed to encode finalized plan: {error}"))
+    })?;
+    let prompt = PromptEngine::render(
+        PromptTemplate::GoalWorkflowQualityAgent,
+        &[
+            ("context_json", &context_json),
+            ("plan_json", &plan_json),
+            ("implementation_report", implementation_report),
+        ],
+    )
+    .map_err(|error| RefineError::Serialization(format!("invalid Quality prompt: {error}")))?;
+    let agent_cwd = agent_worktree_cwd(
+        &worktree_path,
+        setting_string(&ctx.settings, "agent_subpath", "").as_str(),
+    )?;
+    let report = if cfg!(test) && ctx.provider == "smoke-ai" {
+        "Smoke AI Quality fixture reviewed the candidate and retained existing tests.".to_string()
+    } else {
+        let result = run_goal_agent_with_settlement(
+            GoalAgentLaunch {
+                runtime_root: ctx.runtime_root.to_path_buf(),
+                cwd: agent_cwd,
+                provider: ctx.provider.clone(),
+                prompt,
+                metadata: ctx.workflow_process_metadata("quality", "WorkflowQualityAgent"),
+                completion_timeout: Some(Duration::from_secs(setting_usize(
+                    &ctx.settings,
+                    "agent_hard_cap_seconds",
+                    7200,
+                ) as u64)),
+            },
+            |attention| {
+                let _ = ctx.log(
+                    "quality",
+                    "Quality Agent is waiting for user input",
+                    Some(json_object(json!({"message": attention.message}))),
+                );
+            },
+            |_| Ok(()),
+        )?;
+        result.output
+    };
+    let target_branch = setting_string(&ctx.settings, "merge_target_branch", "main");
+    let worktree_git = FileGitWorktreeService::with_runtime_root(&worktree_path, ctx.runtime_root);
+    let commit = with_repository_git_lock(ctx.target_root, || {
+        worktree_git.commit_or_clean_noop_since(
+            &format!("Quality {} round {}", ctx.goal_id, ctx.round_idx + 1),
+            &[],
+            &target_branch,
         )
-        .map(|operation| operation.result)
+    })?;
+    ctx.log(
+        "quality",
+        "Quality Agent completed candidate review and corrections",
+        Some(json_object(json!({
+            "candidate_commit": commit.commit,
+            "report": report
+        }))),
+    )?;
+    Ok((report, commit.commit))
 }
 
-const GOAL_AGENT_WORKFLOW_SUMMARY: &str = "Refine gives this Goal Agent an isolated worktree. Implement and verify the current Round; Refine then commits the candidate, runs configured Quality, integrates it at Ready Merge, performs any configured build and post-build Quality, and stops at human Review. Do not directly advance Goal state, approve, or merge.";
+fn run_workflow_quality(ctx: &mut WorkflowContext<'_>) -> RefineResult<QualityCheckResult> {
+    let runner = QualityOperationRunner::new(ctx.refine_dir(), ctx.runtime_root, ctx.target_root);
+    if let (Some(operation_id), Some(request)) =
+        (ctx.quality_operation_id.take(), ctx.quality_request.take())
+    {
+        runner
+            .run_registered(&operation_id, request)
+            .map(|operation| operation.result)
+    } else {
+        runner
+            .run_goal_checks(
+                &ctx.goal_id,
+                &ctx.provider,
+                ctx.workflow_process_metadata("quality", "WorkflowQuality"),
+            )
+            .map(|operation| operation.result)
+    }
+}
 
 fn ensure_goal_agent_context(ctx: &WorkflowContext<'_>, goal: &Value) -> RefineResult<Value> {
     let round = goal
@@ -1064,7 +1194,7 @@ fn goal_agent_context(
             "rules": governance.get("rules").cloned().unwrap_or_else(|| json!([])),
             "configured": governance.get("configured").cloned().unwrap_or(Value::Bool(false)),
         },
-        "workflow_summary": GOAL_AGENT_WORKFLOW_SUMMARY,
+        "workflow_summary": PromptEngine::load(PromptTemplate::GoalAgentWorkflowSummary),
         "guidance_candidates": guidance_candidates,
         "goal": goal_context,
         "previous_rounds": previous_rounds,
@@ -1176,6 +1306,75 @@ fn is_code_path(path: &str) -> bool {
     )
 }
 
+fn investigate_quality_failure(
+    ctx: &WorkflowContext<'_>,
+    quality_agent_report: &str,
+    quality: &QualityCheckResult,
+) -> RefineResult<QualityRecoveryInvestigation> {
+    let worktree_path = ctx.require_worktree_path()?.to_string();
+    let goal = ctx.work_items.show_goal_detail(&ctx.goal_id)?;
+    let agent_context = ensure_goal_agent_context(ctx, &goal)?;
+    let provider_cwd = agent_worktree_cwd(
+        &worktree_path,
+        setting_string(&ctx.settings, "agent_subpath", "").as_str(),
+    )?;
+    let prompt = quality_recovery_prompt(
+        &ctx.goal_id,
+        ctx.round_idx,
+        &worktree_path,
+        &agent_context,
+        quality_agent_report,
+        quality,
+    )?;
+    let worktree_git = FileGitWorktreeService::with_runtime_root(&worktree_path, ctx.runtime_root);
+    let before = worktree_git.implementation_planning_observation()?;
+    if before.head_commit != quality.candidate_commit {
+        return Err(RefineError::Conflict(format!(
+            "Quality recovery expected candidate {} but worktree HEAD is {}",
+            quality.candidate_commit, before.head_commit
+        )));
+    }
+    if !before.status_porcelain.is_empty() {
+        return Err(RefineError::Conflict(
+            "Quality recovery requires a clean candidate worktree".to_string(),
+        ));
+    }
+
+    let provider = HostAgentProviderService::with_runtime_root(ctx.runtime_root.join("agents"));
+    let output = provider.invoke(ProviderInvocation {
+        provider: ctx.provider.clone(),
+        prompt,
+        session_id: None,
+        cwd: Some(provider_cwd.display().to_string()),
+        process_metadata: ctx
+            .workflow_process_metadata("quality_recovery", "WorkflowQualityRecovery"),
+    })?;
+
+    let after = worktree_git.implementation_planning_observation()?;
+    if after != before {
+        return Err(RefineError::Conflict(
+            "Quality recovery investigation modified the candidate worktree; recovery analysis must be read-only"
+                .to_string(),
+        ));
+    }
+    let mut recovery = parse_quality_recovery_provider_output(&output)?;
+    recovery
+        .details
+        .insert("provider".to_string(), Value::String(ctx.provider.clone()));
+    recovery
+        .details
+        .insert("worktree".to_string(), Value::String(worktree_path));
+    recovery.details.insert(
+        "cwd".to_string(),
+        Value::String(provider_cwd.display().to_string()),
+    );
+    recovery.details.insert(
+        "candidate_commit".to_string(),
+        Value::String(quality.candidate_commit.clone()),
+    );
+    Ok(recovery)
+}
+
 fn evaluate_workflow_governance(
     ctx: &WorkflowContext<'_>,
     worktree_path: &str,
@@ -1194,15 +1393,31 @@ fn evaluate_workflow_governance(
         .and_then(|value| value.as_array())
         .cloned()
         .unwrap_or_default();
-    if rules.is_empty() {
+    let guidance = agent_context
+        .get("guidance_candidates")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let product_or_constitution_configured = governance
+        .get("product")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+        || governance
+            .get("constitution")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+    if rules.is_empty() && guidance.is_empty() && !product_or_constitution_configured {
         return Ok(GovernanceEvaluation {
             failed: false,
             message: None,
+            recovery_analysis: None,
+            recovery_round_prompt: None,
             details: json_object(json!({
                 "phase": "post_implementation",
                 "configured": false,
                 "governance_configured": governance.get("configured").and_then(Value::as_bool).unwrap_or(false),
                 "rules_checked": 0,
+                "guidance_checked": 0,
                 "failed_actions": []
             })),
         });
@@ -1210,6 +1425,7 @@ fn evaluate_workflow_governance(
     let prompt = post_implementation_governance_prompt(
         &governance,
         &rules,
+        &guidance,
         worktree_path,
         provider_cwd,
         &ctx.goal_id,
@@ -1221,13 +1437,15 @@ fn evaluate_workflow_governance(
         prompt,
         session_id: None,
         cwd: Some(provider_cwd.display().to_string()),
-        process_metadata: ctx
-            .workflow_process_metadata("in-progress", "WorkflowImplementationGovernance"),
+        process_metadata: ctx.workflow_process_metadata("governance", "WorkflowGovernance"),
     })?;
     let mut evaluation = parse_governance_provider_output(&output, rules.len());
     evaluation
         .details
         .insert("provider".to_string(), Value::String(ctx.provider.clone()));
+    evaluation
+        .details
+        .insert("guidance_checked".to_string(), json!(guidance.len()));
     evaluation.details.insert(
         "worktree".to_string(),
         Value::String(worktree_path.to_string()),
@@ -1274,7 +1492,9 @@ fn record_governance(
             "governance_rule_actions": evaluation.details
                 .get("failed_actions")
                 .cloned()
-                .unwrap_or_else(|| json!([]))
+                .unwrap_or_else(|| json!([])),
+            "governance_recovery_analysis": evaluation.recovery_analysis,
+            "governance_recovery_round_prompt": evaluation.recovery_round_prompt
         }),
     )?;
     ctx.log(
@@ -1288,7 +1508,162 @@ fn record_governance(
     )
 }
 
+fn handle_quality_finding(
+    ctx: &mut WorkflowContext<'_>,
+    recovery: &QualityRecoveryInvestigation,
+) -> RefineResult<WorkflowAdvanceOutcome> {
+    ctx.work_items.update_goal_round_evaluation_summary(
+        &ctx.goal_id,
+        ctx.round_idx,
+        &json!({
+            "quality_recovery_analysis": recovery.analysis,
+            "quality_recovery_round_prompt": recovery.round_prompt,
+            "quality_recovery_details": recovery.details,
+            "quality_recovery_checked_at": now_timestamp()
+        }),
+    )?;
+    let current_attempt = current_automatic_retry_attempt(ctx)?;
+    let max_retries = max_automatic_round_retries(ctx)?;
+    if current_attempt >= max_retries {
+        return fail(
+            ctx,
+            "quality_retry_exhausted",
+            RefineError::Conflict(format!(
+                "Quality findings remain after {max_retries} automatic recovery Rounds"
+            )),
+        );
+    }
+    let next_attempt = current_attempt + 1;
+    ctx.work_items.queue_quality_recovery_summary(
+        &ctx.goal_id,
+        ctx.round_idx,
+        next_attempt,
+        &recovery.analysis,
+        &recovery.round_prompt,
+    )?;
+    ctx.log(
+        "quality",
+        "Quality drafted a fresh automatic recovery Round",
+        Some(json_object(json!({
+            "attempt": next_attempt,
+            "max_automatic_round_retries": max_retries,
+            "source_round": ctx.round_idx + 1
+        }))),
+    )?;
+    ctx.final_status = Some(GoalStatus::Todo);
+    Ok(WorkflowAdvanceOutcome::Completed {
+        final_status: GoalStatus::Todo,
+        reason: "Quality findings queued a fresh recovery Round".to_string(),
+    })
+}
+
+fn handle_governance_finding(
+    ctx: &mut WorkflowContext<'_>,
+    evaluation: &GovernanceEvaluation,
+) -> RefineResult<WorkflowAdvanceOutcome> {
+    if evaluation
+        .details
+        .get("verdict_parse_error")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return fail(
+            ctx,
+            "governance",
+            RefineError::Conflict(
+                evaluation
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "Governance verdict could not be parsed".to_string()),
+            ),
+        );
+    }
+    let analysis = evaluation.recovery_analysis.as_deref().ok_or_else(|| {
+        RefineError::Serialization(
+            "failing Governance verdict omitted recovery_analysis".to_string(),
+        )
+    });
+    let prompt = evaluation.recovery_round_prompt.as_deref().ok_or_else(|| {
+        RefineError::Serialization(
+            "failing Governance verdict omitted recovery_round_prompt".to_string(),
+        )
+    });
+    let (analysis, prompt) = match (analysis, prompt) {
+        (Ok(analysis), Ok(prompt)) => (analysis, prompt),
+        (Err(error), _) | (_, Err(error)) => return fail(ctx, "governance", error),
+    };
+    let current_attempt = current_automatic_retry_attempt(ctx)?;
+    let max_retries = max_automatic_round_retries(ctx)?;
+    if current_attempt >= max_retries {
+        return fail(
+            ctx,
+            "governance_retry_exhausted",
+            RefineError::Conflict(format!(
+                "Governance findings remain after {max_retries} automatic recovery Rounds"
+            )),
+        );
+    }
+    let next_attempt = current_attempt + 1;
+    ctx.work_items.queue_governance_recovery_summary(
+        &ctx.goal_id,
+        ctx.round_idx,
+        next_attempt,
+        analysis,
+        prompt,
+    )?;
+    ctx.log(
+        "governance",
+        "Governance drafted a fresh automatic recovery Round",
+        Some(json_object(json!({
+            "attempt": next_attempt,
+            "max_automatic_round_retries": max_retries,
+            "source_round": ctx.round_idx + 1
+        }))),
+    )?;
+    ctx.final_status = Some(GoalStatus::Todo);
+    Ok(WorkflowAdvanceOutcome::Completed {
+        final_status: GoalStatus::Todo,
+        reason: "Governance findings queued a fresh recovery Round".to_string(),
+    })
+}
+
+fn current_automatic_retry_attempt(ctx: &WorkflowContext<'_>) -> RefineResult<u32> {
+    Ok(ctx
+        .work_items
+        .show_goal_detail(&ctx.goal_id)?
+        .get("rounds")
+        .and_then(Value::as_array)
+        .and_then(|rounds| rounds.get(ctx.round_idx))
+        .and_then(|round| round.get("automatic_retry"))
+        .and_then(|retry| retry.get("attempt"))
+        .and_then(Value::as_u64)
+        .and_then(|attempt| u32::try_from(attempt).ok())
+        .unwrap_or(0))
+}
+
+fn max_automatic_round_retries(ctx: &WorkflowContext<'_>) -> RefineResult<u32> {
+    Ok(FileGovernanceService::new(ctx.refine_dir())
+        .load()?
+        .get("max_automatic_round_retries")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(5))
+}
+
 fn fail<T>(ctx: &WorkflowContext<'_>, category: &str, error: RefineError) -> RefineResult<T> {
+    if let Ok(Some(handoff)) = find_candidate_handoff(
+        ctx.runtime_root,
+        ctx.target_root,
+        &ctx.goal_id,
+        ctx.round_idx,
+    ) {
+        retain_candidate_handoff_after_failure(
+            ctx.runtime_root,
+            &handoff.id,
+            "candidate_handoff_workflow_failed",
+            &error,
+        );
+    }
     let _ = ctx.fail(category, &error);
     Err(error)
 }

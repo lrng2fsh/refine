@@ -20,11 +20,13 @@ Guidance is a capability because Refine uses it to shape action. It should affec
 
 Guidance should sit between raw user instruction and automated action. It should be reusable by workflow, tools, quality, governance, import, surfaces, and agents.
 
-The current implementation has explicit services and surfaces for settings, guidance, governance, reporters, quality settings, target-app lifecycle instructions, deterministic checks, and generated project rules. Internal agent prompts are Markdown templates under `src/prompts` and use one shared prompt engine. Those are implementation details, but they protect an important separation: prompt templates define the small reusable task frame, while guidance supplies durable target-app context that workflow and tools can reuse.
+The current implementation has explicit services and surfaces for settings, guidance, governance, reporters, quality settings, target-app lifecycle instructions, deterministic checks, and generated project rules. Internal agent prompts are Markdown templates grouped under `src/prompts/<feature>/` and use one shared prompt engine. Those are implementation details, but they protect an important separation: prompt templates define the small reusable task frame, while guidance supplies durable target-app context that workflow and tools can reuse.
 
 Guidance should not become a wall of policy text that agents ignore or a reason to expand every system prompt. It should be specific, current, structured enough to retrieve, and close enough to the work that it changes outcomes. Prompt changes should prefer less prescription when repository discovery, a prototype, or a focused user interview can close the gap more reliably.
 
-For Goal implementation, Refine snapshots every enabled guidance candidate into the current Round before launching the Goal Agent. The same agent decides which candidates apply while performing the implementation and reports their indexes with its completion signal. Refine validates and records the applied and skipped candidates without launching a separate guidance-classification turn.
+For Goal workflow phases, Refine snapshots every enabled guidance candidate into the current Round before launching the Goal Agent. The same agent decides which candidates apply and reports their zero-based integer indexes with its completion signal; display names are not signal identifiers. Refine validates and records the applied and skipped candidates without launching a separate guidance-classification turn.
+
+Guidance persistence assigns every entry a stable id and keeps a collection revision. Legacy array files are normalized and migrated in place under the existing record coordination boundary. Browser and CLI item mutations identify one entry and submit the revision they observed; compatibility whole-list replacement is revision-fenced too. A stale writer receives a conflict and must refresh, so adding, editing, enabling, disabling, or removing one entry cannot silently erase an unrelated concurrent change.
 
 ## Future Direction
 

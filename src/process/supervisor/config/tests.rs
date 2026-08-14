@@ -183,14 +183,17 @@ fn file_settings_service_normalizes_node_stored_build_settings() {
         "Build and repair setup issues"
     );
     assert_eq!(settings["target_app_build_timeout_seconds"], "45");
-    assert_eq!(settings["target_app_auto_build"], "daily");
-    assert_eq!(settings["target_app_auto_build_hour_utc"], "4");
-    assert_eq!(settings["quality_timing"], "post_build");
+    assert!(!settings.contains_key("target_app_auto_build"));
+    assert!(!settings.contains_key("target_app_auto_build_hour_utc"));
+    assert!(!settings.contains_key("quality_timing"));
     let written = fs::read_to_string(service.path()).unwrap();
     assert!(written.contains("target_app_build_command"));
     assert!(written.contains("target_app_build_instructions"));
     assert!(!written.contains("target_app_rebuild_command"));
     assert!(!written.contains("target_app_rebuild_instructions"));
+    assert!(!written.contains("target_app_auto_rebuild"));
+    assert!(!written.contains("target_app_auto_build"));
+    assert!(!written.contains("quality_timing"));
     assert!(!refine_dir.join(SETTINGS_FILE).exists());
 
     fs::remove_dir_all(temp_root).unwrap();
@@ -237,15 +240,18 @@ fn file_project_config_services_persist_governance_guidance_and_reporters() {
     let refine_dir = temp_root.join(".refine");
 
     let governance = FileGovernanceService::new(&refine_dir);
+    assert_eq!(governance.load().unwrap()["max_automatic_round_retries"], 5);
     let saved = governance
         .save(&json!({
             "product": "Refine",
             "constitution": "Be useful",
-            "rules": [{"text": "No regressions"}]
+            "rules": [{"text": "No regressions"}],
+            "max_automatic_round_retries": 3
         }))
         .unwrap();
     assert_eq!(saved["configured"], true);
     assert_eq!(saved["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(saved["max_automatic_round_retries"], 3);
     assert_eq!(
         governance
             .generate_rules(&json!({"product": "Refine", "constitution": "Be useful"}))
@@ -318,6 +324,155 @@ fn file_project_config_services_persist_governance_guidance_and_reporters() {
             .unwrap();
     assert_eq!(feature["reporter"], "Alex");
     assert_eq!(feature["assignee"], "Alex");
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn guidance_migrates_stable_ids_and_rejects_stale_item_mutations() {
+    let temp_root = unique_temp_dir("guidance-revisions");
+    let refine_dir = temp_root.join(".refine");
+    fs::create_dir_all(&refine_dir).unwrap();
+    fs::write(
+        refine_dir.join(GUIDANCE_FILE),
+        serde_json::to_vec_pretty(&json!([{
+            "name": "Existing",
+            "rule": "Always",
+            "instructions": "Keep this entry",
+            "enabled": true
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let service = FileGuidanceService::new(&refine_dir);
+
+    let migrated = service.list().unwrap();
+    assert_eq!(migrated["revision"], 0);
+    assert_eq!(migrated["guidance"][0]["id"], "guidance-1");
+    assert!(
+        serde_json::from_str::<Value>(&fs::read_to_string(refine_dir.join(GUIDANCE_FILE)).unwrap())
+            .unwrap()
+            .is_object()
+    );
+
+    let added = service
+        .add(&json!({
+            "revision": 0,
+            "name": "Second",
+            "rule": "When needed",
+            "instructions": "Preserve the first entry",
+            "enabled": false
+        }))
+        .unwrap();
+    assert_eq!(added["revision"], 1);
+    assert_eq!(added["guidance"].as_array().unwrap().len(), 2);
+    let second_id = added["guidance"][1]["id"].as_str().unwrap();
+    assert!(
+        service
+            .edit(second_id, &json!({"revision": 0, "enabled": true}))
+            .is_err()
+    );
+    let edited = service
+        .edit(second_id, &json!({"revision": 1, "enabled": true}))
+        .unwrap();
+    assert_eq!(edited["revision"], 2);
+    assert_eq!(edited["guidance"][0]["name"], "Existing");
+    assert_eq!(edited["guidance"][1]["enabled"], true);
+    assert!(matches!(
+        service.remove("missing", &json!({"revision": 2})),
+        Err(RefineError::NotFound(_))
+    ));
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn guidance_migrates_unaddressable_ids_and_rejects_invalid_revisions() {
+    let temp_root = unique_temp_dir("guidance-addressable-ids");
+    let refine_dir = temp_root.join(".refine");
+    fs::create_dir_all(&refine_dir).unwrap();
+    fs::write(
+        refine_dir.join(GUIDANCE_FILE),
+        serde_json::to_vec_pretty(&json!([{
+            "id": "not/addressable",
+            "name": "Existing",
+            "rule": "Always",
+            "instructions": "Keep this entry",
+            "enabled": true
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let service = FileGuidanceService::new(&refine_dir);
+
+    let migrated = service.list().unwrap();
+    assert_eq!(migrated["guidance"][0]["id"], "guidance-1");
+    assert!(matches!(
+        service.edit("guidance-1", &json!({"revision": "0", "enabled": false})),
+        Err(RefineError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        service.update(&json!({
+            "revision": 0,
+            "guidance": migrated["guidance"],
+            "unknown": true
+        })),
+        Err(RefineError::InvalidInput(_))
+    ));
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn governance_rule_revisions_preserve_unrelated_fields_and_fence_stale_writers() {
+    let temp_root = unique_temp_dir("governance-revisions");
+    let refine_dir = temp_root.join(".refine");
+    let service = FileGovernanceService::new(&refine_dir);
+    let saved = service
+        .save(&json!({
+            "product": "Refine",
+            "constitution": "Local first",
+            "rules": [{"text": "One"}],
+            "rules_revision": 0
+        }))
+        .unwrap();
+    assert_eq!(saved["rules_revision"], 1);
+
+    let scalar = service
+        .save(&json!({"max_automatic_round_retries": 2}))
+        .unwrap();
+    assert_eq!(scalar["rules_revision"], 1);
+    assert_eq!(scalar["rules"][0]["text"], "One");
+    assert_eq!(scalar["product"], "Refine");
+
+    assert!(matches!(
+        service.save(&json!({"rules": [{"text": "Stale"}], "rules_revision": 0})),
+        Err(RefineError::Conflict(_))
+    ));
+    let replaced = service
+        .save(&json!({"rules": [{"text": "Two"}], "rules_revision": 1}))
+        .unwrap();
+    assert_eq!(replaced["rules_revision"], 2);
+    assert_eq!(replaced["rules"][0]["text"], "Two");
+    assert_eq!(replaced["constitution"], "Local first");
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn governance_rejects_invalid_revision_shapes() {
+    let temp_root = unique_temp_dir("governance-invalid-revision");
+    fs::create_dir_all(&temp_root).unwrap();
+    let service = FileGovernanceService::new(temp_root.join(".refine"));
+
+    assert!(matches!(
+        service.save(&json!({"rules": [], "rules_revision": "0"})),
+        Err(RefineError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        service.save(&json!({"rules_revision": 0})),
+        Err(RefineError::InvalidInput(_))
+    ));
 
     fs::remove_dir_all(temp_root).unwrap();
 }

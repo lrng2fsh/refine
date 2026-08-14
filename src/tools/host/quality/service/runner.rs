@@ -47,8 +47,8 @@ impl QualityOperationRunner {
         Ok(operation)
     }
 
-    /// Starts an operator-requested Quality evaluation under the same Node ownership and agent
-    /// capacity policy used by automated workflow work.
+    /// Starts an operator-requested Quality evaluation under the same soft, observable process
+    /// limits used by automated workflow work.
     pub fn start_manual_goal_checks(
         &self,
         goal_id: &str,
@@ -69,45 +69,27 @@ impl QualityOperationRunner {
 
         let engine = WorkflowEngine::with_target_root(&self.runtime_root, &self.target_root);
         let policy = engine.policy_for_refine_dir_and_node(&self.refine_dir, &active_node)?;
-        let capacity = AgentCapacityService::new(&self.runtime_root);
-        let lease_owner = format!(
-            "quality-manual:{}:{}",
-            summary.goal.id,
-            uuid::Uuid::new_v4()
-        );
-        let acquired = capacity.try_acquire(
+        if !engine.soft_capacity_available(
             &policy,
-            AgentCapacityRequest {
-                owner_id: lease_owner.clone(),
-                role: "quality".to_string(),
-                node_id: goal_node.to_string(),
-                provider: provider.to_string(),
-                target_app_id: self.target_root.display().to_string(),
-            },
-        )?;
-        if !acquired {
+            goal_node,
+            provider,
+            &self.target_root.display().to_string(),
+        )? {
             return Err(RefineError::Conflict(
                 "automation concurrency limit reached".to_string(),
             ));
         }
 
-        let (operation, request) = match self.register_goal_checks_for_node(
+        let (operation, request) = self.register_goal_checks_for_node(
             goal_id,
             provider,
             process_metadata,
             Some(&active_node),
-        ) {
-            Ok(registered) => registered,
-            Err(error) => {
-                let _ = capacity.release(&lease_owner);
-                return Err(error);
-            }
-        };
+        )?;
         let runner = self.clone();
         let operation_id = operation.id.clone();
         thread::spawn(move || {
             let _ = runner.run_registered(&operation_id, request);
-            let _ = AgentCapacityService::new(&runner.runtime_root).release(&lease_owner);
         });
         Ok(operation)
     }
@@ -181,14 +163,14 @@ impl QualityOperationRunner {
                 )
             });
         let post_build =
-            round.get("workflow_quality_timing").and_then(Value::as_str) == Some(POST_BUILD);
+            round.get("workflow_quality_timing").and_then(Value::as_str) == Some("post_build");
         let (cwd, evaluated_commit, evaluation_scope) = if post_build || reconciliation.is_some() {
             let integration = round
                 .get("workflow_integration")
                 .and_then(Value::as_object)
                 .ok_or_else(|| {
                     RefineError::Conflict(format!(
-                        "Goal {goal_id} cannot run post-build Quality without Ready Merge integration evidence"
+                        "Goal {goal_id} cannot reconcile legacy integrated Quality without Governance integration evidence"
                     ))
                 })?;
             let integrated_candidate = integration
@@ -201,7 +183,7 @@ impl QualityOperationRunner {
                 })?;
             if integrated_candidate != source_candidate_commit {
                 return Err(RefineError::Conflict(format!(
-                    "Goal {goal_id} post-build Quality candidate changed from {integrated_candidate} to {source_candidate_commit}"
+                    "Goal {goal_id} legacy integrated Quality candidate changed from {integrated_candidate} to {source_candidate_commit}"
                 )));
             }
             let (target_commit, evaluation_scope) = if reconciliation.is_some() {
@@ -259,14 +241,30 @@ impl QualityOperationRunner {
                     "Goal {goal_id} has no candidate branch for Quality evaluation"
                 ))
             })?;
-            let cwd =
-                FileGitWorktreeService::with_runtime_root(&self.target_root, &self.runtime_root)
-                    .existing_worktree_for_branch(branch)?
-                    .ok_or_else(|| {
-                        RefineError::Conflict(format!(
-                            "Goal {goal_id} candidate worktree was not found"
-                        ))
-                    })?;
+            let git =
+                FileGitWorktreeService::with_runtime_root(&self.target_root, &self.runtime_root);
+            let expected_path = git
+                .git_path("refine-worktrees")?
+                .join(branch.replace('/', "-"));
+            let cwd = git.existing_worktree_for_branch(branch)?.ok_or_else(|| {
+                RefineError::QualityCandidateInfrastructure(Box::new(
+                    crate::process::supervisor::errors::QualityCandidateInfrastructureError {
+                        goal_id: goal_id.to_string(),
+                        phase: "before operation registration".to_string(),
+                        reason: "the exact candidate worktree is not registered".to_string(),
+                        expected_round_idx: round_idx,
+                        observed_round_idx: Some(round_idx),
+                        expected_branch: branch.to_string(),
+                        observed_branch: summary.goal.branch_name.clone(),
+                        expected_path: expected_path.display().to_string(),
+                        observed_path: None,
+                        expected_registered: true,
+                        observed_registered: false,
+                        expected_commit: source_candidate_commit.clone(),
+                        observed_commit: None,
+                    },
+                ))
+            })?;
             (cwd, source_candidate_commit.clone(), "isolated_candidate")
         };
         let request = QualityCheckRequest {
@@ -277,9 +275,53 @@ impl QualityOperationRunner {
             cwd: cwd.display().to_string(),
             source_candidate_commit: Some(source_candidate_commit.clone()),
             evaluation_scope: evaluation_scope.to_string(),
-            candidate_commit: evaluated_commit,
+            candidate_commit: evaluated_commit.clone(),
+            identity_commitment: Some(if evaluation_scope == ISOLATED_CANDIDATE {
+                QualityIdentityCommitment::isolated(
+                    goal_id,
+                    round_idx,
+                    summary.goal.branch_name.as_deref().unwrap_or_default(),
+                    &cwd,
+                    &source_candidate_commit,
+                )
+            } else {
+                let integration = round
+                    .get("workflow_integration")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        RefineError::Conflict(format!(
+                            "Goal {goal_id} integrated-target Quality has no integration evidence"
+                        ))
+                    })?;
+                let target_branch = integration
+                    .get("target_branch")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        RefineError::Conflict(format!(
+                            "Goal {goal_id} integration evidence has no target branch"
+                        ))
+                    })?;
+                QualityIdentityCommitment::integrated(
+                    evaluation_scope,
+                    goal_id,
+                    round_idx,
+                    target_branch,
+                    &cwd,
+                    &evaluated_commit,
+                    &source_candidate_commit,
+                )
+            }),
             process_metadata,
         };
+        if let Some(commitment) = request.identity_commitment.as_ref() {
+            validate_quality_identity(
+                &self.refine_dir,
+                &self.target_root,
+                &self.runtime_root,
+                commitment,
+                "before operation registration",
+            )?;
+        }
         let registry = FileOperationRegistry::new(&self.runtime_root);
         let owner = format!("quality:{goal_id}:{}", request.candidate_commit);
         let operation = registry.register_exclusive_with_request(
@@ -289,10 +331,11 @@ impl QualityOperationRunner {
                 "round_idx": round_idx,
                 "node_id": node_id,
                 "provider": provider,
-                "cwd": request.cwd,
-                "candidate_commit": request.candidate_commit,
+                "cwd": &request.cwd,
+                "candidate_commit": &request.candidate_commit,
                 "source_candidate_commit": source_candidate_commit,
                 "evaluation_scope": evaluation_scope,
+                "identity_commitment": &request.identity_commitment,
                 "target_root": self.target_root.display().to_string(),
                 "refine_dir": self.refine_dir.display().to_string(),
                 "defer_cancellation_terminal": true
@@ -339,7 +382,53 @@ impl QualityOperationRunner {
         );
         let registry = FileOperationRegistry::new(&self.runtime_root);
         let service = FileQualityService::with_runtime_root(&self.refine_dir, &self.runtime_root);
-        match service.run_checks(request.clone()) {
+        let operation_still_owns_execution = registry.status(operation_id).is_ok_and(|operation| {
+            matches!(
+                operation.state,
+                OperationState::Pending | OperationState::Running
+            )
+        });
+        if operation_still_owns_execution
+            && let Some(commitment) = request.identity_commitment.as_ref()
+        {
+            let validation = validate_quality_identity(
+                &self.refine_dir,
+                &self.target_root,
+                &self.runtime_root,
+                commitment,
+                "before supervised execution",
+            );
+            if let Err(error) = validation {
+                if super::is_quality_candidate_infrastructure(&error) {
+                    self.record_candidate_infrastructure_fault(operation_id, &request, &error)?;
+                } else {
+                    self.record_persistence_failure(operation_id, &request, &error);
+                }
+                return Err(error);
+            }
+        }
+        let execution = service.run_checks(request.clone());
+        let operation_still_owns_execution = registry.status(operation_id).is_ok_and(|operation| {
+            matches!(
+                operation.state,
+                OperationState::Pending | OperationState::Running
+            )
+        });
+        if operation_still_owns_execution
+            && let Some(commitment) = request.identity_commitment.as_ref()
+            && let Err(error) = validate_quality_identity(
+                &self.refine_dir,
+                &self.target_root,
+                &self.runtime_root,
+                commitment,
+                "after supervised execution",
+            )
+            && super::is_quality_candidate_infrastructure(&error)
+        {
+            self.record_candidate_infrastructure_fault(operation_id, &request, &error)?;
+            return Err(error);
+        }
+        match execution {
             Ok(result) => {
                 let operation_message = if result.ok {
                     "Quality checks passed"
@@ -459,5 +548,37 @@ impl QualityOperationRunner {
                 Err(error)
             }
         }
+    }
+
+    fn record_candidate_infrastructure_fault(
+        &self,
+        operation_id: &str,
+        request: &QualityCheckRequest,
+        error: &RefineError,
+    ) -> RefineResult<()> {
+        let registry = FileOperationRegistry::new(&self.runtime_root);
+        registry.append_log(
+            operation_id,
+            quality_operation_log(
+                &request.owner_id,
+                "error",
+                &error.to_string(),
+                Some(json!({
+                    "error": error.to_string(),
+                    "error_kind": "candidate_infrastructure",
+                    "evaluation_scope": request.evaluation_scope,
+                    "identity_commitment": request.identity_commitment
+                })),
+            ),
+        )?;
+        registry.fail_with_error(
+            operation_id,
+            json!({
+                "code": "quality_candidate_infrastructure_fault",
+                "message": error.to_string(),
+                "identity_commitment": request.identity_commitment
+            }),
+        )?;
+        Ok(())
     }
 }

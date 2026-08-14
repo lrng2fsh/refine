@@ -3,10 +3,7 @@ use super::*;
 #[test]
 fn local_http_daemon_serves_website_and_markdown_from_repo_root() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
-    let daemon = LocalHttpDaemon {
-        server: server_with_projection(),
-        static_root: Some(repo_root),
-    };
+    let daemon = LocalHttpDaemon::new(server_with_projection(), Some(repo_root));
 
     let index = daemon.handle_wire_request(HttpRequest {
         method: "GET".to_string(),
@@ -33,6 +30,9 @@ fn local_http_daemon_serves_website_and_markdown_from_repo_root() {
     let docs_home = String::from_utf8(docs_home.body).unwrap();
     assert!(docs_home.contains("<h1 id=\"docs-home-title\">How Refine works.</h1>"));
     assert!(docs_home.contains("Browser Details"));
+    assert!(
+        docs_home.contains(r#"href="/read/docs/intent/04-surfaces/03-browser/00-overview.md""#)
+    );
     assert!(docs_home.contains(r#"href="/read/docs/intent/04-surfaces/05-agent.md""#));
 
     let raw_doc = daemon.handle_wire_request(HttpRequest {
@@ -46,7 +46,7 @@ fn local_http_daemon_serves_website_and_markdown_from_repo_root() {
     assert!(
         String::from_utf8(raw_doc.body)
             .unwrap()
-            .contains("# Install Refine")
+            .contains("# Install or Update Refine")
     );
 
     let compatibility_doc = daemon.handle_wire_request(HttpRequest {
@@ -71,7 +71,7 @@ fn local_http_daemon_serves_website_and_markdown_from_repo_root() {
     assert_eq!(rendered_doc.status, 200);
     assert_eq!(rendered_doc.content_type, "text/html; charset=utf-8");
     let rendered_doc = String::from_utf8(rendered_doc.body).unwrap();
-    assert!(rendered_doc.contains("<h1>Install Refine</h1>"));
+    assert!(rendered_doc.contains("<h1>Install or Update Refine</h1>"));
     assert!(rendered_doc.contains("Raw Markdown"));
     assert!(
         rendered_doc.contains(r#"<div class="menu-docs" aria-label="Documentation sections">"#)

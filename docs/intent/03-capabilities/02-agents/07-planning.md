@@ -29,6 +29,10 @@ Planning should sit before durable work creation. It should help users and agent
 
 These are lenses, not mandatory headings. If a concern is irrelevant, temporary, collapsed into another concern, or premature, a good plan may omit it or mention the tradeoff briefly.
 
+Plan Mode is distinct from the Goal workflow's Plan state. Plan Mode explores intent before a Goal exists or before a user chooses to persist work. Governed implementation planning occurs after one exact Goal Round has entered Plan: Workflow asks fresh installed native agents to propose, criticize, and revise an execution plan against pinned product, constitution, rules, guidance, past Rounds, current Round, and repository context before a fresh implementation agent may change it. That plan guides one attempt; it does not redefine the Goal, approve code, or replace later Implement, Quality, Governance, and Review judgments.
+
+Governed implementation plans are succinct execution guides, not exhaustive design documents. They begin with one plain-language paragraph that explains, top down, what will change and why. Any number of stable checklist items may follow when the work needs them, but each item is one concise line whose connection to the plan is obvious. Items capture only behavior, decisions, risks, or failure boundaries that cannot safely be ignored; detailed rationale, file inventories, exact commands, routine workflow mechanics, and verification transcripts belong in the pinned request, repository, or later execution evidence. Planning completion signals carry the typed result in a top-level `planning_result` JSON object rather than embedding or stringifying it in a human message.
+
 Planning should actively find important unknowns instead of polishing assumptions. An agent may follow blind-spot paths through adjacent code and behavior, build a small prototype to test a risky idea, or interview the user when product intent cannot be inferred from available evidence. These strategies should narrow consequential uncertainty without turning every plan into a long questionnaire or research exercise.
 
 Draft Feature should convert the selected plan into ordinary Refine work. It should produce one Feature plus implementation-ready Goals in the plan's natural build order. When dependency order is clear, the drafts should reflect it. When the work is exploratory, visual, research-heavy, or prototype-oriented, the drafts should be the smallest useful implementation slices rather than forced architecture categories.
@@ -44,6 +48,7 @@ Current implementation details that matter to intent:
 - Plan and spec-like extraction should use architecture-aware drafting;
 - simple CSV, issue-list, and direct import flows should remain direct and not become planning exercises;
 - review-before-persist should remain the boundary before creating durable work.
+- every workflow-owned Goal Round uses a separate execution-time proposal, independent criticism, and revision pipeline; its typed evidence belongs to the Round and is never Plan Mode draft state.
 
 ## Future Direction
 

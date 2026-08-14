@@ -6,29 +6,18 @@ use crate::model::goal::RoundIntegration;
 use crate::model::workflow::GoalStatus;
 use crate::process::supervisor::errors::{RefineError, RefineResult};
 use crate::tools::host::git_sync::with_repository_git_lock;
-use crate::tools::host::git_worktrees::FileGitWorktreeService;
+use crate::tools::host::git_worktrees::{FileGitWorktreeService, GitWorktreeService};
 use crate::tools::product::work_items::FileWorkItemService;
+use crate::workflow::candidate_handoff::{find_candidate_handoff, register_candidate_handoff};
 use crate::workflow::context::WorkflowContext;
 
 use super::json_object;
 
-pub(super) fn ensure_workflow_round(
+pub(super) fn authored_workflow_commitment(
     work_items: &FileWorkItemService,
     goal_id: &str,
-) -> RefineResult<usize> {
-    let goal = work_items.show_goal_summary(goal_id)?;
-    if let Some(idx) = goal.goal.round_count.checked_sub(1) {
-        return Ok(idx);
-    }
-    let goal = work_items.append_goal_round_summary(
-        goal_id,
-        "Refine",
-        "Implement and verify this Goal.",
-    )?;
-    goal.goal
-        .round_count
-        .checked_sub(1)
-        .ok_or_else(|| RefineError::InvalidInput(format!("Goal {goal_id} has no rounds")))
+) -> RefineResult<(usize, u64, String)> {
+    work_items.authored_goal_commitment(goal_id)
 }
 
 pub(super) fn hydrate_retry_context(
@@ -63,6 +52,13 @@ pub(super) fn hydrate_retry_context(
             .unwrap_or_else(|| "Resumed existing workflow candidate".to_string()),
     );
     ctx.commit = Some(candidate.clone());
+    ctx.candidate_handoff_operation_id = find_candidate_handoff(
+        ctx.runtime_root,
+        ctx.target_root,
+        &ctx.goal_id,
+        ctx.round_idx,
+    )?
+    .map(|operation| operation.id);
     ctx.implementation_changed = candidate != base;
     let integration = round
         .get("workflow_integration")
@@ -70,7 +66,7 @@ pub(super) fn hydrate_retry_context(
         .map(|value| {
             serde_json::from_value::<RoundIntegration>(value.clone()).map_err(|error| {
                 RefineError::Serialization(format!(
-                    "Goal {} has invalid Ready Merge evidence: {error}",
+                    "Goal {} has invalid Governance evidence: {error}",
                     ctx.goal_id
                 ))
             })
@@ -171,6 +167,78 @@ pub(super) fn hydrate_retry_context(
             "status": current.as_str(),
             "branch": branch,
             "candidate_commit": candidate,
+            "round": ctx.round_idx + 1
+        }))),
+    )
+}
+
+/// Restores the implementation workspace for an interrupted Plan or Implement Goal.
+///
+/// Plan or Implement may have stopped anywhere between the durable status transition and the first
+/// candidate commit. The branch name is deterministic, completed planning artifacts live on the
+/// Round, and `ensure_worktree` is idempotent, so restarting is cheaper and safer than persisting
+/// a worker identity.
+pub(super) fn hydrate_plan_or_implement_context(
+    ctx: &mut WorkflowContext<'_>,
+    branch_pattern: &str,
+    target_branch: &str,
+) -> RefineResult<()> {
+    let detail = ctx.work_items.show_goal_detail(&ctx.goal_id)?;
+    let branch = detail
+        .get("branch_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| implementation_branch_name(branch_pattern, &ctx.goal_id, ctx.round_idx));
+    let git = FileGitWorktreeService::with_runtime_root(ctx.target_root, ctx.runtime_root);
+    let base = detail
+        .get("base_commit")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or(git.resolve_commit(target_branch)?);
+    let worktree_target = git
+        .git_path("refine-worktrees")?
+        .join(branch.replace('/', "-"));
+    let (worktree, handoff) = with_repository_git_lock(ctx.target_root, || {
+        let worktree = git.ensure_worktree(&branch, &worktree_target)?;
+        let handoff = register_candidate_handoff(
+            ctx.runtime_root,
+            ctx.target_root,
+            &ctx.goal_id,
+            ctx.round_idx,
+            &ctx.node_id,
+            &branch,
+            &worktree,
+            &base,
+        )?;
+        Ok((worktree, handoff))
+    })?;
+    ctx.work_items.update_goal_git_refs(
+        &ctx.goal_id,
+        &branch,
+        target_branch,
+        &base,
+        detail
+            .get("candidate_commit")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    )?;
+    ctx.branch = Some(branch.clone());
+    ctx.worktree_path = Some(worktree.clone());
+    ctx.candidate_handoff_operation_id = Some(handoff.id);
+    ctx.agent_cwd = Some(PathBuf::from(&worktree));
+    ctx.start_status = GoalStatus::Implement;
+    ctx.log(
+        "workflow",
+        "Restarted interrupted implementation from its retained worktree",
+        Some(json_object(json!({
+            "status": GoalStatus::Implement.as_str(),
+            "branch": branch,
+            "worktree": worktree,
             "round": ctx.round_idx + 1
         }))),
     )

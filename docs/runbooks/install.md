@@ -1,8 +1,8 @@
-# Install Refine
+# Install or Update Refine
 
 Refine is an agentic software delivery system that runs locally against a user's application repository. It coordinates agents and humans through Goals, workflow state, provider CLIs, local processes, and a browser UI so software changes can move from request to implementation to human review.
 
-Use this document when an agent is responsible for installing Refine. Follow the steps in order, ask the user only the questions needed for the chosen install path, confirm where Refine should be installed when you cannot infer it, and do not claim installation succeeded until the CLI reports a healthy running system or you have reported the exact blocker.
+Use this document when an agent is responsible for installing or updating Refine. Follow the steps in order, ask the user only the questions needed for the chosen path, confirm where Refine should be installed when you cannot infer it, and do not claim installation succeeded until the CLI reports a healthy running system or you have reported the exact blocker.
 
 ## Prerequisites
 
@@ -26,7 +26,7 @@ Ask only when the answer is not clear from the user's environment, prior convers
 ## Install Refine
 
 1. Resolve the Refine checkout path before running install commands. If an existing Refine checkout or a user preference is not clear, ask where to install Refine and use `$HOME/refine` as the default.
-2. Check for required tools, identify reachable dependency sources, and install missing dependencies only from a source the user approves. Do not use `scripts/install.sh`; the agent should make dependency choices explicitly.
+2. Check for required tools, identify reachable dependency sources, and install missing dependencies only from a source the user approves; the agent should make dependency choices explicitly.
 
 ```bash
 curl --version
@@ -35,13 +35,7 @@ cc --version
 cargo --version
 ```
 
-3. If Refine is already installed, update the checkout through the CLI and skip the fresh clone:
-
-```bash
-cd <refine-checkout>
-./r system update --yes
-```
-
+3. If Refine is already installed, follow the [Update Refine](#update-refine) section instead of a fresh clone, then continue with provider configuration below.
 4. For a fresh install, copy the latest published release files without a `.git` directory:
 
 ```bash
@@ -58,14 +52,11 @@ tar -C "$tmp/refine" --exclude .git -cf - . | tar -C <refine-checkout> -xf -
 rm -rf "$tmp"
 ```
 
-5. Always compile the host-local release binary and mark the checkout as deployed. Do this after either `./r system update` or a fresh clone so `./r` uses `bin/refine` instead of running through Cargo:
+5. Install Refine for the selected port. This command assumes the prerequisites above are available, builds the locked release binary, atomically publishes it as `bin/refine`, marks the checkout as deployed, and only then registers and activates the service:
 
 ```bash
 cd <refine-checkout>
-cargo build --release --locked
-mkdir -p bin
-install -m 755 target/release/refine bin/refine
-printf 'mode=deployed\nrelease_bin=bin/refine\n' > .refine-deployed
+./r system install --port <port>
 ```
 
 6. Configure the selected provider:
@@ -87,6 +78,92 @@ cd <refine-checkout>
 ```
 
 Do not offer `smoke-ai` during installation. It is reserved for deterministic tests.
+
+## Product and runtime ownership
+
+The directory selected above is the product home. `./r` always runs the
+stable production binary `<refine-checkout>/bin/refine` — never a debug
+build. `./r system start`, `./r system install`, and `./r system build`
+create or refresh that binary (rebuilding only when the source has changed
+since the last production build) and say so on stdout; every other command
+requires it to already exist. The base runtime is `<refine-checkout>/run`,
+and port `<port>` owns only `<refine-checkout>/run/<port>`. `./r` anchors the
+invocation to that product home; the directory from which a user launches it
+is not an ownership signal. Do not configure HOME, XDG, platform support
+directories, or a neighboring checkout as the runtime root.
+
+Manage the production binary directly with:
+
+```bash
+./r system build   # rebuild bin/refine from source
+./r system clean   # remove bin/refine and the deployed marker
+```
+
+These are checkout-launcher operations, not `refine system` subcommands, so
+they are intentionally absent from `refine system --help` and `refine commands`.
+Use `./r system build --help` or `./r system clean --help` for their direct help.
+
+A published installation is intentionally gitless and is identified by
+`.refine-deployed` plus `bin/refine`. It supports ordinary daemon, web, MCP,
+provider, and published-update operations. Source status and source promotion
+require an actual Git checkout and will fail closed for a gitless product home.
+
+`./r system install` is the complete fresh-install boundary; callers do not
+prebuild or copy the binary separately. Current service registrations launch the checkout-local binary with the exact
+port and checkout-local runtime and use the checkout as their working
+directory. The current targets are `macos_daemon`, `windows_daemon`, and
+`linux_cli_web`. The historical JSON values `mac_os_app_bundle` and
+`windows_installer` are accepted only when reading migration-era state; new
+state is always written with current names.
+
+Ordinary install/status reports a conflicting legacy external runtime or
+registration without changing it. `./r system repair --port <port>` is the
+explicit migration boundary: it leaves external runtime and binary trees
+untouched, stores the exact original registration bytes, SHA-256, parsed
+identity, and final outcome under
+`run/<port>/installation-migrations/`, then atomically publishes only the new
+registration. If activation or byte verification fails, Refine restores the
+exact original registration and retains the journal.
+
+## Update Refine
+
+`./r system update --yes` performs this section automatically: it stops the running daemons, delegates the update to the configured agent provider with this runbook as context, and restarts the daemons afterward. If you are the agent delegated by `./r system update`, the daemons are already stopped: do not run `./r system update` again and do not start, stop, or restart Refine; complete the steps below and report the exact blocker if one fails.
+
+1. When updating manually (not delegated by `./r system update`), stop the running daemons first:
+
+```bash
+cd <refine-checkout>
+./r system stop --port <port>
+```
+
+2. Bring the checkout up to the latest published release. If the checkout is a git repository that is ahead of the latest release (a development checkout), leave the working tree alone and skip to the build step. Otherwise fetch the latest release and copy it over the checkout without a `.git` directory:
+
+```bash
+latest="$(
+  git ls-remote --tags --refs https://github.com/buwilliams/refine.git \
+    | awk -F/ '/refs\/tags\/[0-9]+\.[0-9]+\.[0-9]+$/ { print $NF }' \
+    | sort -t. -k1,1n -k2,2n -k3,3n \
+    | tail -n 1
+)"
+tmp="$(mktemp -d)"
+git clone --depth 1 --branch "$latest" https://github.com/buwilliams/refine.git "$tmp/refine"
+tar -C "$tmp/refine" --exclude .git -cf - . | tar -C <refine-checkout> -xf -
+rm -rf "$tmp"
+```
+
+3. Rebuild the release binary and mark the checkout as deployed:
+
+```bash
+cd <refine-checkout>
+./r system build
+```
+
+4. When updating manually, restart Refine and verify it is healthy:
+
+```bash
+./r system start --port <port>
+./r system status --port <port>
+```
 
 ## After Install
 
@@ -114,7 +191,10 @@ cd <refine-checkout>
 
 ## CLI Management
 
-Use `./r --help` and `./r <group> --help` as the source of truth for management commands. There is no generic `./r status`; use the specific command group.
+Use `./r --help` and `./r <group> --help` as the source of truth for
+production-binary management commands, plus the direct launcher help described
+above for `system build` and `system clean`. There is no generic `./r status`;
+use the specific command group.
 
 Core management commands:
 
@@ -137,6 +217,10 @@ Runtime lifecycle commands:
 ./r system repair --port <port>
 ./r system update --yes
 ```
+
+Use `--runtime-root run` only as compatibility syntax for this checkout's
+canonical `run` directory. Any other relative value, or an absolute path that
+is not the exact canonical runtime of the invoked product home, is rejected.
 
 Target app commands:
 
@@ -163,9 +247,9 @@ Distributed/node commands:
 ```bash
 ./r node list
 ./r node settings <node-id>
-./r cluster list
-./r cluster maintenance
-./r cluster distribute [--to <node-id>] [--converge] [--dry-run]
+./r fleet list
+./r fleet maintenance
+./r fleet distribute [--to <node-id>] [--converge] [--dry-run]
 ```
 
 Refine publishes durable state automatically on the dedicated `refine/state`
@@ -179,13 +263,14 @@ Target App **Git remote** setting controls both state and Goal-branch
 publication and defaults to `origin`. If that remote is unavailable, Refine
 still initializes and commits local state; it simply cannot publish it. Use
 `project sync` or the Node screen's **Sync state now** action when a state
-handoff must happen immediately; `cluster sync` invokes the same shared
+handoff must happen immediately; `fleet sync` invokes the same shared
 capability for the current node. Manual sync is queued in a supervised runner
 process, and the UI reports its progress and any terminal error without
 blocking the daemon.
 
-Cloud worker creation is provider-operated rather than part of the Refine
-binary. Follow `docs/runbooks/provision.md` when a fleet needs another worker.
+Worker machine creation is agent-operated rather than part of the Refine
+binary. Follow `docs/runbooks/manage-fleet.md` when a fleet needs another
+worker.
 
 ## Operating Refine after install
 
@@ -196,10 +281,11 @@ reading source code:
 - `./r next` — recommends the next operations from current project and fleet
   state, each with the exact command. Call it whenever you are deciding what
   to do next.
-- `./r commands` — machine-readable JSON catalog of every CLI command with
-  descriptions. Load once instead of exploring `--help` per subcommand.
-- `docs/runbooks/` — task-oriented guides (provision a fleet worker,
-  distribute and converge work) with preconditions, user questions,
-  verification, and undo steps.
+- `./r commands` — machine-readable JSON catalog of supported user-facing
+  production-binary commands with descriptions. Load once instead of
+  exploring `--help` per subcommand.
+- `docs/runbooks/` — task-oriented guides (manage the fleet, distribute and
+  converge work) with preconditions, user questions, verification, and undo
+  steps.
 
 When a command fails, report the exact command, exit code, stdout/stderr summary, and any relevant log path. Prefer CLI evidence over guessing from browser state.

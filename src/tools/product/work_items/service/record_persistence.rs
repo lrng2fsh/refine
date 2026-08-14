@@ -89,14 +89,6 @@ pub(crate) fn workflow_revision(value: &Value) -> u64 {
         .unwrap_or(0)
 }
 
-pub(super) fn set_workflow_revision(value: &mut Value, revision: u64) -> RefineResult<()> {
-    let object = value.as_object_mut().ok_or_else(|| {
-        RefineError::Serialization("workflow record is not a JSON object".to_string())
-    })?;
-    object.insert("workflow_revision".to_string(), Value::from(revision));
-    Ok(())
-}
-
 pub(super) fn workflow_record_root(path: &std::path::Path) -> PathBuf {
     for ancestor in path.ancestors() {
         if matches!(

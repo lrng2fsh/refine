@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
+use crate::model::goal::ImplementationExecutionEvidence;
 use crate::process::subprocess::{
     FileProcessSupervisor, ManagedProcess, ManagedProcessSpec, ProcessOwner, ProcessResourceLimits,
     ProcessSupervisor,
@@ -20,6 +21,7 @@ use crate::prompts::{PromptTemplate, render};
 use crate::tools::host::agent_providers::HostAgentProviderService;
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(40);
+const SIGNAL_WRITE_GRACE_PERIOD: Duration = Duration::from_secs(2);
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 36;
 const MAX_INPUT_BYTES: usize = 16_000;
@@ -32,6 +34,7 @@ pub struct GoalAgentLaunch {
     pub provider: String,
     pub prompt: String,
     pub metadata: Map<String, Value>,
+    pub completion_timeout: Option<Duration>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,6 +43,20 @@ pub struct GoalAgentResult {
     pub session_id: String,
     pub process_id: String,
     pub guidance_applied: Option<Vec<usize>>,
+    pub implementation_evidence: Option<ImplementationExecutionEvidence>,
+    pub planning_result: Option<Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoalAgentSettlement {
+    pub output: String,
+    pub process_id: String,
+    pub session_id: String,
+    pub state: String,
+    pub exit_code: Option<i32>,
+    pub guidance_applied: Option<Vec<usize>>,
+    pub implementation_evidence: Option<ImplementationExecutionEvidence>,
+    pub planning_result: Option<Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,14 +95,18 @@ struct AgentSessionSignal {
     message: String,
     #[serde(default)]
     guidance_applied: Option<Vec<usize>>,
+    #[serde(default)]
+    implementation_evidence: Option<ImplementationExecutionEvidence>,
+    #[serde(default)]
+    planning_result: Option<Value>,
 }
 
 mod codec;
 mod session_runtime;
 
-pub use session_runtime::run_goal_agent;
 #[cfg(test)]
 use session_runtime::run_goal_agent_session;
+pub use session_runtime::{run_goal_agent, run_goal_agent_with_settlement};
 
 use codec::*;
 

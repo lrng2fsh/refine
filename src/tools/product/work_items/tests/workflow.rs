@@ -58,6 +58,72 @@ fn projected_status_transition_rejects_an_external_revision_change() {
 }
 
 #[test]
+fn authored_todo_start_rejects_round_revision_change_before_execution() {
+    let temp_root = unique_temp_dir("authored-todo-fence");
+    let refine_dir = temp_root.join(".refine");
+    let service = FileWorkItemService::new(&refine_dir);
+    service
+        .create_goal_summary("Fenced Goal", Some("GOAL1"))
+        .unwrap();
+    service
+        .append_goal_round_summary("GOAL1", "Reporter", "Original source")
+        .unwrap();
+    service
+        .transition_goal_status("GOAL1", GoalStatus::Todo)
+        .unwrap();
+    let (round_idx, revision, request) = service.authored_goal_commitment("GOAL1").unwrap();
+    service
+        .edit_latest_goal_round_summary("GOAL1", None, None, Some("Changed source"))
+        .unwrap();
+
+    let error = service
+        .claim_workflow_attempt("GOAL1", GoalStatus::Todo, round_idx, revision, &request)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("changed before workflow attempt claim")
+    );
+    assert_eq!(
+        service.show_goal_summary("GOAL1").unwrap().goal.status,
+        GoalStatus::Todo
+    );
+    assert_eq!(
+        service.show_goal_detail("GOAL1").unwrap()["rounds"][0]["prompt"],
+        "Changed source"
+    );
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn authored_todo_start_atomically_pins_nonempty_round() {
+    let temp_root = unique_temp_dir("authored-todo-start");
+    let refine_dir = temp_root.join(".refine");
+    let service = FileWorkItemService::new(&refine_dir);
+    service
+        .create_goal_summary("Fenced Goal", Some("GOAL1"))
+        .unwrap();
+    assert!(service.authored_goal_commitment("GOAL1").is_err());
+    service
+        .append_goal_round_summary("GOAL1", "Reporter", "Authoritative source")
+        .unwrap();
+    service
+        .transition_goal_status("GOAL1", GoalStatus::Todo)
+        .unwrap();
+    let (round_idx, revision, request) = service.authored_goal_commitment("GOAL1").unwrap();
+    let authority = service
+        .claim_workflow_attempt("GOAL1", GoalStatus::Todo, round_idx, revision, &request)
+        .unwrap();
+    let started = service
+        .advance_claimed_goal_status("GOAL1", authority, GoalStatus::Todo, GoalStatus::Plan)
+        .unwrap();
+    assert_eq!(started.goal.status, GoalStatus::Plan);
+    assert_eq!(round_idx, 0);
+    assert_eq!(request, "Authoritative source");
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
 fn file_work_item_service_verifies_and_undoes_goal_workflow() {
     let temp_root = unique_temp_dir("work-item-verify-undo");
     let refine_dir = temp_root.join(".refine");
@@ -136,7 +202,7 @@ fn file_work_item_service_rejects_invalid_manual_transition() {
     .unwrap();
 
     let err = FileWorkItemService::new(&refine_dir)
-        .transition_goal_status("GOAL1", GoalStatus::InProgress)
+        .transition_goal_status("GOAL1", GoalStatus::Implement)
         .unwrap_err();
     assert_eq!(
         err.category(),

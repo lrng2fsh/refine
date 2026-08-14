@@ -16,7 +16,7 @@ use crate::process::supervisor::operations::{
     FileOperationRegistry, OperationHandle, OperationRegistry, OperationState,
 };
 use crate::process::supervisor::security::{FileSecurityService, SecurityService};
-use crate::prompts::{PromptTemplate, render};
+use crate::prompts::{PromptEngine, PromptTemplate, render};
 use crate::tools::host::agent_providers::{
     AgentProviderService, HostAgentProviderService, ProviderInvocation,
 };
@@ -25,9 +25,12 @@ use crate::tools::observability::logs::FileLogService;
 use crate::tools::product::nodes::FileNodeRegistryService;
 use crate::tools::product::work_items::FileWorkItemService;
 use crate::workflow::WorkflowEngine;
-use crate::workflow::capacity::{AgentCapacityRequest, AgentCapacityService};
 
 use super::types::*;
+use super::{
+    ISOLATED_CANDIDATE, QualityIdentityCommitment, is_quality_candidate_infrastructure,
+    validate_quality_identity,
+};
 
 mod cancellation;
 mod execution;
@@ -44,7 +47,11 @@ use provider_output::*;
 pub use runner::QualityOperationRunner;
 pub(crate) use summary::{quality_error_summary, quality_failure_summary};
 
-pub(super) const SETTINGS_MIGRATION_VERSION: u32 = 2;
+pub(super) const SETTINGS_MIGRATION_VERSION: u32 = 3;
+
+fn default_quality_instructions() -> &'static str {
+    PromptEngine::load(PromptTemplate::QualityDefaultInstructions)
+}
 
 fn default_evaluation_scope() -> String {
     "isolated_candidate".to_string()
@@ -70,6 +77,8 @@ pub struct QualityCheckRequest {
     #[serde(default = "default_evaluation_scope")]
     pub evaluation_scope: String,
     pub candidate_commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_commitment: Option<QualityIdentityCommitment>,
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub process_metadata: Map<String, Value>,
 }

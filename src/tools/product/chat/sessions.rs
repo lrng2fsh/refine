@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::model::JsonObject;
 use crate::process::supervisor::errors::{RefineError, RefineResult};
 
 use super::{
@@ -14,6 +15,11 @@ use super::{
     new_chat_id, now_timestamp, reject_retired_supervisor, unread_lines, unread_progress,
     validate_session_id, write_chat_record_atomically,
 };
+
+/// Transcript events retained in a session record. Every append rewrites the
+/// whole record, so an unbounded transcript made write cost quadratic in
+/// session length; anything beyond this window is summarized by a marker.
+const TRANSCRIPT_EVENT_LIMIT: usize = 5_000;
 
 impl FileChatService {
     pub fn new(refine_dir: impl Into<PathBuf>) -> Self {
@@ -260,7 +266,27 @@ impl FileChatService {
             ))
         })?;
         let path = self.session_path(&record.id);
-        let encoded = serde_json::to_string_pretty(record).map_err(|error| {
+        // The record is rewritten on every provider output line, so its size
+        // is the write amplification factor: compact encoding, and a bounded
+        // transcript once a session outgrows any realistic reading window.
+        let mut bounded;
+        let record = if record.transcript_events.len() > TRANSCRIPT_EVENT_LIMIT {
+            bounded = record.clone();
+            let dropped = bounded.transcript_events.len() - TRANSCRIPT_EVENT_LIMIT;
+            bounded.transcript_events.drain(..dropped);
+            let mut marker = JsonObject::new();
+            marker.insert(
+                "text".to_string(),
+                Value::String(format!("[{dropped} earlier transcript events trimmed]")),
+            );
+            marker.insert("delivered".to_string(), Value::Bool(true));
+            marker.insert("progress".to_string(), Value::Bool(true));
+            bounded.transcript_events.insert(0, marker);
+            &bounded
+        } else {
+            record
+        };
+        let encoded = serde_json::to_string(record).map_err(|error| {
             RefineError::Serialization(format!("failed to encode chat session: {error}"))
         })?;
         write_chat_record_atomically(&path, format!("{encoded}\n").as_bytes()).map_err(|error| {
@@ -288,7 +314,11 @@ impl FileChatService {
             ))
         })?;
         let path = self.sessions_dir().join(format!(".{session_id}.lock"));
-        for _ in 0..500 {
+        // Deadline-based rather than attempt-counted: a fixed try count made
+        // the effective wait collapse on a saturated host, where a holder's
+        // few milliseconds of work can stretch across whole scheduler quanta.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(_) => return Ok(ChatSessionLock { path }),
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
@@ -301,7 +331,12 @@ impl FileChatService {
                         let _ = fs::remove_file(&path);
                         continue;
                     }
-                    thread::sleep(Duration::from_millis(2));
+                    if std::time::Instant::now() >= deadline {
+                        return Err(RefineError::Conflict(format!(
+                            "Chat session {session_id} is busy; retry shortly"
+                        )));
+                    }
+                    thread::sleep(Duration::from_millis(5));
                 }
                 Err(error) => {
                     return Err(RefineError::Io(format!(
@@ -310,8 +345,5 @@ impl FileChatService {
                 }
             }
         }
-        Err(RefineError::Conflict(format!(
-            "Chat session {session_id} is busy; retry shortly"
-        )))
     }
 }

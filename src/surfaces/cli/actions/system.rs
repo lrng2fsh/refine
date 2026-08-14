@@ -2,7 +2,7 @@ use super::*;
 
 #[derive(Debug, Subcommand)]
 pub enum SystemAction {
-    /// Install Refine on this machine (macOS app bundle, Windows installer, or Linux CLI/web).
+    /// Install Refine: build the release binary, then register and start its daemon service.
     Install {
         /// Daemon port to configure for the installation.
         #[arg(long)]
@@ -16,6 +16,21 @@ pub enum SystemAction {
         /// Version string to record for the installation.
         #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
         version: String,
+    },
+    /// Show daemon performance metrics: per-operation summaries and the slowest recent requests.
+    Performance {
+        /// Filter events to one operation name (for example http.request).
+        #[arg(long)]
+        operation: Option<String>,
+        /// Show only failed events.
+        #[arg(long)]
+        failures: bool,
+        /// Recent events to include (1-1000).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Print the raw JSON report instead of the table.
+        #[arg(long)]
+        json: bool,
     },
     /// Repair an existing installation: recreate launchers and services for the recorded version.
     Repair {
@@ -34,6 +49,14 @@ pub enum SystemAction {
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
+        /// Agent provider that performs the update. Defaults to the target
+        /// app's configured provider, then the first installed provider CLI
+        /// in alphabetical order.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Port whose checkout-local runtime owns the update Agent artifacts.
+        #[arg(long, default_value_t = 8082)]
+        port: u16,
         /// Runtime directory where Refine keeps daemon state.
         #[arg(long, default_value = "run")]
         runtime_root: PathBuf,
@@ -117,6 +140,47 @@ pub enum SystemAction {
         #[arg(long)]
         port: u16,
         /// Durable source-promotion operation identifier.
+        #[arg(long)]
+        operation_id: String,
+        /// Unique restart-safe handoff attempt identifier.
+        #[arg(long)]
+        attempt_id: Option<String>,
+        /// One-use non-secret fencing nonce; only its verifier is persisted.
+        #[arg(long)]
+        claim_nonce: Option<String>,
+    },
+    /// Invoke one granular typed source-upgrade capability selected by the installed Agent.
+    #[command(hide = true)]
+    SourceUpgradeCapability {
+        /// Refine controller checkout selected by the installed Agent.
+        #[arg(long)]
+        checkout: PathBuf,
+        /// Port-scoped runtime directory containing durable operation state.
+        #[arg(long)]
+        port_runtime_root: PathBuf,
+        /// Refine daemon port being upgraded.
+        #[arg(long)]
+        port: u16,
+        /// Durable source-upgrade operation identifier.
+        #[arg(long)]
+        operation_id: String,
+        /// Granular capability action selected from durable Agent context.
+        #[arg(long)]
+        action: String,
+    },
+    /// Refresh the durable cached source identity in a supervised worker.
+    #[command(hide = true)]
+    SourceCheckWorker {
+        /// Refine controller checkout whose configured remote is refreshed.
+        #[arg(long)]
+        checkout: PathBuf,
+        /// Port-scoped runtime directory containing cached check state.
+        #[arg(long)]
+        port_runtime_root: PathBuf,
+        /// Refine daemon port owning the cached check.
+        #[arg(long)]
+        port: u16,
+        /// Durable source-check operation identifier.
         #[arg(long)]
         operation_id: String,
     },
@@ -267,8 +331,8 @@ pub enum SystemAction {
 #[derive(Clone, Debug, ValueEnum)]
 pub enum CliInstallTarget {
     Auto,
-    MacosAppBundle,
-    WindowsInstaller,
+    MacosDaemon,
+    WindowsDaemon,
     LinuxCliWeb,
 }
 
@@ -276,12 +340,12 @@ impl CliInstallTarget {
     pub(in crate::surfaces::cli) fn into_target(self) -> InstallTarget {
         match self {
             CliInstallTarget::Auto => match std::env::consts::OS {
-                "macos" => InstallTarget::MacOsAppBundle,
-                "windows" => InstallTarget::WindowsInstaller,
+                "macos" => InstallTarget::MacosDaemon,
+                "windows" => InstallTarget::WindowsDaemon,
                 _ => InstallTarget::LinuxCliWeb,
             },
-            CliInstallTarget::MacosAppBundle => InstallTarget::MacOsAppBundle,
-            CliInstallTarget::WindowsInstaller => InstallTarget::WindowsInstaller,
+            CliInstallTarget::MacosDaemon => InstallTarget::MacosDaemon,
+            CliInstallTarget::WindowsDaemon => InstallTarget::WindowsDaemon,
             CliInstallTarget::LinuxCliWeb => InstallTarget::LinuxCliWeb,
         }
     }

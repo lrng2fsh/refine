@@ -16,7 +16,7 @@ fn file_work_item_service_bulk_updates_deletes_and_assigns_goals() {
             .unwrap();
     }
     service
-        .set_goal_status_unchecked("GOAL3", &GoalStatus::Qa)
+        .set_goal_status_unchecked("GOAL3", &GoalStatus::Quality)
         .unwrap();
 
     let status_result = service
@@ -40,7 +40,7 @@ fn file_work_item_service_bulk_updates_deletes_and_assigns_goals() {
     );
     assert_eq!(
         service.show_goal_summary("GOAL3").unwrap().goal.status,
-        GoalStatus::Qa
+        GoalStatus::Quality
     );
 
     let reporter_result = service
@@ -157,7 +157,7 @@ fn file_work_item_service_bulk_status_allows_review_and_done() {
         .set_goal_status_unchecked("DONE_TARGET", &GoalStatus::Review)
         .unwrap();
     service
-        .set_goal_status_unchecked("AUTOMATED", &GoalStatus::Qa)
+        .set_goal_status_unchecked("AUTOMATED", &GoalStatus::Quality)
         .unwrap();
 
     let review_result = service
@@ -195,7 +195,7 @@ fn file_work_item_service_bulk_status_allows_review_and_done() {
         .unwrap();
     assert_eq!(done_result.updated, 2);
     assert_eq!(done_result.skipped, 1);
-    assert_eq!(done_result.skipped_details[0].reason, "status:qa");
+    assert_eq!(done_result.skipped_details[0].reason, "status:quality");
     for id in ["REVIEW_TARGET", "DONE_TARGET"] {
         assert_eq!(
             service.show_goal_summary(id).unwrap().goal.status,
@@ -204,14 +204,14 @@ fn file_work_item_service_bulk_status_allows_review_and_done() {
     }
     assert_eq!(
         service.show_goal_summary("AUTOMATED").unwrap().goal.status,
-        GoalStatus::Qa
+        GoalStatus::Quality
     );
 
     fs::remove_dir_all(temp_root).unwrap();
 }
 
 #[test]
-fn bulk_review_and_done_revalidate_claims_and_status_after_selection() {
+fn bulk_review_and_done_revalidate_status_after_selection() {
     let temp_root = unique_temp_dir("work-item-bulk-status-selection-race");
     let target_root = temp_root.join("target");
     let refine_dir = target_root.join(".refine");
@@ -233,16 +233,18 @@ fn bulk_review_and_done_revalidate_claims_and_status_after_selection() {
         .create("remote-node")
         .unwrap();
 
-    let claim_runtime_root = runtime_root.clone();
-    let claim_target_root = target_root.clone();
-    let claim_race_service = service
+    let race_service = service.clone();
+    let status_race_service = service
         .clone()
         .with_after_bulk_goal_selection_hook(move || {
-            WorkflowEngine::with_target_root(&claim_runtime_root, &claim_target_root)
-                .claim("CLAIMED_AFTER_SELECTION")
+            race_service
+                .append_goal_round_summary("CLAIMED_AFTER_SELECTION", "Reporter", "Implement")
+                .unwrap();
+            race_service
+                .advance_automated_goal_status("CLAIMED_AFTER_SELECTION", GoalStatus::Plan)
                 .unwrap();
         });
-    let review_result = claim_race_service
+    let review_result = status_race_service
         .bulk_update_goals(
             BulkGoalSelection {
                 selected_ids: Some(vec!["CLAIMED_AFTER_SELECTION".to_string()]),
@@ -253,18 +255,14 @@ fn bulk_review_and_done_revalidate_claims_and_status_after_selection() {
         .unwrap();
     assert_eq!(review_result.updated, 0);
     assert_eq!(review_result.skipped, 1);
-    assert!(
-        review_result.skipped_details[0]
-            .reason
-            .starts_with("claim:")
-    );
+    assert_eq!(review_result.skipped_details[0].reason, "status:plan");
     assert_eq!(
         service
             .show_goal_summary("CLAIMED_AFTER_SELECTION")
             .unwrap()
             .goal
             .status,
-        GoalStatus::Todo
+        GoalStatus::Plan
     );
 
     let done_result = service
@@ -278,14 +276,14 @@ fn bulk_review_and_done_revalidate_claims_and_status_after_selection() {
         .unwrap();
     assert_eq!(done_result.updated, 0);
     assert_eq!(done_result.skipped, 1);
-    assert!(done_result.skipped_details[0].reason.starts_with("claim:"));
+    assert_eq!(done_result.skipped_details[0].reason, "status:plan");
     assert_eq!(
         service
             .show_goal_summary("CLAIMED_AFTER_SELECTION")
             .unwrap()
             .goal
             .status,
-        GoalStatus::Todo
+        GoalStatus::Plan
     );
 
     let status_mutator = FileWorkItemService::new(&refine_dir);
@@ -293,7 +291,7 @@ fn bulk_review_and_done_revalidate_claims_and_status_after_selection() {
         .clone()
         .with_after_bulk_goal_selection_hook(move || {
             status_mutator
-                .set_goal_status_unchecked("AUTOMATED_AFTER_SELECTION", &GoalStatus::Qa)
+                .set_goal_status_unchecked("AUTOMATED_AFTER_SELECTION", &GoalStatus::Quality)
                 .unwrap();
         });
     let automated_result = status_race_service
@@ -307,14 +305,14 @@ fn bulk_review_and_done_revalidate_claims_and_status_after_selection() {
         .unwrap();
     assert_eq!(automated_result.updated, 0);
     assert_eq!(automated_result.skipped, 1);
-    assert_eq!(automated_result.skipped_details[0].reason, "status:qa");
+    assert_eq!(automated_result.skipped_details[0].reason, "status:quality");
     assert_eq!(
         service
             .show_goal_summary("AUTOMATED_AFTER_SELECTION")
             .unwrap()
             .goal
             .status,
-        GoalStatus::Qa
+        GoalStatus::Quality
     );
 
     let node_mutator = FileWorkItemService::new(&refine_dir);

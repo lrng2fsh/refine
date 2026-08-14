@@ -86,28 +86,23 @@ pub(super) fn record_http_request_metric(
     if !screen_critical_http_request(&request.method, &request.path, cache_mode) {
         return false;
     }
-    let method = request.method.clone();
-    let raw_path = request.path.clone();
-    let normalized_path = normalize_api_path(&raw_path);
     let status = response.status;
-    let bytes = response.body.len() as u64;
-    thread::spawn(move || {
-        let _ = FileMetricsService::new(runtime_root).record_operation(
-            "http.request",
-            elapsed_ms,
-            status < 400,
-            json!({
-                "method": method,
-                "path": normalized_path,
-                "raw_path": raw_path,
-                "status": status,
-                "bytes": bytes,
-                "cache_mode": cache_mode,
-                "budget_ms": 50.0,
-                "over_budget": elapsed_ms > 50.0
-            }),
-        );
-    });
+    // Recording is an in-memory ring push; no writer thread or disk involved.
+    let _ = FileMetricsService::new(runtime_root).record_operation(
+        "http.request",
+        elapsed_ms,
+        status < 400,
+        json!({
+            "method": request.method,
+            "path": normalize_api_path(&request.path),
+            "raw_path": request.path,
+            "status": status,
+            "bytes": response.body.len() as u64,
+            "cache_mode": cache_mode,
+            "budget_ms": 50.0,
+            "over_budget": elapsed_ms > 50.0
+        }),
+    );
     true
 }
 
@@ -140,7 +135,7 @@ pub(super) fn screen_critical_http_request(method: &str, path: &str, cache_mode:
             | "/guidance"
             | "/reporters"
             | "/todos"
-            | "/cluster"
+            | "/fleet"
             | "/quality"
             | "/upgrade"
             | "/target-app/status"
@@ -165,7 +160,6 @@ pub(super) fn website_index_path(static_root: &Path) -> PathBuf {
 pub(super) fn website_public_path_allowed(path: &str) -> bool {
     path == "README.md"
         || path == "LICENSE"
-        || path == "scripts/install.sh"
         || path.starts_with("docs/")
         || path == "src/surfaces/website/index.html"
         || path.starts_with("src/surfaces/website/assets/")

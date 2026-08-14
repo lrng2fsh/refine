@@ -366,9 +366,10 @@ impl FileDaemonLifecycleService {
         let port_root = self.runtime_root.port_root(port);
         let supervisor = FileProcessSupervisor::new(&port_root);
         let before_recovery = supervisor.list()?;
-        supervisor.recover()?;
         let recovered_operations =
             FileOperationRegistry::new(&port_root).recover_active_supervised()?;
+        // One reconciling pass after operation recovery; recovering twice
+        // re-verified every process's identity against the OS on the boot path.
         let recovered = supervisor.recover()?;
         let mut status = running_status(port);
         status.active_operations = recovered
@@ -611,30 +612,27 @@ fn relay_daemon_startup_output(path: Option<&str>, offset: &mut usize) -> bool {
 
 impl DaemonRuntimeService for FileDaemonLifecycleService {
     fn stop_runtime(&self, port: u16) -> RefineResult<DaemonStatus> {
-        let supervisor = FileProcessSupervisor::new(self.runtime_root.port_root(port));
-        let processes = supervisor.list()?;
-        for process in processes
-            .iter()
-            .filter(|process| process.owner != ProcessOwner::Daemon)
-        {
-            let process = supervisor.wait(&process.id)?;
-            if process.state == "running" {
-                let _ = supervisor.signal(&process.id, "terminate");
+        let port_root = self.runtime_root.port_root(port);
+        for process_root in [port_root.join("agents"), port_root.clone()] {
+            let supervisor = FileProcessSupervisor::new(process_root);
+            for process in supervisor
+                .list()?
+                .into_iter()
+                .filter(|process| process.owner != ProcessOwner::Daemon)
+            {
+                let process = supervisor.wait(&process.id)?;
+                if process.state == "running" {
+                    let _ = supervisor.signal(&process.id, "kill");
+                }
             }
         }
+        let supervisor = FileProcessSupervisor::new(&port_root);
+        let processes = supervisor.list()?;
         for process in processes {
             if process.owner == ProcessOwner::Daemon {
                 let process = supervisor.wait(&process.id)?;
                 if process.state == "running" {
-                    let _ = supervisor.signal(&process.id, "terminate");
-                    thread::sleep(Duration::from_millis(100));
-                    if supervisor
-                        .wait(&process.id)
-                        .map(|process| process.state == "running")
-                        .unwrap_or(false)
-                    {
-                        let _ = supervisor.signal(&process.id, "kill");
-                    }
+                    let _ = supervisor.signal(&process.id, "kill");
                 }
             }
         }
@@ -715,25 +713,30 @@ pub fn current_launch_mode() -> String {
 }
 
 pub fn current_launch_executable() -> Option<String> {
-    if let Ok(value) = std::env::var("REFINE_LAUNCH_EXECUTABLE")
-        && !value.trim().is_empty()
-    {
-        return Some(value);
+    select_launch_executable(
+        &current_launch_mode(),
+        std::env::var("REFINE_LAUNCH_EXECUTABLE").ok(),
+        std::env::current_exe().ok(),
+    )
+}
+
+fn select_launch_executable(
+    mode: &str,
+    configured: Option<String>,
+    actual: Option<PathBuf>,
+) -> Option<String> {
+    if mode == "cargo" {
+        return actual.map(|path| path.display().to_string());
     }
-    std::env::current_exe()
-        .ok()
-        .map(|path| path.display().to_string())
+    configured
+        .filter(|value| !value.trim().is_empty() && value.trim() != "cargo")
+        .or_else(|| actual.map(|path| path.display().to_string()))
 }
 
 pub fn daemon_executable_path() -> RefineResult<PathBuf> {
-    if current_launch_mode() == "binary"
-        && let Some(path) = current_launch_executable()
-        && path != "cargo"
-    {
-        return Ok(PathBuf::from(path));
-    }
-    std::env::current_exe()
-        .map_err(|error| RefineError::Io(format!("failed to locate current executable: {error}")))
+    current_launch_executable()
+        .map(PathBuf::from)
+        .ok_or_else(|| RefineError::NotFound("failed to locate current executable".to_string()))
 }
 
 pub fn daemon_executable_string() -> RefineResult<String> {

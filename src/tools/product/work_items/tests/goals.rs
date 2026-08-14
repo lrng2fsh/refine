@@ -18,8 +18,8 @@ fn a_nested_projection_cache_still_resolves_the_real_active_node() {
         .unwrap();
     assert_eq!(owned.goal.node_id.as_deref(), Some("bo2lnxnevo03-buddy"));
 
-    // The cache directory claim execution uses: two levels below the runtime root.
-    let nested_cache = runtime_root.join("cache/workflow").join("CLAIM123");
+    // A nested cache directory two levels below the runtime root.
+    let nested_cache = runtime_root.join("cache/projections").join("worker123");
     let service =
         FileWorkItemService::with_projection_cache(&refine_dir, &runtime_root, &nested_cache);
 
@@ -77,7 +77,7 @@ fn retrying_a_failed_goal_clears_the_recorded_failure_reason() {
         .transition_goal_status("GOAL1", GoalStatus::Todo)
         .unwrap();
     service
-        .advance_automated_goal_status("GOAL1", GoalStatus::InProgress)
+        .advance_automated_goal_status("GOAL1", GoalStatus::Plan)
         .unwrap();
     service
         .advance_automated_goal_status("GOAL1", GoalStatus::Failed)
@@ -104,10 +104,10 @@ fn retrying_a_failed_goal_clears_the_recorded_failure_reason() {
 
     // A retry reuses this same round, so the reason it carries is now spent.
     // Leaving it would show a live failure on work that has moved on.
-    service.retry_goal_merge_summary("GOAL1").unwrap();
+    service.retry_goal_governance_summary("GOAL1").unwrap();
 
     let retried = service.show_goal_detail("GOAL1").unwrap();
-    assert_eq!(retried["status"], "ready-merge");
+    assert_eq!(retried["status"], "governance");
     assert_eq!(retried["rounds"][0]["failure_category"], "");
     assert_eq!(retried["rounds"][0]["failure_message"], "");
     assert_eq!(retried["rounds"][0]["failure_at"], "");
@@ -189,7 +189,7 @@ fn distribute_spreads_eligible_goals_evenly_across_nodes() {
         "node-b".to_string(),
     ];
     let result = service
-        .distribute_goals_across_nodes(&targets, false, &std::collections::BTreeSet::new(), false)
+        .distribute_goals_across_nodes(&targets, false, false)
         .unwrap();
 
     assert_eq!(result.strategy, "spread");
@@ -229,7 +229,7 @@ fn distribute_converge_moves_only_reviewable_goals_to_review_node() {
 
     let targets = vec!["default".to_string()];
     let result = service
-        .distribute_goals_across_nodes(&targets, true, &std::collections::BTreeSet::new(), false)
+        .distribute_goals_across_nodes(&targets, true, false)
         .unwrap();
 
     assert_eq!(result.strategy, "converge");

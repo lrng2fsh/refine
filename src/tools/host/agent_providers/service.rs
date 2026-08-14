@@ -38,7 +38,7 @@ impl HostAgentProviderService {
     }
 
     pub fn reap_orphan_prompt_artifacts(&self) -> RefineResult<usize> {
-        reap_orphan_prompt_artifacts(&self.prompt_runtime_root())
+        reap_orphan_prompt_artifacts(&self.prompt_runtime_root()?)
     }
 
     fn spec(provider: &str) -> Option<ProviderSpec> {
@@ -198,7 +198,7 @@ impl HostAgentProviderService {
             spec.noninteractive_prompt_capability()
         };
         let prepared = prepare_prompt_with_environment(
-            &self.prompt_runtime_root(),
+            &self.prompt_runtime_root()?,
             capability,
             request.prompt,
             &request.environment,
@@ -246,6 +246,89 @@ impl HostAgentProviderService {
         invocation: ProviderInvocation,
     ) -> RefineResult<ProviderInvocationResult> {
         self.invoke_detailed_with_output(invocation, |_| {})
+    }
+
+    /// Launch an installed provider as an independently supervised Agent.
+    ///
+    /// Maintenance capabilities use this form when the provider must survive a
+    /// daemon restart and drive several typed Refine commands from durable
+    /// context. The returned managed-process record is the durable launch
+    /// receipt; callers correlate it with an operation through standard
+    /// `operation_id` metadata.
+    pub(crate) fn launch_managed(
+        &self,
+        invocation: ProviderInvocation,
+    ) -> RefineResult<crate::process::subprocess::ManagedProcess> {
+        let _ = self.reap_orphan_prompt_artifacts()?;
+        let (spec, binary) = self.resolve_binary_for_provider(&invocation.provider)?;
+        if invocation
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| cwd.as_bytes().contains(&0))
+        {
+            return Err(RefineError::InvalidInput(
+                "provider cwd contains a NUL byte and cannot be launched".to_string(),
+            ));
+        }
+        let cwd = invocation.cwd.as_deref().map(Path::new);
+        let launch_environment = EffectiveLaunchEnvironment::assemble(&ProcessOwner::Agent, &[])?;
+        let prepared = self.prepare_provider_launch(
+            &spec,
+            binary,
+            ProviderLaunchRequest {
+                prompt: &invocation.prompt,
+                session_id: invocation.session_id.as_deref(),
+                cwd,
+                interactive: false,
+                environment: launch_environment,
+            },
+        )?;
+        prepared.validate_prompt_artifact()?;
+        let mut metadata = invocation.process_metadata;
+        metadata.insert(
+            "prompt_transport".to_string(),
+            serde_json::to_value(&prepared.prompt_transport).map_err(|error| {
+                RefineError::Serialization(format!(
+                    "failed to encode provider prompt transport metadata: {error}"
+                ))
+            })?,
+        );
+        let supervisor = FileProcessSupervisor::new(self.prompt_runtime_root()?);
+        let process = supervisor.launch(ManagedProcessSpec {
+            owner: ProcessOwner::Agent,
+            command: prepared.binary,
+            args: prepared.args,
+            cwd: cwd.map(|path| path.display().to_string()),
+            env: Vec::new(),
+            stdin: prepared.stdin,
+            limits: Some(ProcessResourceLimits {
+                kill_on_parent_exit: false,
+                ..Default::default()
+            }),
+            authorization_command: Some(prepared.authorization_command),
+            sensitive: false,
+            metadata,
+        })?;
+
+        // Keep a prompt-file lease alive until the provider exits. If the
+        // daemon terminates first, the process metadata keeps the artifact
+        // discoverable by the normal orphan reaper after the provider settles.
+        if let Some(artifact) = prepared.prompt_artifact {
+            let observer = supervisor.clone();
+            let process_id = process.id.clone();
+            std::thread::spawn(move || {
+                loop {
+                    match observer.wait(&process_id) {
+                        Ok(current) if current.state == "running" => {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        _ => break,
+                    }
+                }
+                drop(artifact);
+            });
+        }
+        Ok(process)
     }
 
     pub fn invoke_detailed_with_output<F>(
@@ -399,7 +482,7 @@ impl HostAgentProviderService {
                 "provider command cannot be empty".to_string(),
             ));
         };
-        let runtime_root = self.prompt_runtime_root();
+        let runtime_root = self.prompt_runtime_root()?;
         let mut formatter = ProviderActivityFormatter::new(launch.output_format);
         let output = FileProcessSupervisor::new(runtime_root)
             .run_to_completion_with_prepared_environment(
@@ -431,6 +514,7 @@ impl HostAgentProviderService {
             on_output(line);
         }
         let success = output.success();
+        let process_id = output.process.id.clone();
         let exit_code = output.process.exit_code;
         let stdout = output.stdout;
         let stderr = output.stderr;
@@ -456,21 +540,24 @@ impl HostAgentProviderService {
                 output: stdout.clone(),
                 provider_session_id,
                 raw_output: stdout,
+                process_id,
             })
         } else {
             Ok(ProviderInvocationResult {
                 output: final_text,
                 provider_session_id,
                 raw_output: stdout,
+                process_id,
             })
         }
     }
 
-    fn prompt_runtime_root(&self) -> PathBuf {
-        self.runtime_root.clone().unwrap_or_else(|| {
-            crate::process::supervisor::runtime::RuntimePathLayout::current_user("refine")
-                .runtime_root
-                .join("agents")
+    fn prompt_runtime_root(&self) -> RefineResult<PathBuf> {
+        self.runtime_root.clone().ok_or_else(|| {
+            RefineError::Conflict(
+                "stateful provider launch requires the daemon or caller to supply the owning checkout's port-scoped runtime; Refine will not fall back to HOME, XDG, OS app-support state, caller CWD, or an unscoped base run directory"
+                    .to_string(),
+            )
         })
     }
 }

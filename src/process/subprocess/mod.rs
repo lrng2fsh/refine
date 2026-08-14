@@ -17,8 +17,6 @@ use crate::process::supervisor::security::FileSecurityService;
 
 const PROCESS_IDENTITIES_DIR: &str = "process-identities";
 const PROCESS_HISTORY_DIR: &str = "process-history";
-const WORKFLOW_PROCESS_REGISTRATION_LOCK_FILE: &str = ".workflow-process-registration.lock";
-const WORKFLOW_AUTOMATION_STATE_FILE: &str = "workflow-automation-state.json";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -173,6 +171,19 @@ impl ManagedProcessOutput {
 }
 
 impl ManagedProcess {
+    pub fn is_runtime_projection_visible(&self) -> bool {
+        if self.owner != ProcessOwner::Maintenance {
+            return true;
+        }
+        !self
+            .details
+            .as_deref()
+            .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+            .is_some_and(|details| {
+                details.get("kind").and_then(Value::as_str) == Some("repository_reconcile")
+            })
+    }
+
     pub fn api_json(&self) -> serde_json::Value {
         let mut value = json!({
             "id": self.id,
@@ -199,8 +210,6 @@ impl ManagedProcess {
                 "attached_goal_id",
                 "feature_id",
                 "session_id",
-                "claim_id",
-                "execution_id",
                 "mode",
                 "profile",
                 "role",
@@ -232,7 +241,6 @@ impl ManagedProcess {
 }
 
 pub fn workflow_subprocess_metadata(
-    execution_id: &str,
     goal_id: &str,
     workflow_state: &str,
     behavior: &str,
@@ -240,7 +248,6 @@ pub fn workflow_subprocess_metadata(
 ) -> Map<String, Value> {
     let mut metadata = Map::new();
     metadata.insert("kind".to_string(), json!("workflow"));
-    metadata.insert("execution_id".to_string(), json!(execution_id));
     metadata.insert("goal_id".to_string(), json!(goal_id));
     metadata.insert("workflow_state".to_string(), json!(workflow_state));
     metadata.insert("behavior".to_string(), json!(behavior));
@@ -253,6 +260,8 @@ pub fn workflow_subprocess_metadata(
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ProcessPauseState {
     pub workflow_paused: bool,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub disabled_background_workers: BTreeSet<String>,
 }
 
 impl<'de> Deserialize<'de> for ProcessPauseState {
@@ -270,6 +279,8 @@ impl<'de> Deserialize<'de> for ProcessPauseState {
             background_processes_stopped: bool,
             #[serde(default)]
             agents_paused: bool,
+            #[serde(default)]
+            disabled_background_workers: BTreeSet<String>,
         }
 
         let wire = WireState::deserialize(deserializer)?;
@@ -277,7 +288,10 @@ impl<'de> Deserialize<'de> for ProcessPauseState {
             .workflow_paused
             .or(wire.paused)
             .unwrap_or(wire.background_processes_stopped || wire.agents_paused);
-        Ok(Self { workflow_paused })
+        Ok(Self {
+            workflow_paused,
+            disabled_background_workers: wire.disabled_background_workers,
+        })
     }
 }
 
@@ -300,17 +314,6 @@ pub struct FileProcessSupervisor {
     reaper_owned: Arc<Mutex<BTreeSet<String>>>,
 }
 
-#[derive(Debug)]
-pub(crate) struct WorkflowProcessRegistrationLock {
-    file: fs::File,
-}
-
-impl Drop for WorkflowProcessRegistrationLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-    }
-}
-
 impl FileProcessSupervisor {}
 
 mod command_spec;
@@ -326,7 +329,6 @@ use os_signals::*;
 #[cfg(test)]
 pub(crate) use test_hooks::install_after_process_enumeration_hook;
 use test_hooks::*;
-pub(crate) use workflow_registration::acquire_workflow_process_registration_lock;
 pub use workflow_registration::managed_pid_is_alive;
 use workflow_registration::*;
 

@@ -15,7 +15,7 @@ Import exists because work often starts outside Refine: spreadsheets, CSVs, plan
 
 The capability should make that material useful without forcing users to manually create every Goal. It should transform external material into reviewable draft work, then persist accepted drafts as ordinary Refine Goals and Features.
 
-Import is a capability, not just a browser flow. A future agent, CLI command, API route, or desktop surface should be able to use the same extraction, draft, deduplication, and persistence behavior.
+Import is a capability, not just a browser flow. An agent, CLI command, API route, or MCP tool should be able to use the same extraction, draft, deduplication, and persistence behavior.
 
 ## Expected Role
 
@@ -28,6 +28,15 @@ Import should sit between raw source material and durable work state. It should 
 - Feature assignment or Feature creation when source material describes larger outcomes;
 - source evidence that explains where imported work came from;
 - persistence through shared work item services.
+
+Trusted development-request email is a direct source-preserving import. One
+accepted message creates one low-priority Goal whose first Round is assembled
+from explicit From and Subject fields, decoded body text, and every named text
+attachment in MIME order. The sender is Reporter, normal assignee semantics are
+retained, and no extraction or review model may replace that authoritative
+Round. Its local retry ledger migrates a received schema-1 record by re-fetching
+the raw provider message before authoring; missing raw mail remains retryable,
+while already-linked legacy records remain historical and unchanged.
 
 Import should not create a parallel work format. Its successful output should be ordinary Refine work: Goals, Features, notes, ordering, source context, and evidence that workflow and agents can use.
 

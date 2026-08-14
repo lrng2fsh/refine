@@ -89,20 +89,6 @@ impl InProcessWebServer {
         }
 
         if request.method == "POST"
-            && request.path.starts_with("/workflow/executions/")
-            && request.path.ends_with("/retry")
-        {
-            return self.handle_workflow_execution_retry(request);
-        }
-
-        if request.method == "POST"
-            && request.path.starts_with("/workflow/executions/")
-            && request.path.ends_with("/cancel")
-        {
-            return self.handle_workflow_execution_cancel(request);
-        }
-
-        if request.method == "POST"
             && request.path.starts_with("/operations/")
             && request.path.ends_with("/cancel")
         {
@@ -114,6 +100,10 @@ impl InProcessWebServer {
             && request.path.ends_with("/stream")
         {
             return self.handle_process_stream(request);
+        }
+
+        if request.method == "POST" && request.path.starts_with("/processes/background-workers/") {
+            return self.handle_background_worker_control(request);
         }
 
         if request.method == "POST"
@@ -309,44 +299,44 @@ impl InProcessWebServer {
             return self.handle_node_update(request);
         }
 
-        if request.method == "GET" && request.path == "/cluster" {
-            return self.handle_cluster();
+        if request.method == "GET" && request.path == "/fleet" {
+            return self.handle_fleet();
         }
 
-        if request.method == "POST" && request.path == "/cluster/distribute" {
-            return self.handle_cluster_distribute(request);
+        if request.method == "POST" && request.path == "/fleet/distribute" {
+            return self.handle_fleet_distribute(request);
         }
 
-        if request.method == "POST" && request.path == "/cluster/nodes" {
+        if request.method == "POST" && request.path == "/fleet/nodes" {
             return self.handle_remote_node_upsert(request, None);
         }
 
-        if request.method == "PATCH" && request.path.starts_with("/cluster/nodes/") {
-            let node_id = node_id_from_cluster_path(&request.path);
+        if request.method == "PATCH" && request.path.starts_with("/fleet/nodes/") {
+            let node_id = node_id_from_fleet_path(&request.path);
             return self.handle_remote_node_upsert(request, node_id);
         }
 
-        if request.method == "DELETE" && request.path.starts_with("/cluster/nodes/") {
-            let node_id = node_id_from_cluster_path(&request.path);
+        if request.method == "DELETE" && request.path.starts_with("/fleet/nodes/") {
+            let node_id = node_id_from_fleet_path(&request.path);
             return self.handle_remote_node_delete(node_id);
         }
 
         if request.method == "POST"
-            && request.path.starts_with("/cluster/nodes/")
+            && request.path.starts_with("/fleet/nodes/")
             && request.path.ends_with("/bootstrap")
         {
             return self.handle_remote_node_bootstrap(request);
         }
 
         if request.method == "POST"
-            && request.path.starts_with("/cluster/nodes/")
+            && request.path.starts_with("/fleet/nodes/")
             && request.path.ends_with("/run")
         {
             return self.handle_remote_node_run(request);
         }
 
         if request.method == "POST"
-            && request.path.starts_with("/cluster/nodes/")
+            && request.path.starts_with("/fleet/nodes/")
             && request.path.ends_with("/transfer")
         {
             return self.handle_remote_node_transfer(request);
@@ -379,9 +369,10 @@ impl InProcessWebServer {
             return self.handle_target_app_build_queue();
         }
 
-        if request.method == "POST" && request.path == "/runner-workers/merger/hard-reset-worktree"
+        if request.method == "POST"
+            && request.path == "/runner-workers/governance-integrator/hard-reset-worktree"
         {
-            return self.handle_merger_hard_reset_worktree();
+            return self.handle_governance_integration_hard_reset_worktree();
         }
 
         if request.method == "GET" && request.path == "/changes" {
@@ -564,6 +555,18 @@ impl InProcessWebServer {
             return self.handle_guidance_update(request);
         }
 
+        if request.method == "POST" && request.path == "/guidance" {
+            return self.handle_guidance_add(request);
+        }
+
+        if request.method == "PATCH" && request.path.starts_with("/guidance/") {
+            return self.handle_guidance_edit(request);
+        }
+
+        if request.method == "DELETE" && request.path.starts_with("/guidance/") {
+            return self.handle_guidance_remove(request);
+        }
+
         if request.method == "GET" && request.path == "/reporters" {
             return self.handle_reporters_list();
         }
@@ -674,9 +677,9 @@ impl InProcessWebServer {
 
         if request.method == "POST"
             && request.path.starts_with("/chat/")
-            && request.path.ends_with("/submit-ready-merge")
+            && request.path.ends_with("/submit-quality")
         {
-            return self.handle_chat_submit_ready_merge(request);
+            return self.handle_chat_submit_quality(request);
         }
 
         if request.method == "POST"
@@ -866,9 +869,7 @@ impl InProcessWebServer {
                 || request.path.ends_with("/verify")
                 || request.path.ends_with("/approve")
                 || request.path.ends_with("/retry-quality")
-                || request.path.ends_with("/retry-merge")
-                || request.path.ends_with("/submit-merge")
-                || request.path.ends_with("/merge")
+                || request.path.ends_with("/retry-governance")
                 || request.path.ends_with("/undo"))
         {
             return self.handle_goal_action(request);
@@ -1011,8 +1012,8 @@ fn should_refresh_projection_after_mutation(path: &str) -> bool {
         && path != mcp::MCP_ROUTE
 }
 
-fn node_id_from_cluster_path(path: &str) -> Option<String> {
-    path.strip_prefix("/cluster/nodes/")
+fn node_id_from_fleet_path(path: &str) -> Option<String> {
+    path.strip_prefix("/fleet/nodes/")
         .and_then(|rest| rest.split('/').next())
         .map(str::trim)
         .filter(|value| !value.is_empty())

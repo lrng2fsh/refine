@@ -236,6 +236,16 @@ impl FileWorkItemService {
         assignee: Option<&str>,
         prompt: &str,
     ) -> RefineResult<GoalSummaryProjection> {
+        self.append_goal_round_summary_with_requeue(goal_id, reporter, assignee, prompt)
+    }
+
+    fn append_goal_round_summary_with_requeue(
+        &self,
+        goal_id: &str,
+        reporter: &str,
+        assignee: Option<&str>,
+        prompt: &str,
+    ) -> RefineResult<GoalSummaryProjection> {
         let reporter = Self::validate_goal_reporter(reporter)?;
         let assignee = assignee
             .map(Self::validate_goal_assignee)
@@ -268,7 +278,7 @@ impl FileWorkItemService {
                     object.insert("rounds".to_string(), Value::Array(vec![round]));
                 }
             }
-            if current.goal.status == GoalStatus::Review {
+            if matches!(current.goal.status, GoalStatus::Review | GoalStatus::Failed) {
                 object.insert(
                     "status".to_string(),
                     Value::String(GoalStatus::Todo.as_str().to_string()),
@@ -458,6 +468,12 @@ impl FileWorkItemService {
         let fields = evaluation.as_object().ok_or_else(|| {
             RefineError::InvalidInput("round evaluation body must be a JSON object".to_string())
         })?;
+        if fields.contains_key("implementation_plan") {
+            return Err(RefineError::InvalidInput(
+                "implementation_plan is Workflow-owned evidence and can only be changed through its fenced planning authority"
+                    .to_string(),
+            ));
+        }
 
         let (_goal_lock, goal_path, mut value) = self.read_goal_value_unchecked(&current)?;
         let object = value.as_object_mut().ok_or_else(|| {
@@ -487,10 +503,18 @@ impl FileWorkItemService {
             "governance_details",
             "governance_checked_at",
             "governance_rule_actions",
+            "governance_recovery_analysis",
+            "governance_recovery_round_prompt",
             "quality_state",
             "quality_message",
             "quality_details",
             "quality_checked_at",
+            "quality_agent_report",
+            "quality_candidate_commit",
+            "quality_recovery_analysis",
+            "quality_recovery_round_prompt",
+            "quality_recovery_details",
+            "quality_recovery_checked_at",
             "workflow_quality_timing",
             "workflow_git_remote",
             "workflow_integration",

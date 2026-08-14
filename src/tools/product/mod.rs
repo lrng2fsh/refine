@@ -1,14 +1,14 @@
 pub mod chat;
 pub mod development_requests;
 pub mod goal_exports;
+pub mod governance_integration;
 pub mod imports;
-pub mod merging;
 pub mod next_actions;
 pub mod nodes;
 pub mod process_control;
 pub mod project_migration;
+pub mod project_projection;
 pub mod project_registry;
-pub mod project_state;
 pub mod todos;
 pub mod work_items;
 pub mod worktree_cleanup;

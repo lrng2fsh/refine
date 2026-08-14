@@ -1,10 +1,47 @@
 use super::*;
 
 #[test]
+fn web_system_routes_enforce_bootstrap_checkout_and_non_default_port_authority() {
+    let product_home = unique_temp_dir("http-product-authority");
+    let paths = RefineCheckoutPaths::for_test(product_home.clone());
+    let mut server = server_with_projection();
+    server.status.port = 4557;
+    server.app_registry_root = Some(paths.runtime_root.clone());
+    server.runtime_root = Some(paths.port_runtime_root(4557));
+    server.product_paths = Some(paths.clone());
+
+    let status = server.handle(ApiRequest {
+        method: "GET".to_string(),
+        path: "/api/system/install".to_string(),
+        body: None,
+    });
+    assert_eq!(status.status, 200, "{}", status.body);
+    assert_eq!(status.body["install"]["port"], 4557);
+    assert_eq!(status.body["install"]["backend"], serde_json::Value::Null);
+
+    server.runtime_root = Some(paths.port_runtime_root(4558));
+    let mismatch = server.handle(ApiRequest {
+        method: "GET".to_string(),
+        path: "/api/system/install".to_string(),
+        body: None,
+    });
+    assert_eq!(mismatch.status, 409);
+    assert!(
+        mismatch.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("bootstrap does not match")
+    );
+
+    remove_temp_dir(&product_home);
+}
+
+#[test]
 fn web_server_serves_project_utility_upgrade_health_and_sse_routes() {
     let temp_root = unique_temp_dir("http-project-utils");
     let runtime_root = temp_root.join("run/8080");
     fs::create_dir_all(temp_root.join("child")).unwrap();
+    write_test_installed_binary(&temp_root);
     init_git_app(&temp_root);
     let refine_dir = refine_dir_for_target_root(&temp_root).unwrap();
     let mut server = server_with_projection();
@@ -185,11 +222,18 @@ fn web_server_serves_project_utility_upgrade_health_and_sse_routes() {
         .unwrap(),
     )
     .unwrap();
+    fs::write(
+        runtime_root.join("source-update-check.json"),
+        serde_json::to_vec_pretty(&json!({
+            "freshness": "fresh",
+            "in_flight": false,
+            "last_successful_check_at": "2026-08-06T12:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
-    let daemon = LocalHttpDaemon {
-        server,
-        static_root: None,
-    };
+    let daemon = LocalHttpDaemon::new(server, None);
     let sse = daemon.handle_wire_request(HttpRequest {
         method: "GET".to_string(),
         path: "/api/sse".to_string(),
@@ -207,8 +251,9 @@ fn web_server_serves_project_utility_upgrade_health_and_sse_routes() {
     assert!(sse_body.contains("SSE process output"));
     assert!(sse_body.contains("event: operation_progress"));
     assert!(sse_body.contains("SSE operation progress"));
-    assert!(sse_body.contains("event: source_promotion"));
+    assert!(sse_body.contains("event: source_update"));
     assert!(sse_body.contains("Building source candidate"));
+    assert!(sse_body.contains("2026-08-06T12:00:00Z"));
     assert!(sse_body.contains("event: chat_event"));
     assert!(sse_body.contains("SSE chat event"));
 
@@ -531,7 +576,7 @@ fn web_server_lists_processes_and_updates_pause_controls() {
             .map(|work| work["kind"].as_str().unwrap())
             .collect::<Vec<_>>(),
         vec![
-            "merger",
+            "governance_integrator",
             "plan_draft_extractor",
             "target_app_builder",
             "target_app_config_generator",
@@ -787,8 +832,13 @@ fn web_server_lists_processes_and_updates_pause_controls() {
         .transition_goal_status("GOAL-WORKFLOW", GoalStatus::Todo)
         .unwrap();
     work_items
-        .advance_automated_goal_status("GOAL-WORKFLOW", GoalStatus::InProgress)
+        .advance_automated_goal_status("GOAL-WORKFLOW", GoalStatus::Plan)
         .unwrap();
+    let operations = FileOperationRegistry::new(&runtime_root);
+    operations
+        .register("governance-integration:GOAL-WORKFLOW")
+        .unwrap();
+    operations.register("import:extract:plan").unwrap();
     let paused = server.handle(ApiRequest {
         method: "POST".to_string(),
         path: "/api/workflow/pause".to_string(),
@@ -815,18 +865,30 @@ fn web_server_lists_processes_and_updates_pause_controls() {
             .unwrap()
             .goal
             .status,
-        GoalStatus::InProgress
+        GoalStatus::Plan
     );
     assert_eq!(
         supervisor.inspect(&launched_agent.id).unwrap().state,
         "running"
     );
+    let paused_work = paused.body["runner_work"].as_array().unwrap();
+    for kind in ["governance_integrator", "plan_draft_extractor"] {
+        assert_eq!(
+            paused_work
+                .iter()
+                .find(|work| work["kind"] == kind)
+                .unwrap()["status"],
+            "running"
+        );
+    }
     assert!(
-        paused.body["runner_work"]
-            .as_array()
-            .unwrap()
+        paused_work
             .iter()
-            .all(|work| work["status"] == "paused")
+            .filter(|work| !matches!(
+                work["kind"].as_str(),
+                Some("governance_integrator" | "plan_draft_extractor")
+            ))
+            .all(|work| work["status"] == "idle")
     );
 
     let resumed = server.handle(ApiRequest {

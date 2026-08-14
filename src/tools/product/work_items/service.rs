@@ -2,12 +2,14 @@ mod bulk_operations;
 mod features;
 mod goal_authoring;
 mod goal_filters;
+mod implementation_planning;
 mod persistence;
 mod record_persistence;
 mod round_helpers;
 mod rounds_and_metadata;
 mod validation;
 mod workflow;
+mod workflow_attempts;
 use std::collections::BTreeSet;
 use std::fs::{self};
 use std::path::PathBuf;
@@ -32,13 +34,12 @@ use crate::process::supervisor::coordination::{
     RecordLease, acquire_record_lock, record_lock_key, replace_file_durably, with_record_lock,
 };
 use crate::process::supervisor::errors::{RefineError, RefineResult};
-use crate::tools::observability::logs::{FileLogService, LogService};
+use crate::tools::observability::logs::FileLogService;
 use crate::tools::product::nodes::FileNodeRegistryService;
-use crate::tools::product::project_state::{
-    ActiveGoalIndex, FeatureSummaryProjection, FileProjectStateStore, GoalSummaryProjection,
-    ProjectStateStore, ProjectionSnapshot, goal_text_matches,
+use crate::tools::product::project_projection::{
+    ActiveGoalIndex, FeatureSummaryProjection, FileProjectProjectionStore, GoalSummaryProjection,
+    ProjectionSnapshot, goal_text_matches,
 };
-use crate::workflow::WorkflowEngine;
 
 use super::types::*;
 
@@ -46,8 +47,7 @@ use goal_filters::*;
 use record_persistence::*;
 use round_helpers::*;
 use validation::*;
-
-pub(crate) use record_persistence::workflow_revision;
+pub(crate) use workflow_attempts::WorkflowAttemptAuthority;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GoalCancellationExpectation {
@@ -72,69 +72,6 @@ enum BulkGoalStatusProtection {
 enum BulkGoalStatusMutation {
     Updated,
     Skipped(String),
-}
-
-pub(crate) struct GoalCancellationTransaction {
-    service: FileWorkItemService,
-    _lock: GoalMutationLock,
-    goal_id: String,
-    goal_path: PathBuf,
-    original: Value,
-    settled: Value,
-    committed: bool,
-}
-
-impl GoalCancellationTransaction {
-    pub(crate) fn commit(&mut self) -> RefineResult<()> {
-        if self.committed {
-            return Ok(());
-        }
-        let mut expected = self.settled.clone();
-        set_workflow_revision(&mut expected, workflow_revision(&self.original))?;
-        write_json_atomically(&self.goal_path, &expected)?;
-        self.committed = true;
-        Ok(())
-    }
-
-    pub(crate) fn restore(&mut self) -> RefineResult<Value> {
-        if self.committed {
-            let mut expected = self.original.clone();
-            set_workflow_revision(&mut expected, workflow_revision(&self.settled))?;
-            write_json_atomically(&self.goal_path, &expected)?;
-            self.committed = false;
-        }
-        let bytes = fs::read(&self.goal_path).map_err(|error| {
-            RefineError::Io(format!(
-                "failed to read restored Goal {}: {error}",
-                self.goal_path.display()
-            ))
-        })?;
-        serde_json::from_slice(&bytes).map_err(|error| {
-            RefineError::Serialization(format!(
-                "failed to parse restored Goal {}: {error}",
-                self.goal_path.display()
-            ))
-        })
-    }
-
-    pub(crate) fn projection(&self) -> RefineResult<GoalSummaryProjection> {
-        self.service.show_goal_summary(&self.goal_id)
-    }
-
-    pub(crate) fn original_value(&self) -> Value {
-        self.original.clone()
-    }
-
-    pub(crate) fn settled_value(&self) -> Value {
-        let mut settled = self.settled.clone();
-        if let Some(object) = settled.as_object_mut() {
-            object.insert(
-                "workflow_revision".to_string(),
-                Value::from(workflow_revision(&self.original).saturating_add(1)),
-            );
-        }
-        settled
-    }
 }
 
 pub trait WorkItemService {
@@ -168,23 +105,20 @@ pub fn validate_manual_goal_transition(from: &GoalStatus, to: &GoalStatus) -> Re
 fn validate_automated_goal_transition(from: &GoalStatus, to: &GoalStatus) -> RefineResult<()> {
     let allowed = matches!(
         (from, to),
-        (GoalStatus::Todo, GoalStatus::InProgress)
-            | (GoalStatus::Todo, GoalStatus::Qa)
-            | (GoalStatus::InProgress, GoalStatus::Qa)
-            | (GoalStatus::InProgress, GoalStatus::ReadyMerge)
-            | (GoalStatus::Qa, GoalStatus::ReadyMerge)
-            | (GoalStatus::ReadyMerge, GoalStatus::Build)
-            | (GoalStatus::ReadyMerge, GoalStatus::Qa)
-            | (GoalStatus::Build, GoalStatus::Qa)
-            | (GoalStatus::Build, GoalStatus::Review)
-            | (GoalStatus::Qa, GoalStatus::Review)
-            | (GoalStatus::Qa, GoalStatus::Build)
-            | (GoalStatus::Qa, GoalStatus::Done)
-            | (GoalStatus::ReadyMerge, GoalStatus::Todo)
-            | (GoalStatus::InProgress, GoalStatus::Failed)
-            | (GoalStatus::Qa, GoalStatus::Failed)
-            | (GoalStatus::ReadyMerge, GoalStatus::Failed)
-            | (GoalStatus::Build, GoalStatus::Failed)
+        (GoalStatus::Todo, GoalStatus::Plan)
+            | (GoalStatus::Todo, GoalStatus::Quality)
+            | (GoalStatus::Todo, GoalStatus::Failed)
+            | (GoalStatus::Plan, GoalStatus::Implement)
+            | (GoalStatus::Plan, GoalStatus::Failed)
+            | (GoalStatus::Implement, GoalStatus::Quality)
+            | (GoalStatus::Quality, GoalStatus::Governance)
+            | (GoalStatus::Governance, GoalStatus::Review)
+            | (GoalStatus::Quality, GoalStatus::Done)
+            | (GoalStatus::Quality, GoalStatus::Todo)
+            | (GoalStatus::Governance, GoalStatus::Todo)
+            | (GoalStatus::Implement, GoalStatus::Failed)
+            | (GoalStatus::Quality, GoalStatus::Failed)
+            | (GoalStatus::Governance, GoalStatus::Failed)
     );
     if allowed {
         Ok(())
@@ -257,10 +191,30 @@ impl FileWorkItemService {
     /// The runtime root is passed explicitly rather than inferred from the cache
     /// directory. It used to be taken as `cache_dir.parent()`, which held only for
     /// callers whose cache directory sat immediately under the runtime root: a
-    /// caller scoping its cache per unit of work (`cache/workflow/<claim id>`)
+    /// caller scoping its cache per unit of work (`cache/workflow/<worker id>`)
     /// resolved the runtime root to `cache/workflow`, where no `active-node.json`
     /// exists, so every ownership check compared against the `default` fallback
     /// and rejected goals owned by the real active Node.
+    /// Like [`Self::new`], but backed by a projection snapshot cache. Node
+    /// identity still resolves from the state directory itself — only the
+    /// projection load strategy differs. Direct (daemonless) callers use this
+    /// so one query parses a snapshot instead of rebuilding from every record.
+    pub fn with_snapshot_cache(
+        refine_dir: impl Into<PathBuf>,
+        cache_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            refine_dir: refine_dir.into(),
+            projection_cache_dir: Some(cache_dir.into()),
+            active_node_root: None,
+            active_node_id_override: None,
+            #[cfg(test)]
+            after_bulk_goal_selection_hook: None,
+            #[cfg(test)]
+            after_reporter_registration_hook: None,
+        }
+    }
+
     pub fn with_projection_cache(
         refine_dir: impl Into<PathBuf>,
         runtime_root: impl Into<PathBuf>,
@@ -348,16 +302,6 @@ impl FileWorkItemService {
                 current_status.as_str()
             )));
         }
-        if let Some(runtime_root) = &self.active_node_root {
-            let state = WorkflowEngine::new(runtime_root).load_state()?;
-            if let Some(claim) = state.active_claim(goal_id) {
-                return Ok(BulkGoalStatusMutation::Skipped(format!(
-                    "claim:{}",
-                    claim.claim_id
-                )));
-            }
-        }
-
         let target = if raw_target == "__last_workflow_state" {
             restore_last_workflow_status(&current_status)
         } else {

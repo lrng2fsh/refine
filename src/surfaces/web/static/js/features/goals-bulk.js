@@ -15,6 +15,14 @@ const BULK_STATUS_OPTIONS = [
   { value: "cancelled", label: "cancelled" },
 ];
 
+const GOALS_BULK_PENDING_MESSAGE = "Refine is working on it asynchronously.";
+
+async function submitGoalsBulkAction(payload) {
+  toast(GOALS_BULK_PENDING_MESSAGE, "info", { source: "goals-bulk" });
+  const response = await api("POST", "/api/goals/bulk", payload);
+  return await resolveBackgroundOperationResponse(response);
+}
+
 function goalsBulkFilterFromHash() {
   const f = goalsFilterFromHash();
   const filter = {};
@@ -65,8 +73,8 @@ async function openBulkModal(field) {
         ${BULK_STATUS_OPTIONS.map((s) => `<option value="${s.value}">${htmlEscape(s.label)}</option>`).join("")}
       </select>
       <p class="muted small" style="margin-top:6px">
-        Last workflow state sends failed QA attempts back to qa, failed merge
-        attempts back to ready-merge, other failed Goals back to todo, and leaves active
+        Last workflow state sends failed Quality attempts back to quality, failed integration
+        attempts back to governance, other failed Goals back to todo, and leaves active
         automation and Review alone. Cancelled intentionally stops selected active,
         failed, or Review Goals; Done remains protected. Decline Review by submitting
         a new round when the work should continue.
@@ -118,13 +126,9 @@ async function openBulkModal(field) {
   if (next === null) return;
   if (!next) return;          // user opened the picker but didn't choose
   try {
-    let r = await api("POST", "/api/goals/bulk", {
+    const r = await submitGoalsBulkAction({
       filter, ...selectionFields, update: { [field]: next },
     });
-    r = await resolveBackgroundOperationResponse(
-      r,
-      `Bulk ${label.toLowerCase()} update is running in the background`,
-    );
     const failedN = Number(r.failed || (r.failures || []).length || 0);
     if (failedN) {
       toast(`Updated ${r.updated} goal${r.updated === 1 ? "" : "s"}; ` +
@@ -239,7 +243,7 @@ function goalsJiraExportOperationHtml(operation, logs = []) {
       ? "failed"
       : status === "cancelled"
         ? "cancelled"
-        : "in-progress";
+        : "automated";
   const progressHtml = total > 0 ? `
     <progress value="${Math.min(completed, total)}" max="${total}"
               aria-label="Jira export progress"></progress>
@@ -546,7 +550,7 @@ async function openBulkTransferNodeModal() {
         ${opts}
       </select>
       <p class="muted small" style="margin-top:6px">
-        In-progress, qa, ready-merge, and build Goals are skipped.
+        Plan, Implement, Quality, and Governance Goals are skipped.
       </p>
     </div>
     <div class="modal-actions">

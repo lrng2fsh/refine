@@ -1,4 +1,5 @@
 use super::*;
+use crate::surfaces::web_server::project_routes::dashboard_attention_items;
 
 #[test]
 fn web_server_structures_dashboard_attention_and_runtime_banner() {
@@ -10,7 +11,12 @@ fn web_server_structures_dashboard_attention_and_runtime_banner() {
         .unwrap()
         .goal
         .status = GoalStatus::Failed;
-    server.projection.runtime.supervisor = json!({"runner_reachable": false}).as_object().cloned();
+    server.projection.runtime.supervisor = json!({
+        "runner_reachable": false,
+        "workflow_paused": false
+    })
+    .as_object()
+    .cloned();
 
     let response = server.handle(ApiRequest {
         method: "GET".to_string(),
@@ -37,39 +43,244 @@ fn web_server_structures_dashboard_attention_and_runtime_banner() {
 }
 
 #[test]
-fn dashboard_surfaces_quarantined_claim_preparation_failures() {
-    let claim = crate::workflow::WorkflowClaim {
-        claim_id: "claim-poisoned".to_string(),
-        goal_id: "GOAL-POISONED".to_string(),
-        node_id: "node-1".to_string(),
-        provider: "smoke-ai".to_string(),
-        target_app_id: "app-1".to_string(),
-        execution_id: Some("execution-poisoned".to_string()),
-        round_idx: Some(0),
-        goal_revision: Some(7),
-        failure_stage: Some("preparation".to_string()),
-        failure_message: Some("round reconciliation is already reverted".to_string()),
-        decision_version: 2,
-        occurrences: 1,
-        state: crate::workflow::WorkflowClaimState::Failed,
-        created_at: "2026-07-29T00:00:00Z".to_string(),
-        updated_at: "2026-07-29T00:00:01Z".to_string(),
-    };
+fn dashboard_distinguishes_workflow_pause_from_runtime_reachability() {
+    let scenarios = [
+        (
+            false,
+            false,
+            Some((
+                "error",
+                "Refine cannot reach the runtime worker. Re-check auth after restoring provider access.",
+            )),
+        ),
+        (false, true, Some(("info", "Workflow is paused."))),
+        (true, false, None),
+        (true, true, Some(("info", "Workflow is paused."))),
+    ];
 
-    let attention =
-        crate::surfaces::web_server::project_routes::dashboard_attention_items(&[], &[claim], true);
-    assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0]["kind"], "filter");
-    assert_eq!(attention[0]["severity"], "error");
-    assert_eq!(attention[0]["goal_id"], "GOAL-POISONED");
-    assert_eq!(attention[0]["claim_id"], "claim-poisoned");
-    assert_eq!(attention[0]["filter"], json!({"status": "todo"}));
-    assert!(
-        attention[0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("round reconciliation is already reverted")
+    for (runner_reachable, workflow_paused, expected_banner) in scenarios {
+        let attention = dashboard_attention_items(&[], runner_reachable, workflow_paused);
+        let banners = attention
+            .iter()
+            .filter(|item| item["kind"] == "banner")
+            .collect::<Vec<_>>();
+        match expected_banner {
+            Some((severity, message)) => {
+                assert_eq!(banners.len(), 1, "{attention:#?}");
+                assert_eq!(banners[0]["severity"], severity, "{attention:#?}");
+                assert_eq!(banners[0]["message"], message, "{attention:#?}");
+            }
+            None => assert!(banners.is_empty(), "{attention:#?}"),
+        }
+    }
+}
+
+#[test]
+fn dashboard_uses_canonical_runtime_workflow_pause_state() {
+    let runtime_root = unique_temp_dir("dashboard-workflow-paused");
+    FileProcessSupervisor::new(&runtime_root)
+        .set_workflow_paused(true)
+        .unwrap();
+    let mut server = server_with_projection();
+    server.runtime_root = Some(runtime_root);
+
+    let response = server.handle(ApiRequest {
+        method: "GET".to_string(),
+        path: "/api/dashboard".to_string(),
+        body: None,
+    });
+
+    assert_eq!(response.status, 200, "{:#}", response.body);
+    assert_eq!(response.body["runner_reachable"], false);
+    let banners = response.body["needs_attention"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["kind"] == "banner")
+        .collect::<Vec<_>>();
+    assert_eq!(banners.len(), 1, "{:#}", response.body);
+    assert_eq!(banners[0]["severity"], "info", "{:#}", response.body);
+    assert_eq!(
+        banners[0]["message"], "Workflow is paused.",
+        "{:#}",
+        response.body
     );
+}
+
+#[test]
+fn project_status_uses_the_port_scoped_node_that_owns_and_filters_new_goals() {
+    let temp_root = unique_temp_dir("http-project-port-active-node");
+    let app_root = temp_root.join("app");
+    let app_registry_root = temp_root.join("run");
+    let port_runtime_root = app_registry_root.join("8082");
+    fs::create_dir_all(&app_root).unwrap();
+    git(&app_root, &["init", "-q"]).unwrap();
+
+    let mut server = server_with_projection();
+    server.target_root = Some(app_root.clone());
+    server.app_registry_root = Some(app_registry_root.clone());
+    server.runtime_root = Some(port_runtime_root.clone());
+
+    let initial_status = server.handle(ApiRequest {
+        method: "GET".to_string(),
+        path: "/api/project/status".to_string(),
+        body: None,
+    });
+    assert_eq!(initial_status.status, 200, "{:#}", initial_status.body);
+    assert!(app_registry_root.join("apps.json").exists());
+    assert!(!port_runtime_root.join("apps.json").exists());
+
+    let refine_dir = refine_dir_for_target_root(&app_root).unwrap();
+    let base_nodes = crate::tools::product::nodes::FileNodeRegistryService::with_active_root(
+        &refine_dir,
+        &app_registry_root,
+    );
+    base_nodes.create("stale-base").unwrap();
+    base_nodes.rename("stale-base", "Stale Base Node").unwrap();
+    base_nodes.activate("stale-base").unwrap();
+
+    let other_goal = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/goals".to_string(),
+        body: Some(json!({
+            "id": "OTHERGOAL",
+            "name": "Other-node Goal",
+            "reporter": "Reporter",
+            "assignee": "Assignee"
+        })),
+    });
+    assert_eq!(other_goal.status, 201, "{:#}", other_goal.body);
+    assert_eq!(other_goal.body["goal"]["node_id"], "default");
+
+    let created_node = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/nodes".to_string(),
+        body: Some(json!({"id": "port-owner"})),
+    });
+    assert_eq!(created_node.status, 200, "{:#}", created_node.body);
+    let renamed_node = server.handle(ApiRequest {
+        method: "PATCH".to_string(),
+        path: "/api/nodes/port-owner".to_string(),
+        body: Some(json!({"display_name": "Port Owner"})),
+    });
+    assert_eq!(renamed_node.status, 200, "{:#}", renamed_node.body);
+    let activated = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/nodes/activate".to_string(),
+        body: Some(json!({"node_id": "port-owner"})),
+    });
+    assert_eq!(activated.status, 200, "{:#}", activated.body);
+    assert_eq!(activated.body["active_node_id"], "port-owner");
+    assert_eq!(activated.body["active_node"], "Port Owner");
+    assert_eq!(base_nodes.active_node_id().unwrap(), "stale-base");
+
+    let project_status = server.handle(ApiRequest {
+        method: "GET".to_string(),
+        path: "/api/project/status".to_string(),
+        body: None,
+    });
+    let nodes = server.handle(ApiRequest {
+        method: "GET".to_string(),
+        path: "/api/nodes".to_string(),
+        body: None,
+    });
+    assert_eq!(project_status.status, 200, "{:#}", project_status.body);
+    assert_eq!(nodes.status, 200, "{:#}", nodes.body);
+    assert_eq!(
+        project_status.body["active_node_id"],
+        nodes.body["active_node_id"]
+    );
+    assert_eq!(
+        project_status.body["active_node"],
+        nodes.body["active_node"]
+    );
+    assert_eq!(project_status.body["active_node_id"], "port-owner");
+    assert_eq!(project_status.body["active_node"], "Port Owner");
+    assert_ne!(project_status.body["active_node_id"], "stale-base");
+    assert_ne!(project_status.body["active_node"], "Stale Base Node");
+
+    let port_goal = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/goals".to_string(),
+        body: Some(json!({
+            "id": "PORTGOAL",
+            "name": "Port-owned Goal",
+            "reporter": "Reporter",
+            "assignee": "Assignee"
+        })),
+    });
+    assert_eq!(port_goal.status, 201, "{:#}", port_goal.body);
+    assert_eq!(port_goal.body["goal"]["node_id"], "port-owner");
+
+    let current_goals = server.handle(ApiRequest {
+        method: "GET".to_string(),
+        path: "/api/goals?node=current".to_string(),
+        body: None,
+    });
+    assert_eq!(current_goals.status, 200, "{:#}", current_goals.body);
+    assert_eq!(current_goals.body["page"]["total"], 1);
+    let current_ids = current_goals.body["goals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|goal| goal["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(current_ids, vec!["PORTGOAL"]);
+
+    let all_goals = server.handle(ApiRequest {
+        method: "GET".to_string(),
+        path: "/api/goals?node=all".to_string(),
+        body: None,
+    });
+    assert_eq!(all_goals.status, 200, "{:#}", all_goals.body);
+    assert_eq!(all_goals.body["page"]["total"], 2);
+    let all_ids = all_goals.body["goals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|goal| goal["id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        all_ids,
+        std::collections::BTreeSet::from(["OTHERGOAL", "PORTGOAL"])
+    );
+
+    let current_dashboard = server.handle(ApiRequest {
+        method: "GET".to_string(),
+        path: "/api/dashboard?node=current".to_string(),
+        body: None,
+    });
+    assert_eq!(
+        current_dashboard.status, 200,
+        "{:#}",
+        current_dashboard.body
+    );
+    assert_eq!(current_dashboard.body["active_node_id"], "port-owner");
+    assert_eq!(current_dashboard.body["node_filter"], "current");
+    assert_eq!(current_dashboard.body["counts"]["backlog"], 1);
+    assert_eq!(current_dashboard.body["all_node_counts"]["backlog"], 2);
+    assert_eq!(
+        current_dashboard.body["reporter_stats"][0]["reporter"],
+        "Reporter"
+    );
+    assert_eq!(current_dashboard.body["reporter_stats"][0]["reported"], 1);
+
+    let all_dashboard = server.handle(ApiRequest {
+        method: "GET".to_string(),
+        path: "/api/dashboard?node=all".to_string(),
+        body: None,
+    });
+    assert_eq!(all_dashboard.status, 200, "{:#}", all_dashboard.body);
+    assert_eq!(all_dashboard.body["active_node_id"], "port-owner");
+    assert_eq!(all_dashboard.body["node_filter"], "all");
+    assert_eq!(all_dashboard.body["counts"]["backlog"], 2);
+    assert_eq!(
+        all_dashboard.body["reporter_stats"][0]["reporter"],
+        "Reporter"
+    );
+    assert_eq!(all_dashboard.body["reporter_stats"][0]["reported"], 2);
+
+    remove_temp_dir(&temp_root);
 }
 
 #[test]
@@ -315,7 +526,12 @@ fn web_server_applies_runtime_settings_updates_immediately() {
         let created = server.handle(ApiRequest {
             method: "POST".to_string(),
             path: "/api/goals".to_string(),
-            body: Some(json!({"id": id, "name": format!("Instant runtime settings {id}")})),
+            body: Some(json!({
+                "id": id,
+                "name": format!("Instant runtime settings {id}"),
+                "reporter": "Reporter",
+                "prompt": format!("Implement runtime settings Goal {id}")
+            })),
         });
         assert_eq!(created.status, 201);
     }
@@ -336,11 +552,7 @@ fn web_server_applies_runtime_settings_updates_immediately() {
         "0"
     );
 
-    let state = fs::read_to_string(runtime_root.join("workflow-automation-state.json")).unwrap();
-    let state: serde_json::Value = serde_json::from_str(&state).unwrap();
-    assert_eq!(state["policy"]["global_limit"], 2);
-    assert_eq!(state["policy"]["per_node_limit"], 2);
-    assert_eq!(state["claims"].as_array().unwrap().len(), 2);
+    assert!(!runtime_root.join("workflow-automation-state.json").exists());
 
     let raised = server.handle(ApiRequest {
         method: "PATCH".to_string(),
@@ -353,11 +565,7 @@ fn web_server_applies_runtime_settings_updates_immediately() {
     assert_eq!(raised.status, 200);
     assert_eq!(raised.body["settings"]["parallel_run_cap"], "3");
 
-    let state = fs::read_to_string(runtime_root.join("workflow-automation-state.json")).unwrap();
-    let state: serde_json::Value = serde_json::from_str(&state).unwrap();
-    assert_eq!(state["policy"]["global_limit"], 3);
-    assert_eq!(state["policy"]["per_node_limit"], 3);
-    assert_eq!(state["claims"].as_array().unwrap().len(), 3);
+    assert!(!runtime_root.join("workflow-automation-state.json").exists());
 
     let goal = server.handle(ApiRequest {
         method: "GET".to_string(),

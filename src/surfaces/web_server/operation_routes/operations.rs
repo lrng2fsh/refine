@@ -15,11 +15,11 @@ impl InProcessWebServer {
         else {
             return operation_id_required();
         };
-        match self.current_projection_with_runtime() {
+        match self.current_projection_with_runtime_shared() {
             Ok(projection) => projection
                 .runtime
                 .background_operations
-                .into_iter()
+                .iter()
                 .find(|operation| {
                     operation.get("id").and_then(|value| value.as_str()) == Some(operation_id)
                 })
@@ -91,7 +91,18 @@ impl InProcessWebServer {
             return operation_id_required();
         };
         let registry = FileOperationRegistry::new(runtime_root);
-        match registry.cancel_supervised(operation_id, self) {
+        let cancellation = registry.status(operation_id).and_then(|operation| {
+            if operation.owner == "maintenance:source-upgrade" {
+                let paths = self.product_paths()?;
+                paths.validate_source_checkout()?;
+                let checkout = paths.checkout.clone();
+                FileSourcePromotionService::new(checkout, runtime_root, self.status.port)
+                    .cancel_operation(operation_id)
+            } else {
+                registry.cancel_supervised(operation_id, self)
+            }
+        });
+        match cancellation {
             Ok(operation) => {
                 ApiResponse::json(200, json!({"operation": operation_response(operation)}))
             }

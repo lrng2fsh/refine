@@ -10,6 +10,7 @@ use uuid::Uuid;
 use super::*;
 use crate::process::supervisor::coordination::replace_file_durably;
 use crate::process::supervisor::lifecycle::DaemonRuntimeService;
+use crate::tools::host::checkout::RefineCheckoutPaths;
 
 pub const DAEMON_LIFECYCLE_OPERATIONS_DIR: &str = "daemon-lifecycle-operations";
 
@@ -48,11 +49,7 @@ impl FileDaemonLifecycleOperationService {
         action: DaemonLifecycleAction,
         config: BackgroundDaemonConfig,
     ) -> RefineResult<DaemonLifecycleOperation> {
-        let executable = std::env::current_exe().map_err(|error| {
-            RefineError::Io(format!(
-                "failed to locate daemon lifecycle helper executable: {error}"
-            ))
-        })?;
+        let executable = lifecycle_executable(&self.runtime_root.root)?;
         let installation = FileInstallationService::for_port(
             &self.runtime_root.root,
             &self.current_version,
@@ -129,11 +126,14 @@ impl FileDaemonLifecycleOperationService {
         action: DaemonLifecycleAction,
         config: BackgroundDaemonConfig,
     ) -> RefineResult<DaemonLifecycleOperation> {
+        // Long enough for the daemon to flush the small loopback response that
+        // acknowledged this operation; every extra millisecond here is pure
+        // added latency on UI-initiated stop and restart.
         self.run_helper_with(
             operation_id,
             action,
             config,
-            Duration::from_millis(750),
+            Duration::from_millis(250),
             execute_daemon_lifecycle,
         )
     }
@@ -246,6 +246,22 @@ impl FileDaemonLifecycleOperationService {
             .join(DAEMON_LIFECYCLE_OPERATIONS_DIR)
             .join(format!("{operation_id}.json"))
     }
+}
+
+fn lifecycle_executable(runtime_root: &Path) -> RefineResult<PathBuf> {
+    let executable = std::env::current_exe().map_err(|error| {
+        RefineError::Io(format!(
+            "failed to resolve the active Refine lifecycle executable: {error}"
+        ))
+    })?;
+    lifecycle_executable_for_invocation(runtime_root, &executable)
+}
+
+pub(super) fn lifecycle_executable_for_invocation(
+    runtime_root: &Path,
+    executable: &Path,
+) -> RefineResult<PathBuf> {
+    RefineCheckoutPaths::from_runtime_root(runtime_root)?.require_owned_executable(executable)
 }
 
 fn installed_action(action: DaemonLifecycleAction) -> RefineResult<InstalledServiceAction> {

@@ -1,6 +1,131 @@
 use super::*;
 
 #[test]
+fn concurrent_sse_clients_share_one_authoritative_frame_build() {
+    let daemon = LocalHttpDaemon::new(server_with_projection(), None);
+    assert!(Arc::ptr_eq(&daemon.server, &daemon.clone().server));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let mut first = daemon.subscribe_sse_frame_batches("events");
+        let mut second = daemon.subscribe_sse_frame_batches("events");
+        let first_batch = tokio::time::timeout(Duration::from_secs(2), first.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let second_batch = tokio::time::timeout(Duration::from_secs(2), second.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first_batch, &second_batch));
+        assert_eq!(daemon.sse_frame_build_count(), 1);
+    });
+}
+
+#[test]
+fn idle_sse_reuses_the_last_batch_until_an_input_changes() {
+    let temp_root = unique_temp_dir("http-sse-idle-batch");
+    let runtime_root = temp_root.join("run/8080");
+    fs::create_dir_all(temp_root.join(".refine")).unwrap();
+    let stdout_path = runtime_root.join("idle-sse.stdout.log");
+    fs::create_dir_all(&runtime_root).unwrap();
+    fs::write(&stdout_path, "initial\n").unwrap();
+    FileProcessSupervisor::new(&runtime_root)
+        .register(ManagedProcess {
+            id: "idle-sse-process".to_string(),
+            owner: ProcessOwner::UserHelper,
+            pid: Some(std::process::id()),
+            state: "running".to_string(),
+            label: Some("idle SSE process".to_string()),
+            details: None,
+            stdout_path: Some(stdout_path.display().to_string()),
+            stderr_path: None,
+            stdin_path: None,
+            limits: None,
+            started_at: String::new(),
+            exit_code: None,
+        })
+        .unwrap();
+    let mut server = server_with_projection();
+    server.target_root = Some(temp_root.clone());
+    server.runtime_root = Some(runtime_root.clone());
+    let daemon = LocalHttpDaemon::new(server, None);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let mut first = daemon.subscribe_sse_frame_batches("events");
+        let initial = tokio::time::timeout(Duration::from_secs(2), first.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(daemon.sse_frame_build_count(), 1);
+
+        FileProcessSupervisor::new(&runtime_root)
+            .register(ManagedProcess {
+                id: "internal-repository-reconcile".to_string(),
+                owner: ProcessOwner::Maintenance,
+                pid: Some(std::process::id()),
+                state: "running".to_string(),
+                label: Some("git".to_string()),
+                details: Some(
+                    json!({"kind": "repository_reconcile", "command": "git ls-remote"}).to_string(),
+                ),
+                stdout_path: None,
+                stderr_path: None,
+                stdin_path: None,
+                limits: None,
+                started_at: String::new(),
+                exit_code: None,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            daemon.sse_frame_build_count(),
+            1,
+            "internal repository commands must not invalidate the public SSE projection"
+        );
+
+        let mut reconnect = daemon.subscribe_sse_frame_batches("events");
+        let replay = tokio::time::timeout(Duration::from_secs(1), reconnect.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&initial, &replay));
+        assert_eq!(daemon.sse_frame_build_count(), 1);
+
+        fs::write(runtime_root.join(API_EVENTS_FILE), "changed\n").unwrap();
+        let _changed = tokio::time::timeout(Duration::from_secs(2), reconnect.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(daemon.sse_frame_build_count(), 2);
+
+        fs::write(&stdout_path, "initial\nlater output\n").unwrap();
+        let _output_changed = tokio::time::timeout(Duration::from_secs(2), reconnect.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(daemon.sse_frame_build_count(), 3);
+    });
+
+    remove_temp_dir(&temp_root);
+}
+
+#[test]
 fn local_http_daemon_persists_successful_mutations_for_sse() {
     let temp_root = unique_temp_dir("http-mutation-sse");
     let refine_dir = temp_root.join(".refine");
@@ -8,10 +133,7 @@ fn local_http_daemon_persists_successful_mutations_for_sse() {
     let mut server = server_with_projection();
     server.target_root = Some(refine_dir.parent().unwrap().to_path_buf());
     server.runtime_root = Some(runtime_root.clone());
-    let daemon = LocalHttpDaemon {
-        server,
-        static_root: None,
-    };
+    let daemon = LocalHttpDaemon::new(server, None);
 
     let create = daemon.handle_wire_request(HttpRequest {
         method: "POST".to_string(),
@@ -38,10 +160,7 @@ fn local_http_daemon_persists_successful_mutations_for_sse() {
 
 #[test]
 fn local_http_daemon_keeps_sse_stream_open_over_tcp() {
-    let daemon = LocalHttpDaemon {
-        server: server_with_projection(),
-        static_root: None,
-    };
+    let daemon = LocalHttpDaemon::new(server_with_projection(), None);
     let listener = LocalHttpDaemon::bind_loopback(0).unwrap();
     let addr = LocalHttpDaemon::local_addr(&listener).unwrap();
     let _handle = thread::spawn(move || daemon.serve_once(listener).unwrap());
@@ -128,10 +247,7 @@ fn local_http_daemon_keeps_sse_open_when_process_is_reaped_between_enumeration_a
 
     let mut server = server_with_projection();
     server.runtime_root = Some(runtime_root.clone());
-    let daemon = LocalHttpDaemon {
-        server,
-        static_root: None,
-    };
+    let daemon = LocalHttpDaemon::new(server, None);
     let listener = LocalHttpDaemon::bind_loopback(0).unwrap();
     let addr = LocalHttpDaemon::local_addr(&listener).unwrap();
     let handle = thread::spawn(move || daemon.serve_once(listener).unwrap());
@@ -195,7 +311,7 @@ fn local_http_daemon_keeps_sse_open_when_process_is_reaped_between_enumeration_a
     )
     .unwrap();
     let later_event_deadline = Instant::now() + Duration::from_secs(3);
-    while !response.contains("event: source_promotion") {
+    while !response.contains("\"id\":\"after-process-reap\"") {
         match stream.read(&mut chunk) {
             Ok(0) => panic!("SSE stream reached EOF before a later event arrived"),
             Ok(read) => response.push_str(&String::from_utf8_lossy(&chunk[..read])),
@@ -213,6 +329,7 @@ fn local_http_daemon_keeps_sse_open_when_process_is_reaped_between_enumeration_a
         !response.contains("event: error"),
         "reserved SSE error appeared before later delivery: {response}"
     );
+    assert!(response.contains("event: source_update"));
     assert!(response.contains("\"id\":\"after-process-reap\""));
 
     drop(stream);

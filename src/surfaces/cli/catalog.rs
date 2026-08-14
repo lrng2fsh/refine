@@ -1,11 +1,10 @@
 //! Machine-readable CLI catalog.
 //!
-//! `refine commands` emits the full command tree — names, descriptions, and
-//! arguments — as JSON so an agent can load the entire operational vocabulary
-//! in one call instead of exploring `--help` per subcommand. The same tree
-//! renders `docs/spec/cli-reference.md` (via `cargo run -p refine-xtask --
-//! cli-reference`), and a drift test keeps the committed doc in sync, so the
-//! reference can never rot away from the binary.
+//! `refine commands` emits the supported user-facing command tree — names,
+//! descriptions, and arguments — as JSON so an agent can load the current
+//! operational vocabulary in one call instead of exploring `--help` per
+//! subcommand. Hidden worker entry points remain invocable by their owning
+//! processes but are not advertised as operator commands.
 
 use clap::CommandFactory;
 use serde_json::{Value, json};
@@ -21,7 +20,7 @@ pub fn commands_catalog() -> Value {
         "hints": {
             "next": "Run `refine next` for state-aware suggestions of what to do now.",
             "runbooks": "Task-oriented guides live in docs/runbooks/.",
-            "api": "Every command maps onto the daemon HTTP API; discover route groups with `refine system api-groups`."
+            "api": "Discover daemon HTTP route groups and required capabilities with `refine system api-groups`."
         }
     })
 }
@@ -29,7 +28,7 @@ pub fn commands_catalog() -> Value {
 fn subcommand_values(command: &clap::Command) -> Vec<Value> {
     command
         .get_subcommands()
-        .filter(|subcommand| subcommand.get_name() != "help")
+        .filter(|subcommand| subcommand.get_name() != "help" && !subcommand.is_hide_set())
         .map(command_value)
         .collect()
 }
@@ -75,71 +74,6 @@ fn about_text(command: &clap::Command) -> String {
         .unwrap_or_default()
 }
 
-/// Renders the same tree as human-readable markdown for
-/// `docs/spec/cli-reference.md`. Generated — do not edit the file by hand.
-pub fn command_reference_markdown() -> String {
-    let command = Cli::command();
-    let mut output = String::new();
-    output.push_str("# CLI Reference\n\n");
-    output.push_str(
-        "Generated from the clap command tree by `cargo run --manifest-path xtask/Cargo.toml -- cli-reference`.\n\
-         Do not edit by hand — a unit test fails when this file drifts from the binary.\n\n\
-         Agents: `refine commands` emits this same tree as JSON; `refine next` recommends\n\
-         which of these commands to run from current state.\n",
-    );
-    for subcommand in command
-        .get_subcommands()
-        .filter(|subcommand| subcommand.get_name() != "help")
-    {
-        write_command_markdown(&mut output, subcommand, "refine", 2);
-    }
-    output
-}
-
-fn write_command_markdown(
-    output: &mut String,
-    command: &clap::Command,
-    prefix: &str,
-    depth: usize,
-) {
-    let path = format!("{prefix} {}", command.get_name());
-    let heading = "#".repeat(depth.min(4));
-    output.push_str(&format!("\n{heading} `{path}`\n\n"));
-    let about = about_text(command);
-    if !about.is_empty() {
-        output.push_str(&format!("{about}\n"));
-    }
-    let arguments: Vec<&clap::Arg> = command
-        .get_arguments()
-        .filter(|argument| !argument.is_hide_set() && argument.get_id() != "help")
-        .collect();
-    if !arguments.is_empty() {
-        output.push('\n');
-        for argument in arguments {
-            let name = match argument.get_long() {
-                Some(long) => format!("--{long}"),
-                None => format!("<{}>", argument.get_id().as_str().to_uppercase()),
-            };
-            let required = if argument.is_required_set() {
-                " (required)"
-            } else {
-                ""
-            };
-            let help = argument
-                .get_help()
-                .map(|help| help.to_string())
-                .unwrap_or_default();
-            output.push_str(&format!("- `{name}`{required} — {help}\n"));
-        }
-    }
-    for subcommand in command
-        .get_subcommands()
-        .filter(|subcommand| subcommand.get_name() != "help")
-    {
-        write_command_markdown(output, subcommand, &path, depth + 1);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,14 +81,14 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn catalog_lists_cluster_commands_with_descriptions() {
+    fn catalog_lists_fleet_commands_with_descriptions() {
         let catalog = commands_catalog();
         let commands = catalog["commands"].as_array().unwrap();
-        let cluster = commands
+        let fleet = commands
             .iter()
-            .find(|command| command["name"] == "cluster")
-            .expect("cluster command present");
-        let names: Vec<&str> = cluster["subcommands"]
+            .find(|command| command["name"] == "fleet")
+            .expect("fleet command present");
+        let names: Vec<&str> = fleet["subcommands"]
             .as_array()
             .unwrap()
             .iter()
@@ -164,6 +98,81 @@ mod tests {
             assert!(names.contains(&expected), "missing {expected}: {names:?}");
         }
         assert!(commands.iter().any(|command| command["name"] == "next"));
+    }
+
+    #[test]
+    fn catalog_and_interactive_help_only_advertise_supported_commands() {
+        let catalog = commands_catalog();
+        let commands = catalog["commands"].as_array().unwrap();
+        let goal = commands
+            .iter()
+            .find(|command| command["name"] == "goal")
+            .expect("goal command present");
+        let goal_names = goal["subcommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|command| command["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!goal_names.contains(&"verify"));
+
+        let system = commands
+            .iter()
+            .find(|command| command["name"] == "system")
+            .expect("system command present");
+        let system_names = system["subcommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|command| command["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            system_names.contains(&"performance"),
+            "current-main performance command was lost during recovery: {system_names:?}"
+        );
+        for unadvertised in [
+            "build",
+            "clean",
+            "source-promote-helper",
+            "source-upgrade-capability",
+            "source-check-worker",
+            "daemon-lifecycle-helper",
+            "runner-worker",
+        ] {
+            assert!(
+                !system_names.contains(&unadvertised),
+                "catalog advertised non-operator command {unadvertised}: {system_names:?}"
+            );
+        }
+
+        let mut cli = Cli::command();
+        let goal_help = cli
+            .find_subcommand_mut("goal")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(!goal_help.contains("verify"), "{goal_help}");
+        let system_help = cli
+            .find_subcommand_mut("system")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for unadvertised in [
+            "build",
+            "clean",
+            "source-promote-helper",
+            "source-upgrade-capability",
+            "source-check-worker",
+            "daemon-lifecycle-helper",
+            "runner-worker",
+        ] {
+            assert!(
+                !system_help
+                    .lines()
+                    .any(|line| { line.split_whitespace().next() == Some(unadvertised) }),
+                "{system_help}"
+            );
+        }
     }
 
     #[test]
@@ -210,15 +219,38 @@ mod tests {
     }
 
     #[test]
-    fn committed_cli_reference_matches_generated_output() {
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/spec/cli-reference.md");
-        let committed = std::fs::read_to_string(&path).unwrap_or_default();
-        let generated = command_reference_markdown();
-        assert!(
-            committed == generated,
-            "docs/spec/cli-reference.md is out of date; regenerate with `cargo run --manifest-path xtask/Cargo.toml -- cli-reference`"
-        );
+    fn catalog_describes_workflow_pause_and_resume_contract() {
+        let catalog = commands_catalog();
+        let workflow = catalog["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == "workflow")
+            .expect("workflow command present");
+        let subcommands = workflow["subcommands"].as_array().unwrap();
+        let pause = subcommands
+            .iter()
+            .find(|command| command["name"] == "pause")
+            .unwrap()["about"]
+            .as_str()
+            .unwrap();
+        let resume = subcommands
+            .iter()
+            .find(|command| command["name"] == "resume")
+            .unwrap()["about"]
+            .as_str()
+            .unwrap();
+        for phrase in [
+            "new Goal admission",
+            "automatic Git sync",
+            "inactive-worktree cleanup",
+        ] {
+            assert!(pause.contains(phrase), "pause missing {phrase}: {pause}");
+            assert!(resume.contains(phrase), "resume missing {phrase}: {resume}");
+        }
+        assert!(pause.contains("Active Goal executions continue"));
+        assert!(resume.contains("eligible again"));
+        assert!(resume.contains("remain uninterrupted"));
     }
 
     #[test]
@@ -230,7 +262,6 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("md"))
             .collect::<Vec<_>>();
-        paths.push(root.join("docs/spec/scale-reliability-performance.migration.md"));
         paths.sort();
 
         let cli = Cli::command();
@@ -252,22 +283,25 @@ mod tests {
             all.push_str(&document);
             all.push('\n');
         }
-        assert!(
-            index.contains("(../spec/scale-reliability-performance.migration.md)"),
-            "the operational node-migration document must be discoverable from the runbook index"
-        );
-
         for retired in [
             "refine daemon ",
             "./r daemon ",
+            "refine cluster ",
+            "./r cluster ",
             "\nrefine status\n",
             "\n./r status\n",
+            "refine goal verify",
+            "./r goal verify",
         ] {
             assert!(
                 !all.contains(retired),
                 "operational runbooks still contain retired CLI form {retired:?}"
             );
         }
+        assert!(
+            !all.contains("catalog of every CLI command"),
+            "operational runbooks must not claim hidden worker or launcher commands are cataloged"
+        );
         assert!(
             !all.contains("Refine `4.0.0`"),
             "migration guidance must use the installed v4 version"
@@ -300,6 +334,21 @@ mod tests {
             let group_name = group_name.trim_matches(|character: char| {
                 !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_')
             });
+            let documented_subcommand = tokens.get(1).copied().map(|token| {
+                token.trim_matches(|character: char| {
+                    !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_')
+                })
+            });
+            if group_name == "system" && matches!(documented_subcommand, Some("build" | "clean")) {
+                assert_eq!(
+                    line_tokens[command_index],
+                    "./r",
+                    "{}:{} must invoke launcher-owned system commands through ./r",
+                    path.display(),
+                    line_index + 1
+                );
+                continue;
+            }
             let group = cli.find_subcommand(group_name).unwrap_or_else(|| {
                 panic!(
                     "{}:{} documents unknown Refine command group {group_name}",
@@ -310,15 +359,8 @@ mod tests {
             let mut documented_command = group;
             let mut argument_start = 1;
             if group.has_subcommands() {
-                let subcommand_name = tokens
-                    .get(1)
-                    .copied()
+                let subcommand_name = documented_subcommand
                     .filter(|token| !token.starts_with('-'))
-                    .map(|token| {
-                        token.trim_matches(|character: char| {
-                            !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_')
-                        })
-                    })
                     .unwrap_or_else(|| {
                         panic!(
                             "{}:{} omits a subcommand after {group_name}",

@@ -94,12 +94,14 @@ function ensureGoalModalUnderlay() {
 }
 
 async function loadGoalDetail(goalId) {
+  const nodeGeneration = captureNodeContextGeneration();
   try {
     const { goal } = await api("GET", "/api/goals/" + goalId);
-    if (state.currentGoal !== goalId || goal?.id !== goalId) return;
+    if (!isNodeContextGenerationCurrent(nodeGeneration)
+        || state.currentGoal !== goalId || goal?.id !== goalId) return;
     drawGoalDetail(goal);
   } catch (e) {
-    if (state.currentGoal !== goalId) return;
+    if (!isNodeContextGenerationCurrent(nodeGeneration) || state.currentGoal !== goalId) return;
     const container = goalDetailContainer();
     if (container) {
       container.innerHTML = `<p class="muted">Could not load Goal: ${htmlEscape(e.message)}</p>`;
@@ -109,10 +111,8 @@ async function loadGoalDetail(goalId) {
 
 // User-driven workflow transitions for a Goal. Each state declares its
 // `back` and `forward` neighbors. System-owned states have no user buttons —
-// `in-progress` (Workflow Engine owns), `qa` (Quality owns), `ready-merge`
-// (merger queue owns), and `build` (target-app rebuild owns) have no user buttons
-// because they're system-driven phases the agent passes through
-// automatically in the order pinned by the current Goal round.
+// Plan, Implement, Quality, and Governance are system-owned and have no
+// user-driven status buttons.
 // Forward from `review` goes through the dedicated /approve endpoint for
 // approval. Declining review requires the new-round form so the next attempt
 // has a distinct identity and starts from the current integrated target.
@@ -124,10 +124,7 @@ async function loadGoalDetail(goalId) {
 const GOAL_WORKFLOW = {
   backlog:      { forward: { label: "Todo →",     next: "todo"   } },
   todo:         { back:    { label: "← Backlog",  next: "backlog" } },
-  // in-progress: no user buttons — Workflow Engine owns.
-  // qa: no user buttons — Quality owns.
-  // ready-merge: no user buttons — serialized integration owns.
-  // build: no user buttons — target-app build owns.
+  // plan / implement / quality / governance: automation owns these states.
   review:       { forward: { label: "Approve →",  next: "done", approve: true } },
   done:         { back:    { label: "← Review",   next: "review" } },
   failed:       { back:    { label: "← Todo",     next: "todo"   } },
@@ -136,10 +133,10 @@ const GOAL_WORKFLOW = {
 
 function workflowForGoal(goal, latest) {
   if (goal.status === "failed" && isQualityRetryGoal(latest)) {
-    return { back: { label: "← QA", next: "qa", retryQuality: true } };
+    return { back: { label: "← Quality", next: "quality", retryQuality: true } };
   }
   if (goal.status === "failed" && isMergeRetryGoal(latest)) {
-    return { back: { label: "← Candidate", next: "ready-merge", retryMerge: true } };
+    return { back: { label: "← Governance", next: "governance", retryGovernance: true } };
   }
   return GOAL_WORKFLOW[goal.status] || {};
 }
@@ -147,14 +144,14 @@ function workflowForGoal(goal, latest) {
 function isQualityRetryGoal(latest) {
   const message = latest?.latest_workflow_log?.message || "";
   return message.includes("Workflow status changed:") &&
-         message.includes("qa") &&
+         message.includes("quality") &&
          message.includes("failed");
 }
 
 function isMergeRetryGoal(latest) {
   const message = latest?.latest_workflow_log?.message || "";
   return message.includes("Workflow status changed:") &&
-         message.includes("ready-merge") &&
+         message.includes("governance") &&
          message.includes("failed");
 }
 
@@ -260,6 +257,10 @@ function drawGoalDetail(goal) {
   document.querySelectorAll("details.round[data-round-idx]").forEach((el) => {
     prevRoundOpen[el.dataset.roundIdx] = el.open;
   });
+  const prevPlanHistoryOpen = {};
+  document.querySelectorAll("details[data-plan-history][data-round-idx]").forEach((el) => {
+    prevPlanHistoryOpen[`${el.dataset.roundIdx}:${el.dataset.planHistory}`] = el.open;
+  });
   const rounds = goal.rounds || [];
   const latest = rounds[rounds.length - 1] || null;
   const failureBanner = computeFailureBanner(goal, latest);
@@ -280,7 +281,7 @@ function drawGoalDetail(goal) {
   // Outside implementation it opens a separate diagnostic session whose stop
   // lifecycle cannot requeue, cancel, or otherwise mutate the Goal.
   const canOpenAgent = !!goal.id;
-  const openAgentTitle = goal.status === "in-progress"
+  const openAgentTitle = ["plan", "implement", "quality"].includes(goal.status)
     ? "Attach to the running Goal Agent"
     : "Open a diagnostic Agent with this Goal's recorded context";
 
@@ -367,6 +368,7 @@ function drawGoalDetail(goal) {
           rnd, idx,
           idx === rounds.length - 1,
           prevRoundOpen,
+          prevPlanHistoryOpen,
         )).join("")}
 
       ${(isLatestEditable || hasPreservedDraft) ? `
@@ -436,7 +438,7 @@ function bindGoalDetailControls() {
       if (!target) return;
       const busyLabel = target.approve
         ? "Approving…"
-        : target.retryMerge
+        : target.retryGovernance
           ? "Queueing candidate…"
           : `Moving to ${target.next}…`;
       await withButtonBusy(btn, busyLabel, async () => {
@@ -447,12 +449,12 @@ function bindGoalDetailControls() {
             else toast(r.message || "Approval did not complete", "error");
           } else if (target.retryQuality) {
             const r = await api("POST", `/api/goals/${liveGoal().id}/retry-quality`);
-            if (r.ok) toast(r.message || "Queued for QA", "info");
-            else toast(r.message || "QA retry did not queue", "error");
-          } else if (target.retryMerge) {
-            const r = await api("POST", `/api/goals/${liveGoal().id}/retry-merge`);
-            if (r.ok) toast(r.message || "Queued candidate", "info");
-            else toast(r.message || "Candidate retry did not queue", "error");
+            if (r.ok) toast(r.message || "Queued for Quality", "info");
+            else toast(r.message || "Quality retry did not queue", "error");
+          } else if (target.retryGovernance) {
+            const r = await api("POST", `/api/goals/${liveGoal().id}/retry-governance`);
+            if (r.ok) toast(r.message || "Queued for Governance", "info");
+            else toast(r.message || "Governance retry did not queue", "error");
           } else {
             await api("PATCH", `/api/goals/${liveGoal().id}`, { status: target.next });
             toast(`Moved to ${target.next}`, "info");
@@ -765,7 +767,53 @@ function restoreRoundFormDraftFocus(goalId) {
   }
 }
 
-function renderRound(rnd, idx, isLatest, prevRoundOpen = {}) {
+function renderImplementationChecklist(items, implementation) {
+  const results = new Map((implementation?.execution?.checklist || []).map((item) => [item.id, item]));
+  if (!items?.length) return `<p class="muted small">No checklist has been recorded.</p>`;
+  return `<ol class="implementation-plan-checklist" data-testid="goal-implementation-plan-checklist">
+    ${items.map((item) => {
+      const result = results.get(item.id);
+      return `<li data-checklist-id="${htmlEscape(item.id)}">
+        <div><code>${htmlEscape(item.id)}</code> ${htmlEscape(item.description || "")}
+          ${result ? `<span class="status-pill ${result.outcome === "completed" ? "done" : "failed"}" data-testid="goal-implementation-checklist-outcome">${htmlEscape(result.outcome)}</span>` : ""}
+        </div>
+        ${item.affected_behavior?.length ? `<div class="muted small">Affected: ${item.affected_behavior.map(htmlEscape).join(", ")}</div>` : ""}
+        ${item.governance_rationale ? `<div class="muted small">Governance: ${htmlEscape(item.governance_rationale)}</div>` : ""}
+        ${item.verification?.length ? `<div class="muted small">Intended evidence: ${item.verification.map(htmlEscape).join("; ")}</div>` : ""}
+        ${result?.evidence ? `<div class="small" data-testid="goal-implementation-checklist-evidence">${htmlEscape(result.evidence)}</div>` : ""}
+      </li>`;
+    }).join("")}
+  </ol>`;
+}
+
+function renderImplementationPlan(rnd, idx, prevPlanHistoryOpen = {}) {
+  const plan = rnd?.implementation_plan;
+  if (!plan) return "";
+  const finalPlan = plan.final_plan?.result;
+  const proposal = plan.proposal?.result;
+  const criticism = plan.criticism?.result;
+  const historyOpen = (kind) => prevPlanHistoryOpen[`${idx}:${kind}`] ? " open" : "";
+  const phase = plan.phase || "unknown";
+  const planState = plan.state || "in_progress";
+  const phaseLabel = planState === "in_progress" ? phase : planState;
+  return `<section class="card implementation-plan" data-testid="goal-implementation-plan" aria-labelledby="implementation-plan-title-${idx}" style="margin-top:12px">
+    <div class="row" style="align-items:center;gap:8px">
+      <h4 id="implementation-plan-title-${idx}" style="margin:0">Implementation Plan</h4>
+      <span class="status-pill ${planState === "completed" ? "done" : planState === "failed" ? "failed" : "plan"}" data-testid="goal-implementation-plan-phase">${htmlEscape(phaseLabel)}</span>
+      <span class="muted small">phase ${htmlEscape(phase)}</span>
+      <span class="spacer"></span>
+      <span class="muted small">phase started ${fmtTime(plan.phase_started_at || plan.started_at)} · updated ${fmtTime(plan.updated_at)}</span>
+    </div>
+    ${plan.active_process ? `<div class="muted small" data-testid="goal-implementation-plan-active-process">Active operation ${htmlEscape(plan.active_process.operation_id || "unknown")}${plan.active_process.process_id ? ` · process ${htmlEscape(plan.active_process.process_id)}` : " · awaiting process registration"}</div>` : ""}
+    ${finalPlan ? `<p data-testid="goal-implementation-plan-summary">${htmlEscape(finalPlan.summary || "")}</p>${renderImplementationChecklist(finalPlan.checklist, plan.implementation)}` : `<p class="muted">The final plan is not available yet.</p>`}
+    ${plan.implementation?.execution?.verification?.length ? `<div class="small" data-testid="goal-implementation-verification"><strong>Verification:</strong> ${plan.implementation.execution.verification.map(htmlEscape).join("; ")}</div>` : ""}
+    ${plan.failure ? `<div class="banner error" role="alert" data-testid="goal-implementation-plan-failure"><span class="banner-msg">${htmlEscape(plan.failure.phase)} failed ${plan.failure.failed_at ? `at ${fmtTime(plan.failure.failed_at)}` : ""}: ${htmlEscape(plan.failure.message)}</span></div>` : ""}
+    ${proposal ? `<details data-plan-history="proposal" data-round-idx="${idx}" data-testid="goal-implementation-plan-proposal"${historyOpen("proposal")}><summary>Original proposal · ${fmtTime(plan.proposal.completed_at)}</summary><p>${htmlEscape(proposal.summary || "")}</p>${renderImplementationChecklist(proposal.checklist)}</details>` : ""}
+    ${criticism ? `<details data-plan-history="criticism" data-round-idx="${idx}" data-testid="goal-implementation-plan-criticism"${historyOpen("criticism")}><summary>Independent criticism · ${fmtTime(plan.criticism.completed_at)}</summary><p>${htmlEscape(criticism.summary || "")}</p><ul>${(criticism.findings || []).map((finding) => `<li><code>${htmlEscape(finding.id)}</code> ${htmlEscape(finding.description || "")}<div class="muted small">${htmlEscape(finding.recommendation || "")}</div></li>`).join("")}</ul></details>` : ""}
+  </section>`;
+}
+
+function renderRound(rnd, idx, isLatest, prevRoundOpen = {}, prevPlanHistoryOpen = {}) {
   // Preserve the user's open/closed choice across re-renders. New rounds
   // (no prior entry in the snapshot) default to "open on latest" — the
   // historical behavior.
@@ -780,7 +828,7 @@ function renderRound(rnd, idx, isLatest, prevRoundOpen = {}) {
           ? `<span class="status-pill ${reviewStateClass(rnd.rule_state)}">governance: ${htmlEscape(rnd.rule_state)}</span>`
           : ""}
         ${isLatest && rnd.quality_state && rnd.quality_state !== "unclassified"
-          ? `<span class="status-pill ${reviewStateClass(rnd.quality_state, "qa")}">quality: ${htmlEscape(rnd.quality_state)}</span>`
+          ? `<span class="status-pill ${reviewStateClass(rnd.quality_state, "quality")}">quality: ${htmlEscape(rnd.quality_state)}</span>`
           : ""}
         <span class="spacer"></span>
         <span class="muted small">
@@ -793,6 +841,7 @@ function renderRound(rnd, idx, isLatest, prevRoundOpen = {}) {
         <dl class="pair">
           <dt>prompt</dt><dd data-testid="goal-round-detail-prompt">${htmlEscape(rnd.prompt || "").replace(/\n/g, "<br>")}</dd>
         </dl>
+        ${renderImplementationPlan(rnd, idx, prevPlanHistoryOpen)}
         ${rnd.implementation_report ? `
           <div class="card implementation-report" data-testid="goal-implementation-report" style="margin-top:12px">
             <div class="row" style="align-items:center;gap:8px">
@@ -901,7 +950,7 @@ function renderQualitySummary(round) {
     <div class="card" style="margin:0 0 14px" data-testid="goal-quality-summary">
       <h3>Quality</h3>
       <div class="row" style="gap:8px;flex-wrap:wrap">
-        <span class="status-pill ${reviewStateClass(round.quality_state, "qa")}" data-testid="goal-quality-state">quality: ${htmlEscape(normalizeReviewState(round.quality_state))}</span>
+        <span class="status-pill ${reviewStateClass(round.quality_state, "quality")}" data-testid="goal-quality-state">quality: ${htmlEscape(normalizeReviewState(round.quality_state))}</span>
         ${round.quality_checked_at ? `<span class="muted small" data-testid="goal-quality-checked-at">${fmtTime(round.quality_checked_at)}</span>` : ""}
       </div>
       ${round.quality_message ? `<p style="margin-bottom:6px" data-testid="goal-quality-message">${htmlEscape(round.quality_message)}</p>` : ""}

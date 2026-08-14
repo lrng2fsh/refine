@@ -9,7 +9,7 @@ use crate::model::workflow::GoalStatus;
 use crate::process::supervisor::config::{ConfigService, FileSettingsService};
 use crate::process::supervisor::errors::RefineResult;
 use crate::tools::product::nodes::FileNodeRegistryService;
-use crate::tools::product::project_state::{ActiveGoalIndex, ProjectionSnapshot};
+use crate::tools::product::project_projection::{ActiveGoalIndex, ProjectionSnapshot};
 use crate::tools::product::work_items::FileWorkItemService;
 
 #[derive(Clone, Debug)]
@@ -46,6 +46,7 @@ impl BacklogPromotionService {
         let mut candidates = active
             .goals()
             .filter(|goal| goal.status == GoalStatus::Backlog)
+            .filter(|goal| goal.round_count > 0)
             .filter(|goal| goal.node_id.as_deref().unwrap_or("default") == active_node_id)
             .filter(|goal| backlog_goal_age_seconds(goal, now) >= Some(threshold))
             .cloned()
@@ -87,12 +88,14 @@ impl BacklogPromotionService {
             .values()
             .map(|projection| &projection.goal)
             .filter(|goal| goal.status == GoalStatus::Backlog)
+            .filter(|goal| goal.round_count > 0)
             .filter(|goal| goal.node_id.as_deref().unwrap_or("default") == active_node_id)
             .filter(|goal| backlog_goal_age_seconds(goal, now) >= Some(threshold))
             .cloned()
             .collect::<Vec<_>>();
         if let Some(created_goal) = created_goal
             && created_goal.status == GoalStatus::Backlog
+            && created_goal.round_count > 0
             && created_goal.node_id.as_deref().unwrap_or("default") == active_node_id
             && backlog_goal_age_seconds(created_goal, now) >= Some(threshold)
         {

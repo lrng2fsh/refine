@@ -1149,7 +1149,8 @@ function toolbarIcon(name) {
 function renderTerminalPanel(tab) {
   const terminal = terminalStateFor(chatState.activeTabId);
   const role = tab.mode === "terminal" ? "shell" : `${tab.label} agent`;
-  const diagnosticGoal = tab.mode === "goal" && tab.goalStatus && tab.goalStatus !== "in-progress";
+  const diagnosticGoal = tab.mode === "goal" && tab.goalStatus
+    && !["plan", "implement", "quality"].includes(tab.goalStatus);
   const status = terminal?.loading
     ? `Starting ${role}...`
     : terminal?.stopping
@@ -1320,7 +1321,9 @@ async function stopTerminalSession(tab = currentToolbarTab()) {
 function retainedGoalStopMessage(stopped) {
   const goalOutcome = stopped?.goal?.status === "cancelled"
     ? "Explicit Goal cancellation remains terminal."
-    : "Goal returned to todo.";
+    : stopped?.goal?.status === "failed"
+      ? "The current planned attempt failed; start a fresh follow-up Round to retry."
+      : "The Goal state was unchanged.";
   return `Agent stopped. ${goalOutcome} Its workflow worktree and branch were retained for inspection or explicit cleanup.`;
 }
 
@@ -3025,4 +3028,14 @@ function removeToolbarTab(tabId) {
   }
   saveChatStateToStorage();
   drawChat();
+}
+
+function removeToolbarTabsForStoppedProcess(processId, sessionId = "") {
+  const matches = Object.entries(chatState.tabs)
+    .filter(([, tab]) => (
+      (processId && tab.processId === processId)
+      || (sessionId && tab.sessionId === sessionId)
+    ))
+    .map(([tabId]) => tabId);
+  for (const tabId of matches) removeToolbarTab(tabId);
 }

@@ -2,32 +2,23 @@
 
 ## Key Ideas
 
-- **Intentionally Stopped**: cancelled means work should not continue unless reopened or replaced.
-- **Preserved Context**: cancellation should explain why the work stopped.
-- **Safe Exit**: cancellation should release claims, stop relevant execution, and preserve evidence.
+- **Intentionally Stopped**: cancelled means work should not continue.
+- **Monotonic Intent**: cancellation is committed on the Goal before local cleanup.
+- **Explicit Reopening**: moving a cancelled Goal to todo supersedes the cancelled attempt and permits a replacement attempt.
+- **Preserved Context**: history, evidence, branches, and worktrees remain inspectable.
 
 ## Purpose
 
-Cancelled exists so Refine can intentionally stop work without pretending it succeeded or failed accidentally. A Goal may become irrelevant, duplicate, unsafe, out of scope, or superseded by a different plan.
+Cancelled intentionally stops work without pretending it succeeded or failed accidentally. A Goal may be irrelevant, duplicate, unsafe, out of scope, or superseded.
 
 ## Expected Role
 
-Cancelled should remove work from active automation while preserving the reason, history, logs, and relationships needed for future understanding.
+Single and bulk cancellation use the same Goal capability. Each Goal is changed to `cancelled` and read back independently. Refine then attempts to stop matching local processes as best-effort cleanup and reports any failures without rolling the Goal back.
 
-Cancellation should be visible to workflow, Features, agents, and surfaces. If cancelled work affected ordered Features or active processes, those effects should be handled explicitly.
+A stale worker cannot transition a cancelled Goal. Governance cancellation before integration prevents its first Git side effect; cancellation after integration begins remains terminal while integration may finish and preserve exact evidence. Cancellation never silently deletes history, branches, or worktrees.
 
-## What Happens
-
-When a Goal is cancelled:
-
-- Refine removes it from active workflow consideration.
-- Active claims, relevant processes, and pending automation should be stopped or released where appropriate.
-- Single and bulk cancellation use the same durable operation, process, claim, capacity, Goal,
-  receipt, and replay settlement; bulk callers receive an outcome for each selected Goal.
-- The cancellation reason, history, logs, and relationships should remain inspectable.
-- Feature rollups and ordered work should account for the cancellation explicitly.
-- Future work may replace or supersede the cancelled Goal, but cancellation should not silently delete the record.
+Undo and shared bulk movement may explicitly reopen a cancelled Goal to todo. Reopening clears the prior attempt's settlement authority; the next worker claims the existing latest Round or a newly submitted Round with a newer authority. Logs, process records, candidate branches, and worktrees from the cancelled attempt remain evidence, but its late failure cannot fail the reopened Goal or write failure metadata onto the replacement Round.
 
 ## Future Direction
 
-Future cancellation behavior may support replacement links, superseded-by relationships, automatic cleanup, and agent-suggested cancellation when work becomes obsolete. The state should remain a deliberate stop, not silent disappearance.
+Cancellation may gain replacement links, superseded-by relationships, and smarter cleanup while remaining deliberate synchronized Goal intent rather than process state.

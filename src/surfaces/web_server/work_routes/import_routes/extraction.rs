@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::tools::product::project_state::goal_text_matches;
+use crate::tools::product::project_projection::goal_text_matches;
 
 impl InProcessWebServer {
     pub(crate) fn handle_import_extract(&self, request: ApiRequest) -> ApiResponse {
@@ -243,7 +243,7 @@ impl InProcessWebServer {
             Ok(drafts) => drafts,
             Err(error) => return error_response(error),
         };
-        let projection = match self.current_projection() {
+        let projection = match self.current_projection_shared() {
             Ok(projection) => projection,
             Err(error) => return error_response(error),
         };

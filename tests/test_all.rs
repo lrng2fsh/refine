@@ -43,7 +43,7 @@ fn print_usage() {
 \n\
 Suites:\n\
   --unit         Run in-crate Rust unit tests only. This is the default.\n\
-  --integration  Run opt-in CLI, daemon, Docker, and cluster suites.\n\
+  --integration  Run opt-in CLI, daemon, Docker, and fleet suites.\n\
   --full         Run all test suites and repository checks.\n\
 \n\
 Examples:\n\
@@ -56,7 +56,7 @@ Examples:\n\
 fn repo_root() -> PathBuf {
     let mut current = std::env::current_dir().expect("failed to inspect cwd");
     loop {
-        if current.join("docs/spec/rust-spec.md").is_file() {
+        if current.join("docs/intent/README.md").is_file() {
             return current;
         }
         assert!(current.pop(), "failed to locate repository root");

@@ -23,7 +23,7 @@ Target App should be the foundation that ties durable work to the real project. 
 
 - the active app and project registry;
 - durable product state in the repository's Git-owned Refine layout, with `.refine` checked out only in the isolated `refine/state` worktree;
-- runtime state for the local daemon, processes, operations, claims, and caches;
+- runtime state for the local daemon, processes, operations, and caches;
 - workflow state that explains what can happen next;
 - projection snapshots and other derived state that keep the product fast without becoming authoritative;
 - target-app lifecycle instructions for start, stop, and rebuild, plus deterministic commands for tests and health checks;
@@ -44,8 +44,12 @@ The current implementation details that matter to intent are:
   durable recovery record until their record-locked cascade completes, while explicit removal
   changes only the dropdown and leaves historical strings intact;
 - projections and caches exist for speed but should be rebuildable from durable state;
+- Goal log sidecars are node-local evidence under the live state's `runtime/`
+  namespace. They must remain readable on the node that observed them without
+  being published as durable `refine/state` project history;
 - Git provides history, isolation, rollback, and merge discipline;
 - shared services and daemon routes should coordinate state mutation so surfaces do not compete for authority.
+- the active checkout-owned daemon is the normal configuration mutation authority for browser and CLI. Guidance and Governance collection revisions make stale writers explicit while stable item ids preserve unrelated entries; no surface writes `.git/refine-live-state` directly or creates a parallel configuration model.
 
 The important boundary is source of truth. Caches, indexes, projections, and UI state are allowed and necessary for performance, but they should not replace durable target-app state. If a cache is wrong, the repair path should be refresh or rebuild, not manual database surgery.
 

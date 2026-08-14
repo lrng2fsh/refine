@@ -2,10 +2,7 @@ use super::*;
 
 #[test]
 fn local_http_daemon_serves_projection_routes_over_tcp() {
-    let daemon = LocalHttpDaemon {
-        server: server_with_projection(),
-        static_root: None,
-    };
+    let daemon = LocalHttpDaemon::new(server_with_projection(), None);
     let listener = LocalHttpDaemon::bind_loopback(0).unwrap();
     let addr = LocalHttpDaemon::local_addr(&listener).unwrap();
     let handle = thread::spawn(move || daemon.serve_once(listener).unwrap());
@@ -25,10 +22,7 @@ fn local_http_daemon_serves_projection_routes_over_tcp() {
 
 #[test]
 fn local_http_daemon_handles_tcp_requests_on_worker_threads() {
-    let daemon = LocalHttpDaemon {
-        server: server_with_projection(),
-        static_root: None,
-    };
+    let daemon = LocalHttpDaemon::new(server_with_projection(), None);
     let listener = LocalHttpDaemon::bind_loopback(0).unwrap();
     let addr = LocalHttpDaemon::local_addr(&listener).unwrap();
     let handle = thread::spawn(move || daemon.serve_once(listener).unwrap());
@@ -69,10 +63,7 @@ fn local_http_daemon_stays_responsive_while_plan_start_waits_for_git() {
     let mut server = server_with_projection();
     server.target_root = Some(app_root);
     server.runtime_root = Some(runtime_root);
-    let daemon = LocalHttpDaemon {
-        server,
-        static_root: None,
-    };
+    let daemon = LocalHttpDaemon::new(server, None);
     let listener = LocalHttpDaemon::bind_loopback(0).unwrap();
     let addr = LocalHttpDaemon::local_addr(&listener).unwrap();
     let server_thread = thread::spawn(move || daemon.serve_once(listener).unwrap());
@@ -114,26 +105,69 @@ fn local_http_daemon_stays_responsive_while_plan_start_waits_for_git() {
 }
 
 #[test]
-fn local_http_daemon_reports_startup_cache_progress() {
-    let daemon = LocalHttpDaemon {
-        server: server_with_projection(),
-        static_root: None,
-    };
+fn startup_recovery_no_longer_blocks_on_cache_warming() {
+    let daemon = LocalHttpDaemon::new(server_with_projection(), None);
     let mut messages = Vec::new();
 
     daemon
         .recover_runtime_state_with_progress(|message| messages.push(message.to_string()))
         .unwrap();
 
-    assert_eq!(
-        messages,
-        vec![
-            "warming project and runtime caches",
-            "warming diagnostics cache",
-            "warming static asset cache",
-            "startup cache warming complete",
-        ]
+    // Cache warming moved behind readiness (`warm_caches_in_background`):
+    // every warmed cache rebuilds on demand, so holding the port closed for
+    // warming only delayed boot. Recovery itself reports no warming steps.
+    assert!(
+        messages
+            .iter()
+            .all(|message| !message.contains("warming")),
+        "recovery emitted cache-warming steps: {messages:?}"
     );
+}
+
+#[test]
+fn runtime_only_changes_do_not_rewrite_the_project_projection_snapshot() {
+    let temp_root = unique_temp_dir("http-runtime-projection-persistence");
+    let runtime_root = temp_root.join("run/8080");
+    fs::create_dir_all(temp_root.join(".refine")).unwrap();
+    let mut server = server_with_projection();
+    server.target_root = Some(temp_root.clone());
+    server.runtime_root = Some(runtime_root.clone());
+    server.warm_current_projection_cache().unwrap();
+
+    let snapshot_path = runtime_root.join("cache").join(PROJECTION_SNAPSHOT_FILE);
+    let before = fs::read(&snapshot_path).unwrap();
+    FileProcessSupervisor::new(&runtime_root)
+        .register(ManagedProcess {
+            id: "visible-runtime-process".to_string(),
+            owner: ProcessOwner::UserHelper,
+            pid: Some(std::process::id()),
+            state: "running".to_string(),
+            label: Some("visible runtime process".to_string()),
+            details: None,
+            stdout_path: None,
+            stderr_path: None,
+            stdin_path: None,
+            limits: None,
+            started_at: String::new(),
+            exit_code: None,
+        })
+        .unwrap();
+
+    let projection = server.current_projection_with_runtime_shared().unwrap();
+    assert!(
+        projection
+            .runtime
+            .processes
+            .iter()
+            .any(|process| process.get("id") == Some(&json!("visible-runtime-process")))
+    );
+    assert_eq!(
+        fs::read(snapshot_path).unwrap(),
+        before,
+        "derived runtime state must stay in memory instead of rewriting the project snapshot"
+    );
+
+    remove_temp_dir(&temp_root);
 }
 
 #[test]
@@ -144,10 +178,7 @@ fn local_http_daemon_refreshes_hot_projection_and_records_screen_metrics() {
     let mut server = server_with_projection();
     server.target_root = Some(refine_dir.parent().unwrap().to_path_buf());
     server.runtime_root = Some(runtime_root.clone());
-    let daemon = LocalHttpDaemon {
-        server,
-        static_root: None,
-    };
+    let daemon = LocalHttpDaemon::new(server, None);
     daemon.recover_runtime_state().unwrap();
 
     let create = daemon.handle_wire_request(HttpRequest {
@@ -237,10 +268,7 @@ fn local_http_daemon_recovers_stale_chat_turns_before_serving() {
     let mut server = server_with_projection();
     server.target_root = Some(temp_root.clone());
     server.runtime_root = Some(runtime_root.clone());
-    let daemon = LocalHttpDaemon {
-        server,
-        static_root: None,
-    };
+    let daemon = LocalHttpDaemon::new(server, None);
     daemon.recover_runtime_state().unwrap();
 
     let recovered: serde_json::Value =

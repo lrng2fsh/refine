@@ -7,12 +7,11 @@ mod goals;
 mod http_transport;
 mod imports;
 mod imports_parity;
-mod nodes_cluster;
+mod nodes_fleet;
 mod operations_processes;
 mod project_runtime;
 mod quality_guidance;
 mod static_surface;
-mod workflow_runtime;
 
 use crate::model::log::LogEntry;
 use crate::process::supervisor::config::{ConfigService, FileSettingsService};
@@ -23,8 +22,6 @@ use crate::tools::observability::activity::{ActivityService, FileActivityService
 use crate::tools::observability::logs::FileLogService;
 use crate::tools::observability::metrics::{FileMetricsService, PerformanceQuery};
 use crate::tools::product::chat::{ChatAttachment, ChatService, FileChatService};
-use crate::workflow::capacity::AgentCapacityService;
-use crate::workflow::{WorkflowAutomation, WorkflowClaimState, WorkflowEngine};
 use chrono::Utc;
 use serde_json::json;
 
@@ -56,10 +53,11 @@ use crate::surfaces::web_server::support::{
 };
 use crate::tools::host::agent_providers::smoke_ai_env_lock;
 use crate::tools::host::project_layout::refine_dir_for_target_root;
-use crate::tools::product::project_state::{
-    ActivityProjectionQuery, DashboardProjection, FeatureSummaryProjection, FileProjectStateStore,
-    GoalSummaryProjection, PROJECTION_SNAPSHOT_FILE, PROJECTION_SNAPSHOT_VERSION, PageRequest,
-    ProjectStateStore, ProjectionQuery, ProjectionSnapshot, RuntimeProjection,
+use crate::tools::product::project_projection::{
+    ActivityProjectionQuery, DashboardProjection, FeatureSummaryProjection,
+    FileProjectProjectionStore, GoalSummaryProjection, PROJECTION_SNAPSHOT_FILE,
+    PROJECTION_SNAPSHOT_VERSION, PageRequest, ProjectionQuery, ProjectionSnapshot,
+    RuntimeProjection,
 };
 use crate::tools::product::work_items::FileWorkItemService;
 
@@ -228,6 +226,7 @@ fn server_with_projection() -> InProcessWebServer {
         target_root: None,
         app_registry_root: None,
         runtime_root: None,
+        product_paths: None,
     }
 }
 
@@ -476,6 +475,19 @@ fn remove_temp_dir(temp_root: impl AsRef<Path>) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn write_test_installed_binary(checkout: &Path) {
+    let executable = checkout.join("bin/refine");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::write(&executable, "installed fixture\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(executable, permissions).unwrap();
     }
 }
 

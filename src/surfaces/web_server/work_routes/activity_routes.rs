@@ -16,7 +16,7 @@ impl InProcessWebServer {
         }) else {
             return target_root_unavailable("read activity");
         };
-        let projection = match self.current_projection() {
+        let projection = match self.current_projection_shared() {
             Ok(projection) => projection,
             Err(error) => return error_response(error),
         };
@@ -111,7 +111,7 @@ impl InProcessWebServer {
     }
 
     pub(crate) fn handle_changes_list(&self, raw_path: &str) -> ApiResponse {
-        let projection = match self.current_projection() {
+        let projection = match self.current_projection_shared() {
             Ok(projection) => projection,
             Err(error) => return error_response(error),
         };
@@ -203,7 +203,7 @@ impl InProcessWebServer {
         let Some(runtime_root) = &self.runtime_root else {
             return runtime_root_unavailable("undo Git changes");
         };
-        let linked_goal_id = self.current_projection().ok().and_then(|projection| {
+        let linked_goal_id = self.current_projection_shared().ok().and_then(|projection| {
             projection
                 .changes
                 .values()
@@ -390,22 +390,11 @@ impl InProcessWebServer {
                 _ => None,
             }),
         };
-        if query == PerformanceQuery::default()
-            && let Ok(runtime) = self.current_runtime_projection()
-            && let Some(performance) = runtime.performance
-        {
-            return ApiResponse::json(200, serde_json::Value::Object(performance));
-        }
+        // The report is computed from the in-memory event ring, so it is
+        // answered directly; the old projection-cached copy persisted the
+        // whole snapshot on a read path.
         match performance_report_value(runtime_root, query) {
-            Ok(value) => {
-                let response = ApiResponse::json(200, value.clone());
-                if let Some(performance) = value.as_object().cloned() {
-                    let _ = self.persist_runtime_projection_override(|runtime| {
-                        runtime.performance = Some(performance);
-                    });
-                }
-                response
-            }
+            Ok(value) => ApiResponse::json(200, value),
             Err(error) => error_response(error),
         }
     }
@@ -447,7 +436,7 @@ impl InProcessWebServer {
         }
     }
 
-    pub(crate) fn handle_merger_hard_reset_worktree(&self) -> ApiResponse {
+    pub(crate) fn handle_governance_integration_hard_reset_worktree(&self) -> ApiResponse {
         let Some(target_root) = self.target_root() else {
             return target_root_unavailable("hard-reset Git worktree");
         };

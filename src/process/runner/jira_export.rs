@@ -169,10 +169,8 @@ pub(super) fn append_jira_export_log(
 pub(super) fn refresh_projection(
     runtime_root: &Path,
     target_root: &Path,
-) -> RefineResult<crate::tools::product::project_state::ProjectionSnapshot> {
+) -> RefineResult<crate::tools::product::project_projection::ProjectionSnapshot> {
     let refine_dir = prepare_refine_dir(target_root)?;
-    let store = FileProjectStateStore::with_runtime_root(&refine_dir, runtime_root);
-    let projection = store.rebuild_projection()?;
-    store.persist_projection_snapshot(&runtime_root.join("cache"), &projection)?;
-    Ok(projection)
+    let store = FileProjectProjectionStore::with_runtime_root(&refine_dir, runtime_root);
+    store.load_or_refresh_projection(&runtime_root.join("cache"))
 }

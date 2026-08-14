@@ -22,9 +22,12 @@ When a Goal is in backlog:
 
 - Refine stores the work as durable target-app state.
 - Users or agents can inspect, edit, enrich, deduplicate, prioritize, or attach it to a Feature.
-- Workflow automation should not claim it for implementation.
+- Workflow automation should not start implementation.
 - Promotion rules or explicit user action can move it to todo when it has enough context to act on.
 - The transition to todo should preserve source context, ordering, reporter, priority, and Feature membership.
+- A Goal with no non-empty authored Round is not promotable. It is excluded
+  from Feature and priority eligibility so malformed work cannot hold a valid
+  sibling's queue position.
 
 ## Future Direction
 

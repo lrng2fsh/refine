@@ -62,7 +62,7 @@ fn web_api_stops_managed_and_synthetic_agents_through_shared_control() {
         .transition_goal_status("GOAL-STOP-AGENT", GoalStatus::Todo)
         .unwrap();
     work_items
-        .advance_automated_goal_status("GOAL-STOP-AGENT", GoalStatus::InProgress)
+        .advance_automated_goal_status("GOAL-STOP-AGENT", GoalStatus::Plan)
         .unwrap();
 
     let agent_supervisor = FileProcessSupervisor::new(runtime_root.join("agents"));
@@ -120,8 +120,10 @@ fn web_api_stops_managed_and_synthetic_agents_through_shared_control() {
     assert_eq!(stopped.body["process"]["id"], process.id);
     assert_eq!(stopped.body["termination"]["confirmed_exit"], true);
     assert_eq!(stopped.body["goal"]["id"], "GOAL-STOP-AGENT");
-    assert_eq!(stopped.body["goal"]["status"], "todo");
-    assert_eq!(stopped.body["worktree_retention"]["retained"], false);
+    assert_eq!(stopped.body["goal"]["status"], "failed");
+    assert_eq!(stopped.body["goal_failed"], true);
+    assert_eq!(stopped.body["goal_requeued"], false);
+    assert_eq!(stopped.body["worktrees_retained"], true);
     assert!(!managed_pid_is_alive(pid).unwrap());
     assert!(agent_supervisor.inspect(&process.id).is_err());
 
@@ -132,7 +134,7 @@ fn web_api_stops_managed_and_synthetic_agents_through_shared_control() {
         .transition_goal_status("GOAL-STOP-CHAT", GoalStatus::Todo)
         .unwrap();
     work_items
-        .advance_automated_goal_status("GOAL-STOP-CHAT", GoalStatus::InProgress)
+        .advance_automated_goal_status("GOAL-STOP-CHAT", GoalStatus::Plan)
         .unwrap();
     let chat = FileChatService::with_runtime_root(&refine_dir, &runtime_root);
     let session = chat
@@ -152,8 +154,10 @@ fn web_api_stops_managed_and_synthetic_agents_through_shared_control() {
     assert_eq!(stopped_chat.body["termination"]["confirmed_exit"], true);
     assert_eq!(stopped_chat.body["termination"]["already_idle"], true);
     assert_eq!(stopped_chat.body["goal"]["id"], "GOAL-STOP-CHAT");
-    assert_eq!(stopped_chat.body["goal"]["status"], "todo");
-    assert_eq!(stopped_chat.body["worktree_retention"]["retained"], false);
+    assert_eq!(stopped_chat.body["goal"]["status"], "failed");
+    assert_eq!(stopped_chat.body["goal_failed"], true);
+    assert_eq!(stopped_chat.body["goal_requeued"], false);
+    assert_eq!(stopped_chat.body["worktrees_retained"], true);
     assert!(
         chat.list_sessions()
             .unwrap()
@@ -170,7 +174,7 @@ fn web_api_stops_managed_and_synthetic_agents_through_shared_control() {
         .transition_goal_status("GOAL-STOP-MCP", GoalStatus::Todo)
         .unwrap();
     work_items
-        .advance_automated_goal_status("GOAL-STOP-MCP", GoalStatus::InProgress)
+        .advance_automated_goal_status("GOAL-STOP-MCP", GoalStatus::Plan)
         .unwrap();
     let mcp_process = agent_supervisor
         .launch(ManagedProcessSpec {
@@ -211,7 +215,7 @@ fn web_api_stops_managed_and_synthetic_agents_through_shared_control() {
     );
     assert_eq!(
         through_mcp.body["result"]["structuredContent"]["goal"]["status"],
-        "todo"
+        "failed"
     );
 
     remove_temp_dir(&temp_root);

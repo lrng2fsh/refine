@@ -39,16 +39,26 @@ pub trait ProjectRegistryService {
 
 #[derive(Clone, Debug)]
 pub struct FileProjectRegistryService {
+    /// Durable app attachment, migration, and supervised-process storage root.
     pub runtime_root: PathBuf,
+    /// Runtime-local root that owns the active Node selection.
+    pub active_node_root: PathBuf,
     pub current_target_root: Option<PathBuf>,
 }
 
 impl FileProjectRegistryService {
     pub fn new(runtime_root: impl Into<PathBuf>, current_target_root: Option<PathBuf>) -> Self {
+        let runtime_root = runtime_root.into();
         Self {
-            runtime_root: runtime_root.into(),
+            active_node_root: runtime_root.clone(),
+            runtime_root,
             current_target_root,
         }
+    }
+
+    pub fn with_active_node_root(mut self, active_node_root: impl Into<PathBuf>) -> Self {
+        self.active_node_root = active_node_root.into();
+        self
     }
 
     pub fn path(&self) -> PathBuf {
@@ -87,9 +97,20 @@ impl FileProjectRegistryService {
             RefineError::Serialization(format!("failed to encode app registry: {error}"))
         })?;
         let path = self.path();
-        fs::write(&path, format!("{encoded}\n")).map_err(|error| {
+        // Temp-and-rename: the daemon reads this registry while other threads
+        // save it, and a bare write could expose a truncated file to a reader
+        // or lose the registry to a crash mid-write.
+        let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        fs::write(&temp, format!("{encoded}\n")).map_err(|error| {
             RefineError::Io(format!(
                 "failed to write app registry {}: {error}",
+                temp.display()
+            ))
+        })?;
+        fs::rename(&temp, &path).map_err(|error| {
+            let _ = fs::remove_file(&temp);
+            RefineError::Io(format!(
+                "failed to commit app registry {}: {error}",
                 path.display()
             ))
         })
@@ -111,29 +132,40 @@ impl FileProjectRegistryService {
             .current_target_root
             .as_ref()
             .map(|path| path.display().to_string());
+        let mut dirty = false;
         if registry.active_app.is_none() {
             registry.active_app = startup_app.clone();
+            dirty = registry.active_app.is_some();
         }
         let current = registry.active_app.clone();
         if let Some(current) = &startup_app {
-            let app = RegisteredApp {
-                name: Path::new(current)
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or(current)
-                    .to_string(),
-                path: current.clone(),
-                added_at: now_timestamp(),
-                last_used_at: Some(now_timestamp()),
-            };
-            upsert_app(&mut registry, app, false);
+            // Register the startup app only when it is actually missing.
+            // Re-upserting with fresh timestamps rewrote the registry on every
+            // status read — a write on a read path polled several times a
+            // second.
+            if !registry.apps.contains_key(current) {
+                let app = RegisteredApp {
+                    name: Path::new(current)
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or(current)
+                        .to_string(),
+                    path: current.clone(),
+                    added_at: now_timestamp(),
+                    last_used_at: Some(now_timestamp()),
+                };
+                upsert_app(&mut registry, app, false);
+                dirty = true;
+            }
+        }
+        if dirty {
             self.save(&registry)?;
         }
         if let Some(current) = &current {
             self.migrate_schema_if_safe(Path::new(current))?;
         }
         let attached = current.is_some();
-        project_status_for(registry, current, attached, Some(&self.runtime_root))
+        project_status_for(registry, current, attached, Some(&self.active_node_root))
     }
 
     pub fn register_path(
@@ -249,7 +281,12 @@ impl FileProjectRegistryService {
             true,
         );
         self.save(&registry)?;
-        project_status_for(registry, Some(display_path), true, Some(&self.runtime_root))
+        project_status_for(
+            registry,
+            Some(display_path),
+            true,
+            Some(&self.active_node_root),
+        )
     }
 
     pub fn create_local_project_at(
@@ -309,7 +346,7 @@ impl FileProjectRegistryService {
             app.last_used_at = Some(now_timestamp());
         }
         self.save(&registry)?;
-        project_status_for(registry, Some(path), true, Some(&self.runtime_root))
+        project_status_for(registry, Some(path), true, Some(&self.active_node_root))
     }
 
     pub fn migrate_current(&self) -> RefineResult<ProjectMigrationReport> {
@@ -335,7 +372,7 @@ impl FileProjectRegistryService {
             return Ok(());
         }
         if schema.migration_required {
-            if schema.safe_auto && !schema.requires_cluster_quiescence {
+            if schema.safe_auto && !schema.requires_fleet_quiescence {
                 service.migrate()?;
                 return Ok(());
             }
@@ -356,7 +393,7 @@ impl FileProjectRegistryService {
         let service =
             FileProjectMigrationService::with_runtime_root(&refine_dir, self.runtime_root.clone());
         let schema = service.status()?;
-        if schema.migration_required && schema.safe_auto && !schema.requires_cluster_quiescence {
+        if schema.migration_required && schema.safe_auto && !schema.requires_fleet_quiescence {
             service.migrate()?;
             return Ok(true);
         }
@@ -445,7 +482,7 @@ impl ProjectRegistryService for FileProjectRegistryService {
         let mut registry = self.load()?;
         registry.active_app = None;
         self.save(&registry)?;
-        project_status_for(registry, None, false, Some(&self.runtime_root))
+        project_status_for(registry, None, false, Some(&self.active_node_root))
     }
 
     fn clone_app(
@@ -487,10 +524,10 @@ impl ProjectRegistryService for FileProjectRegistryService {
                 registry,
                 Some(app_path.display().to_string()),
                 true,
-                Some(&self.runtime_root),
+                Some(&self.active_node_root),
             );
         }
-        project_status_for(registry, None, false, Some(&self.runtime_root))
+        project_status_for(registry, None, false, Some(&self.active_node_root))
     }
 }
 
@@ -575,7 +612,7 @@ fn detached_schema_status() -> ProjectSchemaStatus {
         migration_id: None,
         migration_description: None,
         safe_auto: true,
-        requires_cluster_quiescence: false,
+        requires_fleet_quiescence: false,
         operator_instructions: None,
     }
 }

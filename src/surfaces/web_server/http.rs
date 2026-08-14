@@ -11,6 +11,8 @@ use std::env;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -31,28 +33,28 @@ use events::should_write_sse_frame;
 use pulldown_cmark::{CowStr, Event as MarkdownEvent, Options, Parser, Tag, html};
 use serde_json::{Value, json};
 use static_content::*;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, broadcast, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::process::agent_sessions::find_agent_session;
-#[cfg(not(test))]
 use crate::process::runner::{
-    DEVELOPMENT_REQUEST_RUNNER, FileRunnerWorkerService, GIT_SYNC_RUNNER, WORKFLOW_RUNNER,
-    WORKTREE_CLEANUP_RUNNER,
+    BackgroundWorkerEnsure, FileRunnerWorkerService, GIT_SYNC_RUNNER, WORKTREE_CLEANUP_RUNNER,
 };
+#[cfg(not(test))]
+use crate::process::runner::{DEVELOPMENT_REQUEST_RUNNER, WORKFLOW_RUNNER};
 #[cfg(test)]
 use crate::process::supervisor::config::{ConfigService, FileSettingsService};
 use crate::process::supervisor::errors::{RefineError, RefineResult};
 use crate::process::supervisor::lifecycle::{
     DaemonRuntimeService, DaemonStatus, FileDaemonLifecycleService,
 };
-use crate::process::supervisor::operations::FileOperationRegistry;
+use crate::process::supervisor::operations::{FileOperationRegistry, OperationRegistry};
 use crate::tools::host::quality::QualityOperationRunner;
 use crate::tools::observability::activity::{ActivityService, FileActivityService};
 use crate::tools::observability::metrics::FileMetricsService;
 #[cfg(not(test))]
 use crate::tools::product::development_requests::load_self_development_email_config;
-use crate::tools::product::project_state::ProjectionQuery;
+use crate::tools::product::project_projection::ProjectionQuery;
 #[cfg(test)]
 use crate::workflow::WorkflowEngine;
 
@@ -132,9 +134,36 @@ fn sse_event(event: &str, data: Value) -> RefineResult<String> {
 }
 
 #[derive(Clone, Debug)]
-struct SseEventFrame {
+pub(in crate::surfaces::web_server) struct SseEventFrame {
     event: &'static str,
     data: Value,
+}
+
+pub(in crate::surfaces::web_server) type SseFrameBatch = Result<Arc<Vec<SseEventFrame>>, Arc<str>>;
+
+/// Builds one authoritative frame batch for all current SSE clients. Each
+/// client still owns replay deduplication, so a newly connected browser gets
+/// the next complete batch without rebuilding the project projection itself.
+#[derive(Debug)]
+struct SseFrameHub {
+    sender: broadcast::Sender<SseFrameBatch>,
+    producer_running: Mutex<bool>,
+    latest_batch: Mutex<Option<SseFrameBatch>>,
+    #[cfg(test)]
+    build_count: AtomicUsize,
+}
+
+impl Default for SseFrameHub {
+    fn default() -> Self {
+        let (sender, _) = broadcast::channel(4);
+        Self {
+            sender,
+            producer_running: Mutex::new(false),
+            latest_batch: Mutex::new(None),
+            #[cfg(test)]
+            build_count: AtomicUsize::new(0),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -159,8 +188,11 @@ const GIT_RECONCILE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct LocalHttpDaemon {
-    pub server: InProcessWebServer,
+    /// Shared request authority. Daemon/router/worker clones must not deep-clone
+    /// the bootstrap projection retained by `InProcessWebServer`.
+    pub server: Arc<InProcessWebServer>,
     pub static_root: Option<PathBuf>,
+    sse_frame_hub: Arc<SseFrameHub>,
 }
 
 pub(super) struct AgentWorkflowLoop {
@@ -171,6 +203,20 @@ pub(super) struct AgentWorkflowLoop {
 pub(super) struct GitSyncLoop {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+}
+
+pub(super) struct RetentionLoop {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for RetentionLoop {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl AgentWorkflowLoop {
@@ -204,6 +250,14 @@ struct AxumDaemonState {
 }
 
 impl LocalHttpDaemon {
+    pub fn new(server: InProcessWebServer, static_root: Option<PathBuf>) -> Self {
+        Self {
+            server: Arc::new(server),
+            static_root,
+            sse_frame_hub: Arc::new(SseFrameHub::default()),
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn start_agent_automation_loop(&self, interval: Duration) -> AgentWorkflowLoop {
         let stop = Arc::new(AtomicBool::new(false));
@@ -339,6 +393,12 @@ fn serve_once_shutdown() -> AxumShutdown {
     }
 }
 
+/// Set when shutdown begins so long-lived SSE streams end themselves. Axum's
+/// graceful shutdown waits for every in-flight connection, and an SSE stream
+/// never finishes on its own — one open browser tab would otherwise wedge a
+/// graceful shutdown indefinitely.
+pub(super) static DAEMON_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
 fn lifecycle_shutdown(lifecycle: FileDaemonLifecycleService, port: u16) -> AxumShutdown {
     let (tx, rx) = oneshot::channel();
     thread::spawn(move || {
@@ -349,6 +409,7 @@ fn lifecycle_shutdown(lifecycle: FileDaemonLifecycleService, port: u16) -> AxumS
                 _ => break,
             }
         }
+        DAEMON_SHUTTING_DOWN.store(true, Ordering::SeqCst);
         let _ = tx.send(());
     });
     AxumShutdown {

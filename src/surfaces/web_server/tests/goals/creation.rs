@@ -213,7 +213,7 @@ fn warmed_goal_create_post_completes_under_fifty_milliseconds_at_current_scale()
     server.target_root = Some(temp_root.clone());
     server.runtime_root = Some(runtime_root);
     server.warm_current_projection_cache().unwrap();
-    FileProjectStateStore::reset_rebuild_count(&refine_dir);
+    FileProjectProjectionStore::reset_rebuild_count(&refine_dir);
 
     let duplicate_started = Instant::now();
     let duplicate = server.handle(ApiRequest {
@@ -231,7 +231,7 @@ fn warmed_goal_create_post_completes_under_fifty_milliseconds_at_current_scale()
         format!("GOAL{:04}", GOAL_COUNT - 1)
     );
     assert_eq!(
-        FileProjectStateStore::rebuild_count(&refine_dir),
+        FileProjectProjectionStore::rebuild_count(&refine_dir),
         0,
         "a warmed duplicate decision must not rebuild the projection"
     );
@@ -249,7 +249,7 @@ fn warmed_goal_create_post_completes_under_fifty_milliseconds_at_current_scale()
     assert_eq!(created.status, 201);
     assert_eq!(created.body["goal"]["round_count"], 1);
     assert_eq!(
-        FileProjectStateStore::rebuild_count(&refine_dir),
+        FileProjectProjectionStore::rebuild_count(&refine_dir),
         1,
         "a successful create must rebuild the complete projection exactly once"
     );
@@ -353,7 +353,7 @@ fn concurrent_goal_create_requests_make_one_auditable_duplicate_decision() {
     assert_eq!(responses[0].status, 201);
     assert_eq!(responses[1].status, 409);
     assert_eq!(responses[1].body["error"]["code"], "duplicate_goal");
-    let projection = FileProjectStateStore::new(&refine_dir)
+    let projection = FileProjectProjectionStore::new(&refine_dir)
         .rebuild_projection()
         .unwrap();
     assert_eq!(projection.goals.len(), 1);
@@ -397,7 +397,7 @@ fn web_server_creates_and_shows_goal() {
 }
 
 #[test]
-fn web_server_submit_standalone_chat_creates_ready_merge_goal_and_preserves_worktree() {
+fn web_server_submit_standalone_chat_creates_quality_goal_and_preserves_worktree() {
     let temp_root = unique_temp_dir("http-chat-standalone-submit");
     let runtime_root = temp_root.join("run/8080");
     init_git_app(&temp_root);
@@ -424,18 +424,25 @@ fn web_server_submit_standalone_chat_creates_ready_merge_goal_and_preserves_work
     )
     .unwrap();
 
-    let submitted = server.handle(ApiRequest {
+    let retired_submit = server.handle(ApiRequest {
         method: "POST".to_string(),
         path: format!("/api/chat/{session_id}/submit-ready-merge"),
+        body: Some(json!({})),
+    });
+    assert_eq!(retired_submit.status, 404);
+
+    let submitted = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: format!("/api/chat/{session_id}/submit-quality"),
         body: Some(json!({
             "reporter": "QA",
-            "prompt": "Standalone experiment is ready for the merge workflow.",
+            "prompt": "Standalone experiment is ready for the Governance workflow.",
             "priority": "medium"
         })),
     });
     assert_eq!(submitted.status, 201, "{submitted:#?}");
     let goal_id = submitted.body["goal"]["id"].as_str().unwrap().to_string();
-    assert_eq!(submitted.body["goal"]["status"], "ready-merge");
+    assert_eq!(submitted.body["goal"]["status"], "quality");
     assert_eq!(submitted.body["goal"]["branch_name"], branch);
     assert_eq!(submitted.body["goal"]["priority"], "medium");
     assert!(worktree_path.exists());

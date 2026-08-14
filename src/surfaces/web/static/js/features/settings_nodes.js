@@ -105,25 +105,14 @@ function bindSettingsNodesTab() {
     await withButtonBusy(btn, "Creating...", async () => {
       try {
         await api("POST", "/api/nodes", { display_name: name.trim() });
+        await reconcileNodeContext();
         await refreshSettingsTab("application", { force: true });
       } catch (e) { await showActionError(e); }
     });
   });
   $$("[data-node-activate]").forEach((b) => bindOnce(b, "click", async () => {
     await withButtonBusy(b, "Activating...", async () => {
-      try {
-        const result = await api("POST", "/api/nodes/activate", { node_id: b.dataset.nodeActivate });
-        state.project = {
-          ...(state.project || {}),
-          nodes: result.nodes || state.project?.nodes || [],
-          active_node_id: result.active_node_id || "",
-          active_node: result.active_node || null,
-        };
-        updateActiveNodeLabel();
-        await refreshNodeScopedState();
-        toast("Node activated", "info");
-        await refreshSettingsTab("application", { force: true });
-      } catch (e) { await showActionError(e); }
+      await activateNodeContext(b.dataset.nodeActivate);
     });
   }));
   $$("[data-node-rename]").forEach((b) => bindOnce(b, "click", async () => {
@@ -136,6 +125,7 @@ function bindSettingsNodesTab() {
         await api("PATCH", "/api/nodes/" + encodeURIComponent(b.dataset.nodeRename), {
           display_name: name.trim(),
         });
+        await reconcileNodeContext();
         await refreshSettingsTab("application", { force: true });
       } catch (e) { await showActionError(e); }
     });
@@ -152,6 +142,7 @@ function bindSettingsNodesTab() {
         await api("PATCH", "/api/nodes/" + encodeURIComponent(b.dataset.nodeArchive), {
           archived: true,
         });
+        await reconcileNodeContext();
         await refreshSettingsTab("application", { force: true });
       } catch (e) { await showActionError(e); }
     });
@@ -162,10 +153,11 @@ function bindSettingsNodesTab() {
     if (!payload) return;
     await withButtonBusy(b, "Saving...", async () => {
       try {
-        await api("PATCH", "/api/cluster/nodes/" + encodeURIComponent(b.dataset.nodeRemoteConfigure), {
+        await api("PATCH", "/api/fleet/nodes/" + encodeURIComponent(b.dataset.nodeRemoteConfigure), {
           ...payload,
           display_name: payload.display_name || b.dataset.nodeRemoteConfigure,
         });
+        await reconcileNodeContext();
         await refreshSettingsTab("application", { force: true });
       } catch (e) { await showActionError(e); }
     });
@@ -175,9 +167,10 @@ function bindSettingsNodesTab() {
     const enabled = b.dataset.enabled !== "1";
     await withButtonBusy(b, enabled ? "Enabling..." : "Disabling...", async () => {
       try {
-        await api("PATCH", "/api/cluster/nodes/" + encodeURIComponent(b.dataset.nodeRemoteToggle), {
+        await api("PATCH", "/api/fleet/nodes/" + encodeURIComponent(b.dataset.nodeRemoteToggle), {
           enabled,
         });
+        await reconcileNodeContext();
         await refreshSettingsTab("application", { force: true });
       } catch (e) { await showActionError(e); }
     });
@@ -191,8 +184,9 @@ function bindSettingsNodesTab() {
     if (!ok) return;
     await withButtonBusy(b, "Bootstrapping...", async () => {
       try {
-        const result = await api("POST", "/api/cluster/nodes/" + encodeURIComponent(b.dataset.nodeRemoteBootstrap) + "/bootstrap", {});
+        const result = await api("POST", "/api/fleet/nodes/" + encodeURIComponent(b.dataset.nodeRemoteBootstrap) + "/bootstrap", {});
         toast(result.ok ? "Node bootstrapped" : "Node bootstrap failed", result.ok ? "info" : "error");
+        await reconcileNodeContext();
         await refreshSettingsTab("application", { force: true });
       } catch (e) { await showActionError(e); }
     });

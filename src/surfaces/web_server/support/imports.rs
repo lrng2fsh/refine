@@ -57,7 +57,7 @@ pub(in crate::surfaces::web_server) fn import_feature_destination(
 }
 
 pub(in crate::surfaces::web_server) fn feature_import_response(
-    feature: &crate::tools::product::project_state::FeatureSummaryProjection,
+    feature: &crate::tools::product::project_projection::FeatureSummaryProjection,
 ) -> serde_json::Value {
     json!({
         "id": feature.feature.id,
@@ -108,9 +108,8 @@ pub(in crate::surfaces::web_server) fn goal_action_message(action: &str) -> &'st
         "start" => "Started",
         "approve" => "Approved",
         "verify" => "Verified",
-        "retry-quality" => "Queued for QA",
-        "retry-merge" => "Queued candidate preparation",
-        "merge" => "Approved",
+        "retry-quality" => "Queued for Quality",
+        "retry-governance" => "Queued for Governance",
         "undo" => "Undone",
         _ => "Goal action completed",
     }

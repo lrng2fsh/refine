@@ -1,6 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -15,7 +14,22 @@ use crate::process::supervisor::errors::{RefineError, RefineResult};
 pub const METRICS_LOG_FILE: &str = "metrics/performance.jsonl";
 pub const DEFAULT_METRICS_RETENTION_DAYS: i64 = 30;
 
-static METRICS_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+/// Recent events one runtime root retains, resident in memory only.
+///
+/// Performance timings are operational telemetry with a short useful life:
+/// the one consumer is a recent-window status screen (plus a support-bundle
+/// excerpt). Persisting every request grew a disk log the size of a month of
+/// traffic that a single status query then had to parse; the events since
+/// this daemon started are the ones worth asking about, and losing them on
+/// restart loses nothing anyone read.
+const RECENT_EVENT_CAPACITY: usize = 5_000;
+
+static RECENT_EVENTS: OnceLock<Mutex<BTreeMap<PathBuf, VecDeque<PerformanceEvent>>>> =
+    OnceLock::new();
+
+fn recent_events() -> &'static Mutex<BTreeMap<PathBuf, VecDeque<PerformanceEvent>>> {
+    RECENT_EVENTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct MetricSample {
@@ -198,18 +212,16 @@ impl FileMetricsService {
     }
 
     pub fn cleanup(&self, clear: bool) -> RefineResult<MetricsCleanupResult> {
-        let events = self.read_all()?;
-        let existing = events.len();
-        let path = self.path();
+        // Events live in memory; the only disk work left is removing the
+        // legacy on-disk log an older build may have written.
+        self.remove_legacy_log();
+        let mut store = recent_events()
+            .lock()
+            .map_err(|_| RefineError::Io("metrics store lock was poisoned".to_string()))?;
+        let ring = store.entry(self.runtime_root.clone()).or_default();
+        let existing = ring.len();
         if clear {
-            if path.exists() {
-                fs::remove_file(&path).map_err(|error| {
-                    RefineError::Io(format!(
-                        "failed to remove metrics log {}: {error}",
-                        path.display()
-                    ))
-                })?;
-            }
+            ring.clear();
             return Ok(MetricsCleanupResult {
                 ok: true,
                 deleted: existing,
@@ -217,132 +229,52 @@ impl FileMetricsService {
                 cleared: true,
             });
         }
-
         let cutoff = Utc::now() - Duration::days(self.retention_days);
-        let mut retained = Vec::new();
-        for event in events {
-            let keep = chrono::DateTime::parse_from_rfc3339(&event.occurred_at)
+        ring.retain(|event| {
+            chrono::DateTime::parse_from_rfc3339(&event.occurred_at)
                 .map(|parsed| parsed.with_timezone(&Utc) >= cutoff)
-                .unwrap_or(true);
-            if keep {
-                retained.push(event);
-            }
-        }
-        let deleted = existing.saturating_sub(retained.len());
-        if deleted > 0 {
-            self.replace_all(&retained)?;
-        }
+                .unwrap_or(true)
+        });
+        let retained = ring.len();
         Ok(MetricsCleanupResult {
             ok: true,
-            deleted,
-            retained: retained.len(),
+            deleted: existing.saturating_sub(retained),
+            retained,
             cleared: false,
         })
     }
 
-    fn append_event(&self, event: &PerformanceEvent) -> RefineResult<()> {
-        let _guard = METRICS_LOG_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .map_err(|_| RefineError::Io("metrics log lock was poisoned".to_string()))?;
+    /// Best-effort removal of the persisted log format this service used to
+    /// write, so upgraded installations reclaim the disk without operator
+    /// action.
+    fn remove_legacy_log(&self) {
         let path = self.path();
+        let _ = fs::remove_file(&path);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                RefineError::Io(format!(
-                    "failed to create metrics directory {}: {error}",
-                    parent.display()
-                ))
-            })?;
+            let _ = fs::remove_dir(parent);
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|error| {
-                RefineError::Io(format!(
-                    "failed to open metrics log {}: {error}",
-                    path.display()
-                ))
-            })?;
-        let encoded = serde_json::to_string(event).map_err(|error| {
-            RefineError::Serialization(format!("failed to encode metrics event: {error}"))
-        })?;
-        writeln!(file, "{encoded}").map_err(|error| {
-            RefineError::Io(format!(
-                "failed to append metrics log {}: {error}",
-                path.display()
-            ))
-        })
+    }
+
+    fn append_event(&self, event: &PerformanceEvent) -> RefineResult<()> {
+        let mut store = recent_events()
+            .lock()
+            .map_err(|_| RefineError::Io("metrics store lock was poisoned".to_string()))?;
+        let ring = store.entry(self.runtime_root.clone()).or_default();
+        if ring.len() >= RECENT_EVENT_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back(event.clone());
+        Ok(())
     }
 
     fn read_all(&self) -> RefineResult<Vec<PerformanceEvent>> {
-        let path = self.path();
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let file = fs::File::open(&path).map_err(|error| {
-            RefineError::Io(format!(
-                "failed to open metrics log {}: {error}",
-                path.display()
-            ))
-        })?;
-        let mut events = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|error| {
-                RefineError::Io(format!(
-                    "failed to read metrics log {}: {error}",
-                    path.display()
-                ))
-            })?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            events.extend(parse_performance_events_line(&line));
-        }
-        Ok(events)
-    }
-
-    fn replace_all(&self, events: &[PerformanceEvent]) -> RefineResult<()> {
-        let _guard = METRICS_LOG_LOCK
-            .get_or_init(|| Mutex::new(()))
+        let store = recent_events()
             .lock()
-            .map_err(|_| RefineError::Io("metrics log lock was poisoned".to_string()))?;
-        let path = self.path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                RefineError::Io(format!(
-                    "failed to create metrics directory {}: {error}",
-                    parent.display()
-                ))
-            })?;
-        }
-        let temp_path = path.with_extension("jsonl.tmp");
-        {
-            let mut file = fs::File::create(&temp_path).map_err(|error| {
-                RefineError::Io(format!(
-                    "failed to create metrics temp log {}: {error}",
-                    temp_path.display()
-                ))
-            })?;
-            for event in events {
-                let encoded = serde_json::to_string(event).map_err(|error| {
-                    RefineError::Serialization(format!("failed to encode metrics event: {error}"))
-                })?;
-                writeln!(file, "{encoded}").map_err(|error| {
-                    RefineError::Io(format!(
-                        "failed to write metrics temp log {}: {error}",
-                        temp_path.display()
-                    ))
-                })?;
-            }
-        }
-        fs::rename(&temp_path, &path).map_err(|error| {
-            RefineError::Io(format!(
-                "failed to replace metrics log {} with {}: {error}",
-                path.display(),
-                temp_path.display()
-            ))
-        })
+            .map_err(|_| RefineError::Io("metrics store lock was poisoned".to_string()))?;
+        Ok(store
+            .get(&self.runtime_root)
+            .map(|ring| ring.iter().cloned().collect())
+            .unwrap_or_default())
     }
 }
 
@@ -453,20 +385,6 @@ fn operations(events: &[PerformanceEvent]) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
-}
-
-fn parse_performance_events_line(line: &str) -> Vec<PerformanceEvent> {
-    if let Ok(event) = serde_json::from_str::<PerformanceEvent>(line) {
-        return vec![event];
-    }
-    let mut events = Vec::new();
-    for event in serde_json::Deserializer::from_str(line).into_iter::<PerformanceEvent>() {
-        match event {
-            Ok(event) => events.push(event),
-            Err(_) => break,
-        }
-    }
-    events
 }
 
 fn event_tags(event: &PerformanceEvent) -> Vec<(String, String)> {

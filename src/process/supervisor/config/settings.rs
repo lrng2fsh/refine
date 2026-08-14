@@ -44,29 +44,12 @@ impl FileSettingsService {
     }
 
     pub fn update(&self, body: &serde_json::Value) -> RefineResult<serde_json::Value> {
-        let Some(updates) = body.as_object() else {
-            return Err(RefineError::InvalidInput(
-                "expected an object of {key: value}".to_string(),
-            ));
-        };
-        if updates.is_empty() {
-            return Err(RefineError::InvalidInput(
-                "expected an object of {key: value}".to_string(),
-            ));
-        }
+        let updates = normalize_settings_patch(body)?;
         let mut current = self.load()?;
-        let quality_timing = updates
-            .get(QUALITY_TIMING_KEY)
-            .map(|value| normalize_setting(QUALITY_TIMING_KEY, value))
-            .transpose()?;
-        let allowed = allowed_settings();
         let mut updated_test_command = false;
         let mut updated_test_commands = false;
         for (key, value) in updates {
-            if !allowed.contains(key.as_str()) {
-                return Err(RefineError::InvalidInput(format!("unknown setting: {key}")));
-            }
-            current.insert(key.clone(), Value::String(normalize_setting(key, value)?));
+            current.insert(key.clone(), value);
             if key == "target_app_test_command" {
                 updated_test_command = true;
             } else if key == "target_app_test_commands" {
@@ -77,17 +60,12 @@ impl FileSettingsService {
             sync_target_app_test_settings(&mut current, updated_test_commands)?;
         }
         self.validate(&current)?;
-        if let Some(timing) = quality_timing.as_deref() {
-            self.write_quality_timing(timing)?;
-            current.insert(
-                QUALITY_TIMING_KEY.to_string(),
-                Value::String(timing.to_string()),
-            );
-        }
-        if updates.keys().any(|key| key != QUALITY_TIMING_KEY) {
-            self.write(&current)?;
-        }
+        self.write(&current)?;
         Ok(serde_json::json!({"ok": true, "settings": current}))
+    }
+
+    pub fn validate_update(body: &serde_json::Value) -> RefineResult<()> {
+        normalize_settings_patch(body).map(|_| ())
     }
 
     fn write(&self, settings: &JsonObject) -> RefineResult<()> {
@@ -108,9 +86,7 @@ impl FileSettingsService {
             )));
         };
         node.settings = settings.clone();
-        // Quality timing is a project-wide setting. Keep the legacy wire field available while
-        // ensuring Node settings never remain an independent source of truth.
-        node.settings.remove(QUALITY_TIMING_KEY);
+        node.settings.remove("quality_timing");
         node.updated_at = now;
         service.save_registry(&registry)
     }
@@ -147,59 +123,6 @@ impl FileSettingsService {
             ))
         })
     }
-
-    fn quality_settings_path(&self) -> PathBuf {
-        self.refine_dir.join(QUALITY_SETTINGS_FILE)
-    }
-
-    fn load_quality_timing(
-        &self,
-        registry: &crate::model::node::NodeRegistry,
-    ) -> RefineResult<String> {
-        let path = self.quality_settings_path();
-        if path.exists() {
-            let value = read_json_or_default(path, json!({}))?;
-            return Ok(value
-                .get("timing")
-                .and_then(Value::as_str)
-                .map(normalize_quality_timing_lossy)
-                .unwrap_or_else(|| DEFAULT_QUALITY_TIMING.to_string()));
-        }
-
-        let mut timings = BTreeSet::new();
-        for node in &registry.nodes {
-            let timing = node
-                .settings
-                .get(QUALITY_TIMING_KEY)
-                .and_then(Value::as_str)
-                .map(normalize_quality_timing_lossy)
-                .unwrap_or_else(|| DEFAULT_QUALITY_TIMING.to_string());
-            timings.insert(timing);
-        }
-        if timings.len() > 1 {
-            return Err(RefineError::Conflict(
-                "legacy Node quality_timing values diverge; migrate them to one project-wide Quality timing before updating settings"
-                    .to_string(),
-            ));
-        }
-        Ok(timings
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| DEFAULT_QUALITY_TIMING.to_string()))
-    }
-
-    fn write_quality_timing(&self, timing: &str) -> RefineResult<()> {
-        let path = self.quality_settings_path();
-        let mut value = read_json_or_default(path.clone(), json!({}))?;
-        let object = value.as_object_mut().ok_or_else(|| {
-            RefineError::Serialization(format!(
-                "Quality settings {} must contain a JSON object",
-                path.display()
-            ))
-        })?;
-        object.insert("timing".to_string(), Value::String(timing.to_string()));
-        write_json(path, &value)
-    }
 }
 
 impl ConfigService for FileSettingsService {
@@ -228,7 +151,8 @@ impl ConfigService for FileSettingsService {
                     Value::String(normalize_setting(new_key, &value)?),
                 );
                 migrated = true;
-            } else if key == RETIRED_SUPERVISOR_STALL_KEY
+            } else if key == "quality_timing"
+                || key == RETIRED_SUPERVISOR_STALL_KEY
                 || is_retired_development_request_setting(&key)
             {
                 migrated = true;
@@ -237,15 +161,7 @@ impl ConfigService for FileSettingsService {
         if sync_target_app_test_settings(&mut settings, false)? {
             migrated = true;
         }
-        let quality_timing = self.load_quality_timing(&registry)?;
-        settings.insert(
-            QUALITY_TIMING_KEY.to_string(),
-            Value::String(quality_timing.clone()),
-        );
         if migrated {
-            if !self.quality_settings_path().exists() {
-                self.write_quality_timing(&quality_timing)?;
-            }
             self.write(&settings)?;
         }
         Ok(settings)

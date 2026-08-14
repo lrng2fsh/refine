@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{JsonObject, Timestamp};
 use crate::process::supervisor::errors::RefineResult;
-use crate::tools::product::project_state::GoalSummaryProjection;
+use crate::tools::product::project_projection::GoalSummaryProjection;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,7 +84,7 @@ pub struct ChatReadResult {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct StandaloneReadyMergeRequest {
+pub struct StandaloneQualityRequest {
     pub name: Option<String>,
     pub reporter: String,
     pub prompt: String,
@@ -92,7 +92,7 @@ pub struct StandaloneReadyMergeRequest {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct StandaloneReadyMergeResult {
+pub struct StandaloneQualityResult {
     pub goal: GoalSummaryProjection,
     pub worktree: ChatSessionWorktree,
 }

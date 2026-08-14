@@ -153,7 +153,7 @@ impl DiagnosticsService for FileDiagnosticsService {
                 format!("installed_providers={}", installed_providers.join(",")),
             ],
             browser: vec![
-                "workflow QA uses the configured target-app test command; no browser CLI is required"
+                "workflow Quality uses configured target-app test commands; no browser CLI is required"
                     .to_string(),
             ],
             docker: vec![docker_status],
@@ -184,7 +184,13 @@ fn command_status(
         cwd: None,
         env: Vec::new(),
         stdin: None,
-        limits: None,
+        // Diagnostics probes run on the boot path; a wedged CLI (a stuck
+        // Docker socket is common on WSL2) must degrade the report, not block
+        // startup indefinitely.
+        limits: Some(crate::process::subprocess::ProcessResourceLimits {
+            stall_timeout_seconds: Some(10),
+            ..crate::process::subprocess::ProcessResourceLimits::default()
+        }),
         authorization_command: Some(format!("{} {}", command, args.join(" "))),
         sensitive: false,
         metadata: Default::default(),
@@ -227,8 +233,8 @@ fn os_backend_hint() -> &'static str {
 
 fn install_target_label(target: &InstallTarget) -> &'static str {
     match target {
-        InstallTarget::MacOsAppBundle => "macos_app_bundle",
-        InstallTarget::WindowsInstaller => "windows_installer",
+        InstallTarget::MacosDaemon => "macos_daemon",
+        InstallTarget::WindowsDaemon => "windows_daemon",
         InstallTarget::LinuxCliWeb => "linux_cli_web",
     }
 }

@@ -2,13 +2,13 @@ use super::*;
 
 #[derive(Debug, Subcommand)]
 pub enum WorkflowAction {
-    /// Pause the agent automation engine: no new Goal work is claimed until resumed. Active executions continue to completion and can be stopped separately.
+    /// Pause workflow automation: block new Goal admission and quiesce automatic Git sync and inactive-worktree cleanup at safe boundaries. Active Goal executions continue unless stopped separately.
     Pause {
         /// Runtime directory where Refine keeps daemon state.
         #[arg(long, default_value = "run")]
         runtime_root: PathBuf,
     },
-    /// Resume the agent automation engine after a pause so agents claim Goal work again.
+    /// Resume workflow automation: make new Goal admission, automatic Git sync, and inactive-worktree cleanup eligible again. Active Goal executions remain uninterrupted.
     Resume {
         /// Runtime directory where Refine keeps daemon state.
         #[arg(long, default_value = "run")]
@@ -20,10 +20,10 @@ pub enum WorkflowAction {
 pub enum CliGoalStatus {
     Backlog,
     Todo,
-    InProgress,
-    Qa,
-    ReadyMerge,
-    Build,
+    Plan,
+    Implement,
+    Quality,
+    Governance,
     Review,
     Done,
     Failed,
@@ -35,10 +35,10 @@ impl From<CliGoalStatus> for GoalStatus {
         match value {
             CliGoalStatus::Backlog => Self::Backlog,
             CliGoalStatus::Todo => Self::Todo,
-            CliGoalStatus::InProgress => Self::InProgress,
-            CliGoalStatus::Qa => Self::Qa,
-            CliGoalStatus::ReadyMerge => Self::ReadyMerge,
-            CliGoalStatus::Build => Self::Build,
+            CliGoalStatus::Plan => Self::Plan,
+            CliGoalStatus::Implement => Self::Implement,
+            CliGoalStatus::Quality => Self::Quality,
+            CliGoalStatus::Governance => Self::Governance,
             CliGoalStatus::Review => Self::Review,
             CliGoalStatus::Done => Self::Done,
             CliGoalStatus::Failed => Self::Failed,

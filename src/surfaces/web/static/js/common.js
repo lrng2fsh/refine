@@ -23,22 +23,10 @@ const state = {
 const WORKFLOW_STATUSES = [
   "backlog",
   "todo",
-  "in-progress",
-  "qa",
-  "ready-merge",
-  "build",
-  "review",
-  "done",
-  "failed",
-  "cancelled",
-];
-const POST_BUILD_WORKFLOW_STATUSES = [
-  "backlog",
-  "todo",
-  "in-progress",
-  "ready-merge",
-  "build",
-  "qa",
+  "plan",
+  "implement",
+  "quality",
+  "governance",
   "review",
   "done",
   "failed",
@@ -48,10 +36,10 @@ const STATUS_FILTER_OPTIONS = ["", ...WORKFLOW_STATUSES];
 const WORKFLOW_STATUS_LABELS = {
   "backlog": "Backlog",
   "todo": "To do",
-  "in-progress": "In progress",
-  "qa": "QA",
-  "ready-merge": "Ready Merge",
-  "build": "Rebuild",
+  "plan": "Plan",
+  "implement": "Implement",
+  "quality": "Quality",
+  "governance": "Governance",
   "review": "Review",
   "done": "Done",
   "failed": "Failed",
@@ -63,9 +51,7 @@ function workflowStatusLabel(status) {
 }
 
 function workflowStatuses() {
-  return state.dashboard?.quality_timing === "post_build"
-    ? POST_BUILD_WORKFLOW_STATUSES
-    : WORKFLOW_STATUSES;
+  return WORKFLOW_STATUSES;
 }
 
 const PASSED_REVIEW_STATES = new Set(["pass", "passed", "ok", "success", "succeeded"]);
@@ -243,9 +229,8 @@ function screenDataCacheablePath(path) {
     "/api/governance",
     "/api/guidance",
     "/api/reporters",
-    "/api/cluster",
+    "/api/fleet",
     "/api/quality",
-    "/api/performance",
     "/api/upgrade",
     "/api/target-app/status",
   ].includes(route);
@@ -286,7 +271,6 @@ function defaultScreenDataPaths() {
     "/api/settings",
     "/api/processes",
     "/api/diagnostics",
-    "/api/performance?limit=50&offset=0",
   ];
 }
 
@@ -383,7 +367,9 @@ async function api(method, path, body, options = {}) {
       err.error = data?.error || null;
       err.__uiLogged = true;
       state.lastApiErrorLog = { message: msg, at: Date.now() };
-      if (!options.prefetch) {
+      // Passive capability reads can render their own degraded state without
+      // turning an expected failure into a project mutation.
+      if (!options.prefetch && options.recordError !== false) {
         recordUiError(msg, {
           source: "api",
           path,
@@ -395,10 +381,11 @@ async function api(method, path, body, options = {}) {
       throw err;
     }
     if (method !== "GET") {
+      // The screen the user is on refreshes itself after its own mutation, and
+      // SSE announces the change to every other screen. Forcing an 11-request
+      // prefetch burst here multiplied every click into a page-load's worth of
+      // traffic against a server that had just invalidated its caches.
       invalidateScreenDataCache();
-      if (/^\/api\/(project|apps|goals|features|activity|changes|nodes|settings|cache)\b/.test(path)) {
-        scheduleMainScreenPrefetch({ force: true, delayMs: 250 });
-      }
     }
     return data;
   })();
@@ -615,8 +602,35 @@ function isDuplicateApiErrorToast(message) {
     || last.message.includes(current);
 }
 
+const UI_ERROR_RECORD_COOLDOWN_MS = 30_000;
+const UI_ERROR_RECORD_LIMIT = 100;
+
 function recordUiError(message, details = {}) {
   if (!message) return;
+  const now = Date.now();
+  const signature = JSON.stringify([
+    String(message),
+    details.source || "ui-error",
+    details.path || "",
+    details.status || "",
+    details.code || "",
+    details.goal_id || "",
+    details.details || "",
+  ]);
+  if (!state.uiErrorRecordTimes) state.uiErrorRecordTimes = new Map();
+  const lastRecordedAt = state.uiErrorRecordTimes.get(signature) || 0;
+  if (now - lastRecordedAt < UI_ERROR_RECORD_COOLDOWN_MS) return;
+  state.uiErrorRecordTimes.set(signature, now);
+  if (state.uiErrorRecordTimes.size > UI_ERROR_RECORD_LIMIT) {
+    for (const [key, recordedAt] of state.uiErrorRecordTimes) {
+      if (now - recordedAt >= UI_ERROR_RECORD_COOLDOWN_MS) {
+        state.uiErrorRecordTimes.delete(key);
+      }
+    }
+    while (state.uiErrorRecordTimes.size > UI_ERROR_RECORD_LIMIT) {
+      state.uiErrorRecordTimes.delete(state.uiErrorRecordTimes.keys().next().value);
+    }
+  }
   recordUiNotice(message, {
     kind: "error",
     source: details.source || "ui-error",
@@ -833,7 +847,7 @@ function manualMigrationText(source) {
 
 function isManualMigrationError(err) {
   const text = `${err?.details || ""}\n${err?.message || ""}`;
-  return /refine (?:project migrate|migrate run)|manual cluster migration/i.test(text);
+  return /refine (?:project migrate|migrate run)|manual fleet migration/i.test(text);
 }
 
 async function ensureProjectAttached() {
@@ -889,6 +903,9 @@ async function ensureProjectAttached() {
 }
 
 async function refreshProjectStatus() {
+  const nodeGeneration = typeof captureNodeContextGeneration === "function"
+    ? captureNodeContextGeneration()
+    : 0;
   let snap = null;
   try {
     snap = await api("GET", "/api/project/status");
@@ -896,6 +913,8 @@ async function refreshProjectStatus() {
     toast(e.message || "Could not check project status", "error");
     return null;
   }
+  if (typeof isNodeContextGenerationCurrent === "function"
+      && !isNodeContextGenerationCurrent(nodeGeneration)) return null;
   state.project = snap;
   updateActiveNodeLabel();
   if (snap.attached === false) {
@@ -1169,7 +1188,8 @@ async function applyProjectAttachResult(result, options = {}) {
   if (options.toast !== false) showProjectAttachToast(result);
   resetChatForProjectSwitch();
   initSSE();
-  await refreshNodeScopedState({ selectReporterFallback: true });
+  if (typeof reconcileNodeContext === "function") await reconcileNodeContext();
+  else await refreshNodeScopedState();
   await refreshTargetAppToggle();
   if (location.hash !== "#/node/application") {
     location.hash = "#/node/application";
@@ -1541,34 +1561,38 @@ function mdInline(text) {
 
 // ---- reporter dropdown ------------------------------------------------------
 
-async function refreshReporters({ selectFallback = false } = {}) {
+async function refreshReporters() {
   if (!hasAttachedProject()) {
     state.reporters = [];
     setLastReporter("");
     populateAllReporterDropdowns();
     return;
   }
+  const nodeGeneration = captureNodeContextGeneration();
   const data = await api("GET", "/api/reporters");
+  if (!isNodeContextGenerationCurrent(nodeGeneration)) return;
   state.reporters = data.reporters || [];
-  reconcileLastReporter({ selectFallback });
+  reconcileLastReporter();
   populateAllReporterDropdowns();
+  if (typeof notifyReporterOnboardingHydrated === "function") {
+    notifyReporterOnboardingHydrated();
+  }
 }
 
-async function refreshNodeScopedState({ selectReporterFallback = false } = {}) {
+async function refreshNodeScopedState() {
   if (typeof resetChatForProjectSwitch === "function") resetChatForProjectSwitch();
   state.reporters = [];
   state.dashboard = null;
   state.currentGoal = null;
-  setLastReporter("");
-  populateAllReporterDropdowns();
-  await refreshReporters({ selectFallback: selectReporterFallback });
+  // Reporter identity is browser-local, not Node-local. Rehydrate the list
+  // before deciding whether the current selection still exists.
+  await refreshReporters();
 }
 
-function reconcileLastReporter({ selectFallback = false } = {}) {
+function reconcileLastReporter() {
   const names = state.reporters.map((r) => r.name).filter(Boolean);
   if (state.lastReporter && names.includes(state.lastReporter)) return;
-  const next = selectFallback ? (names[0] || "") : "";
-  setLastReporter(next);
+  setLastReporter("");
 }
 
 function populateAllReporterDropdowns() {
@@ -1610,15 +1634,36 @@ async function handleReporterAdd(sel) {
   }
   try {
     const { reporter } = await api("POST", "/api/reporters", { name });
-    await refreshReporters();
+    mergeReporterIntoProjection(reporter);
+    populateAllReporterDropdowns();
     sel.value = reporter.name;
     setLastReporter(reporter.name);
+    try {
+      await refreshReporters();
+    } catch (refreshError) {
+      toast(
+        `Reporter created and selected, but the Reporter list could not be refreshed: ${refreshError.message}`,
+        "warn",
+        { source: "reporter-controls" },
+      );
+    }
     return reporter.name;
   } catch (e) {
     toast(`Could not add reporter: ${e.message}`, "error");
     sel.value = state.lastReporter || "";
     return null;
   }
+}
+
+function mergeReporterIntoProjection(reporter) {
+  if (!reporter?.name) return;
+  const reporters = Array.isArray(state.reporters) ? state.reporters : [];
+  const index = reporters.findIndex((candidate) =>
+    (reporter.id != null && candidate.id === reporter.id)
+      || candidate.name === reporter.name);
+  if (index >= 0) reporters[index] = { ...reporters[index], ...reporter };
+  else reporters.push(reporter);
+  state.reporters = reporters;
 }
 
 function setLastReporter(name) {
@@ -1764,6 +1809,33 @@ function sseEventChanged(key, event) {
   return true;
 }
 
+// One SSE batch often carries both a status_change and a project_updated
+// frame; refreshing the visible screen once per frame doubled every fetch and
+// re-morphed the goal detail twice. Route refreshes coalesce through this
+// debounced scheduler instead.
+const ROUTE_DATA_REFRESH_DEBOUNCE_MS = 150;
+let routeDataRefreshTimer = null;
+function scheduleRouteDataRefresh() {
+  if (routeDataRefreshTimer) return;
+  routeDataRefreshTimer = setTimeout(() => {
+    routeDataRefreshTimer = null;
+    if (state.currentRoute === "dashboard") refreshDashboard();
+    // Refresh only the table on background updates so an active workflow
+    // keystroke in the search box isn't interrupted by a full re-render.
+    if (state.currentRoute === "goals") refreshGoalsTable();
+    if (state.currentRoute === "logs") loadLogs();
+    if (["settings", "node", "project"].includes(state.currentRoute || "")) {
+      refreshCurrentSettingsSurface();
+    }
+    // Changes screen: an approved implementation can land asynchronously;
+    // a cancellation flips an existing row's Undo button state.
+    if (state.currentRoute === "changes") loadChanges();
+    if (state.currentRoute === "goals_detail" && state.currentGoal) {
+      loadGoalDetail(state.currentGoal);
+    }
+  }, ROUTE_DATA_REFRESH_DEBOUNCE_MS);
+}
+
 function activitySystemOperationDetails(entry) {
   const details = entry?.details && typeof entry.details === "object" && !Array.isArray(entry.details)
     ? { ...entry.details }
@@ -1783,6 +1855,11 @@ function initSSE() {
     invalidateScreenDataCache();
     reconcilePendingBackgroundOperations();
     if (reconnected) toast("Live updates reconnected.", "success");
+    if (reconnected && typeof reconcileNodeContext === "function") {
+      reconcileNodeContext({ external: true }).catch((error) => {
+        toast(`Could not reconcile Node context: ${error.message || error}`, "error");
+      });
+    }
     // SSE is a notification transport, not durable state. Reconcile the visible
     // screen from the authoritative read endpoint on every initial connection
     // and reconnect so a missed frame can never leave the workflow UI stale.
@@ -1832,20 +1909,7 @@ function initSSE() {
     invalidateScreenDataCache();
     if (typeof scheduleAgentStatusRefresh === "function") scheduleAgentStatusRefresh();
     if (typeof refreshTargetAppToggle === "function") refreshTargetAppToggle();
-    if (state.currentRoute === "dashboard") refreshDashboard();
-    // Refresh only the table on background updates so an in-progress
-    // keystroke in the search box isn't interrupted by a full re-render.
-    if (state.currentRoute === "goals") refreshGoalsTable();
-    if (state.currentRoute === "logs") loadLogs();
-    if (["settings", "node", "project"].includes(state.currentRoute || "")) {
-      refreshCurrentSettingsSurface();
-    }
-    // Changes screen: an approved implementation can land asynchronously;
-    // a cancellation flips an existing row's Undo button state.
-    if (state.currentRoute === "changes") loadChanges();
-    if (state.currentRoute === "goals_detail" && state.currentGoal) {
-      loadGoalDetail(state.currentGoal);
-    }
+    scheduleRouteDataRefresh();
   });
   sseSource.addEventListener("runtime_change", () => {
     invalidateScreenDataCache();
@@ -1870,6 +1934,22 @@ function initSSE() {
       }
     } catch {}
   });
+  sseSource.addEventListener("source_update_check", (e) => {
+    try {
+      const payload = JSON.parse(e.data || "{}");
+      if (typeof handleSourceUpdateCheckSseEvent === "function") {
+        handleSourceUpdateCheckSseEvent(payload);
+      }
+    } catch {}
+  });
+  sseSource.addEventListener("source_update", (e) => {
+    try {
+      const payload = JSON.parse(e.data);
+      if (typeof handleSourceUpdateSseEvent === "function") {
+        handleSourceUpdateSseEvent(payload);
+      }
+    } catch {}
+  });
   sseSource.addEventListener("target_app_state", () => {
     refreshTargetAppToggle();
   });
@@ -1883,30 +1963,22 @@ function initSSE() {
       refreshCurrentSettingsSurface();
     }
   });
+  sseSource.addEventListener("api_mutation", (event) => {
+    if (typeof handleNodeContextMutationEvent === "function") {
+      handleNodeContextMutationEvent(event);
+    }
+  });
   sseSource.addEventListener("project_updated", async (e) => {
     if (!sseEventChanged("Project", e)) return;
     invalidateScreenDataCache();
     await refreshProjectStatus();
-    if (
-      state.currentRoute === "features" ||
-      state.currentRoute === "goals" ||
-      state.currentRoute === "dashboard" ||
-      (state.currentRoute === "node"
-        && document.querySelector('[data-tab-pane="reporters"].active'))
-    ) {
+    if (hasAttachedProject()) {
       await refreshReporters();
     }
     if (typeof refreshAgentStatusIndicator === "function") refreshAgentStatusIndicator();
     if (typeof refreshTargetAppToggle === "function") refreshTargetAppToggle();
     if (typeof refreshSourceUpdateNav === "function") refreshSourceUpdateNav({ quiet: true });
-    if (state.currentRoute === "dashboard") refreshDashboard();
-    if (state.currentRoute === "goals") refreshGoalsTable();
-    if (state.currentRoute === "logs") loadLogs();
-    if (["settings", "node", "project"].includes(state.currentRoute || "")) refreshCurrentSettingsSurface();
-    if (state.currentRoute === "changes") loadChanges();
-    if (state.currentRoute === "goals_detail" && state.currentGoal) {
-      loadGoalDetail(state.currentGoal);
-    }
+    scheduleRouteDataRefresh();
   });
   sseSource.addEventListener("round_log_added", () => {
     if (state.currentRoute === "logs") loadLogs();

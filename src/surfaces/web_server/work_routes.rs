@@ -22,14 +22,14 @@ use crate::tools::observability::activity::{ActivityService, FileActivityService
 use crate::tools::observability::logs::FileLogService;
 use crate::tools::observability::metrics::{FileMetricsService, PerformanceQuery};
 use crate::tools::product::goal_exports::FileGoalExportService;
+use crate::tools::product::governance_integration::FileGovernanceIntegrationService;
 use crate::tools::product::imports::{
     FileImportService, ImportPersistFailureKind, import_drafts_from_value,
     import_extraction_prompt, parse_provider_import_result, parse_structured_import_result,
     validate_import_extraction_result,
 };
-use crate::tools::product::merging::FileMergerService;
 use crate::tools::product::process_control::FileProcessControlService;
-use crate::tools::product::project_state::{
+use crate::tools::product::project_projection::{
     ActivityProjectionQuery, ChangeProjectionQuery, FeatureProjectionQuery, GoalProjectionQuery,
     PROJECTION_SNAPSHOT_FILE, PageRequest, ProjectionQuery,
 };

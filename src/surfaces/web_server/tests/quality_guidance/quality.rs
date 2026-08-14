@@ -60,10 +60,7 @@ fn daemon_startup_recovers_quality_cancellation_for_original_app_after_switch() 
 
     let mut server = server_with_projection();
     server.runtime_root = Some(runtime_root.clone());
-    let daemon = LocalHttpDaemon {
-        server,
-        static_root: None,
-    };
+    let daemon = LocalHttpDaemon::new(server, None);
     daemon.recover_runtime_state().unwrap();
 
     let incomplete = registry.status(&operation.id).unwrap();
@@ -193,7 +190,7 @@ fn web_server_manages_quality_settings_and_checks() {
     });
     assert_eq!(initial.status, 200);
     assert_eq!(initial.body["enabled"], "1");
-    assert_eq!(initial.body["timing"], "pre_merge");
+    assert!(initial.body.get("timing").is_none());
     assert_eq!(initial.body["tests"], json!([]));
 
     let saved = server.handle(ApiRequest {
@@ -209,7 +206,7 @@ fn web_server_manages_quality_settings_and_checks() {
     });
     assert_eq!(saved.status, 200);
     assert_eq!(saved.body["enabled"], "1");
-    assert_eq!(saved.body["timing"], "post_build");
+    assert!(saved.body.get("timing").is_none());
     assert_eq!(saved.body["configured"], true);
 
     let legacy_timing = server.handle(ApiRequest {
@@ -217,23 +214,19 @@ fn web_server_manages_quality_settings_and_checks() {
         path: "/api/settings".to_string(),
         body: Some(json!({"quality_timing": "pre_merge"})),
     });
-    assert_eq!(legacy_timing.status, 200);
-    assert_eq!(
-        legacy_timing.body["settings"]["quality_timing"],
-        "pre_merge"
-    );
+    assert_eq!(legacy_timing.status, 400);
     let effective_quality = server.handle(ApiRequest {
         method: "GET".to_string(),
         path: "/api/quality".to_string(),
         body: None,
     });
-    assert_eq!(effective_quality.body["timing"], "pre_merge");
+    assert!(effective_quality.body.get("timing").is_none());
     let dashboard = server.handle(ApiRequest {
         method: "GET".to_string(),
         path: "/api/dashboard".to_string(),
         body: None,
     });
-    assert_eq!(dashboard.body["quality_timing"], "pre_merge");
+    assert!(dashboard.body.get("quality_timing").is_none());
     let nodes: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(refine_dir.join("nodes.json")).unwrap()).unwrap();
     assert!(

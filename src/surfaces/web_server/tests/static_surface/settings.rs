@@ -53,9 +53,14 @@ fn static_main_nav_exposes_refine_source_update_affordance() {
     assert!(releases.contains("const sourceUpdate = result.source_update || {}"));
     assert!(releases.contains("button.disabled = sourceUpdate.enabled !== true"));
     assert!(releases.contains(r#"fetchRemote ? "/api/system/source/check""#));
-    assert!(releases.contains("const confirmed = window.confirm("));
     assert!(releases.contains(r#"api("POST", "/api/system/source/promote", {})"#));
+    assert!(releases.contains("Upgrade Refine"));
+    assert!(releases.contains("source_check"));
+    assert!(!releases.contains("window.confirm("));
+    assert!(!releases.contains("hasAttachedProject()"));
     assert!(releases.contains("handleSourcePromotionSseEvent"));
+    assert!(releases.contains("handleSourceUpdateCheckSseEvent"));
+    assert!(releases.contains("handleSourceUpdateSseEvent"));
     assert!(!releases.contains("setInterval"));
     assert!(init.contains("initSourceUpdateNav()"));
 }
@@ -68,11 +73,23 @@ fn static_project_settings_explain_governance_and_quality_effects() {
     let quality = fs::read_to_string(static_root.join("js/features/settings_quality.js")).unwrap();
 
     assert!(governance.contains(r#"data-testid="governance-explanation""#));
-    assert!(governance.contains("A rule violation stops the Goal before"));
+    assert!(governance.contains("A rule finding can draft a fresh recovery Round"));
     assert!(governance.contains("do not start a check now"));
+    assert!(governance.contains("rules_revision:"));
+    assert!(governance.contains("saved.rules || []"));
+    assert!(governance.contains("e.status === 409"));
+    assert!(governance.contains("refreshSettingsTab(\"governance\""));
+
+    let guidance =
+        fs::read_to_string(static_root.join("js/features/settings_guidance.js")).unwrap();
+    assert!(guidance.contains("/api/guidance/${encodeURIComponent(current.id)}"));
+    assert!(guidance.contains("{ ...item, revision }"));
+    assert!(guidance.contains("e.status === 409"));
+    assert!(guidance.contains("refreshSettingsTab(refreshTab, { force: true })"));
+    assert!(!guidance.contains("api(\"PUT\", \"/api/guidance\""));
 
     assert!(quality.contains(r#"data-testid="quality-explanation""#));
-    assert!(quality.contains("Passing checks advance the Goal to review"));
+    assert!(quality.contains("Passing checks advance the Goal to Governance"));
     assert!(quality.contains("preserve the candidate"));
     assert!(quality.contains("do not start a run now"));
 }

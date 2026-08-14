@@ -2,9 +2,10 @@ mod support;
 
 mod cli_surface {
     pub(super) mod agents;
-    pub(super) mod cluster;
+    pub(super) mod config;
     pub(super) mod daemon_status;
     pub(super) mod features;
+    pub(super) mod fleet;
     pub(super) mod goals;
     pub(super) mod logs;
     pub(super) mod nodes;
@@ -22,9 +23,10 @@ use serde_json::json;
 use support::integration::IntegrationFixture;
 
 use cli_surface::agents::*;
-use cli_surface::cluster::*;
+use cli_surface::config::*;
 use cli_surface::daemon_status::*;
 use cli_surface::features::*;
+use cli_surface::fleet::*;
 use cli_surface::goals::*;
 use cli_surface::logs::*;
 use cli_surface::nodes::*;
@@ -39,19 +41,20 @@ fn cli_surface_suite() {
 
     system_status_reports_healthy_daemon(&fixture);
     project_status_is_attached_to_test_app(&fixture);
+    config_commands_route_through_the_active_daemon(&fixture);
     daemon_backed_project_status_suppresses_ambiguous_default_label(&fixture);
     project_doctor_runs(&fixture);
     project_registry_lifecycle_commands(&fixture);
     system_doctor_and_api_groups_run(&fixture);
     goal_create_list_show_edit_note_round_delete(&fixture);
     goal_feature_assignment_and_round_edit_latest(&fixture);
-    goal_workflow_actions_start_retry_verify_merge_undo(&fixture);
+    goal_workflow_actions_start_retry_and_undo(&fixture);
     feature_create_membership_rollup_and_delete(&fixture);
     feature_show_edit_reorder_move_cancel_and_import(&fixture);
     todo_commands_share_reporter_scoped_api_capability(&fixture);
     node_create_activate_archive(&fixture);
     node_show_rename_settings_and_transfer(&fixture);
-    cluster_local_registry_commands(&fixture);
+    fleet_local_registry_commands(&fixture);
     log_commands_query_public_activity(&fixture);
     agent_commands_use_smoke_ai(&fixture);
 }

@@ -125,7 +125,9 @@ fn web_server_instantly_promotes_new_goal_when_configured() {
         path: "/api/goals".to_string(),
         body: Some(json!({
             "id": "GOAL1",
-            "name": "Instantly promoted Goal"
+            "name": "Instantly promoted Goal",
+            "reporter": "Reporter",
+            "prompt": "Implement the instantly promoted Goal"
         })),
     });
 
@@ -272,7 +274,12 @@ fn daemon_agent_automation_loop_executes_todo_goals_without_manual_request() {
     server.handle(ApiRequest {
         method: "POST".to_string(),
         path: "/api/goals".to_string(),
-        body: Some(json!({"id": "GOAL1", "name": "Loop schedulable"})),
+        body: Some(json!({
+            "id": "GOAL1",
+            "name": "Loop schedulable",
+            "reporter": "Reporter",
+            "prompt": "Implement the schedulable Goal"
+        })),
     });
     server.handle(ApiRequest {
         method: "POST".to_string(),
@@ -280,10 +287,7 @@ fn daemon_agent_automation_loop_executes_todo_goals_without_manual_request() {
         body: Some(json!({"status": "todo"})),
     });
 
-    let daemon = LocalHttpDaemon {
-        server: server.clone(),
-        static_root: None,
-    };
+    let daemon = LocalHttpDaemon::new(server.clone(), None);
     let automation_loop = daemon.start_agent_automation_loop(Duration::from_millis(25));
     #[cfg(not(target_os = "macos"))]
     let automation_timeout = Duration::from_secs(15);
@@ -311,8 +315,7 @@ fn daemon_agent_automation_loop_executes_todo_goals_without_manual_request() {
     }
     automation_loop.stop_for_test();
 
-    let state = fs::read_to_string(runtime_root.join("workflow-automation-state.json")).unwrap();
-    assert!(state.contains("\"goal_id\": \"GOAL1\""));
+    assert!(!runtime_root.join("workflow-automation-state.json").exists());
     assert!(
         !fs::read_to_string(runtime_root.join(API_EVENTS_FILE))
             .unwrap_or_default()

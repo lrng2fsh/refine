@@ -22,8 +22,8 @@ pub(super) fn run_website(
     let listener = LocalHttpDaemon::bind_address(bind_address, port)?;
     let addr = LocalHttpDaemon::local_addr(&listener)?;
     let actual_port = addr.port();
-    let daemon = LocalHttpDaemon {
-        server: InProcessWebServer {
+    let daemon = LocalHttpDaemon::new(
+        InProcessWebServer {
             status: DaemonStatus {
                 port: actual_port,
                 daemon_healthy: false,
@@ -40,9 +40,10 @@ pub(super) fn run_website(
             target_root: None,
             app_registry_root: None,
             runtime_root: None,
+            product_paths: None,
         },
-        static_root: Some(static_root),
-    };
+        Some(static_root),
+    );
     eprintln!("refine: serving website at http://{addr}");
     if once {
         daemon.serve_once(listener)?;

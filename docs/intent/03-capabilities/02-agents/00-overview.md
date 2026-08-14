@@ -7,7 +7,7 @@
 - **Tools With Accountability**: agents should use powerful local tools through shared behavior and leave recoverable traces.
 - **Evidence Before Trust**: quality checks, logs, diffs, review, and activity should explain why work is ready.
 - **Reviewable Handoff**: agent work should move through review, merge, and Git worktree boundaries without losing context.
-- **Shared Capability**: browser, CLI, API, desktop, and agent-native surfaces should call the same agent behavior.
+- **Shared Capability**: browser, CLI, API, MCP, and agent-native surfaces should call the same agent behavior.
 - **Unhobbled By Default**: prompts should be concise enough to leave room for the spiky intelligence and capability overhang of current models.
 
 ## Purpose
@@ -56,7 +56,12 @@ Current implementation details that matter to intent:
   worktree, with private ownership, exact UTF-8 byte and SHA-256 evidence, and
   explicit failure when the handoff is missing, changed, unreadable, or cannot
   fit the provider sandbox.
-- every internal agent prompt is a Markdown template under `src/prompts`, loaded through the shared prompt engine rather than embedded in consumer code;
+- every stateful provider launch receives the owning checkout's exact
+  `run/<port>` root from daemon, workflow, CLI, or durable operation context.
+  Runtime-free detect, configure, authentication, and diagnostics remain
+  stateless; invoke, resume, interactive, and managed launches fail closed
+  instead of inventing HOME, XDG, platform support, or CWD state.
+- every internal agent prompt is a Markdown template under `src/prompts/<feature>/`, loaded through the shared prompt engine rather than embedded in consumer code;
 - agents should prefer installed local CLIs and host tools where possible;
 - chat and standalone sessions are agent behavior, not browser-only behavior;
 - import extraction and draft review should use shared work item persistence;

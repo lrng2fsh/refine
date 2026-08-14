@@ -55,8 +55,6 @@ pub(super) fn default_settings() -> JsonObject {
         ("target_app_tcp_check_host", ""),
         ("target_app_tcp_check_port", ""),
         ("target_app_process_check_command", ""),
-        ("target_app_auto_build", "never"),
-        ("target_app_auto_build_hour_utc", "3"),
     ] {
         settings.insert(key.to_string(), Value::String(value.to_string()));
     }
@@ -88,7 +86,6 @@ pub(super) fn allowed_settings() -> BTreeSet<&'static str> {
         "git_remote",
         "merge_target_branch",
         "quality_enabled",
-        "quality_timing",
         "allowed_commands",
         "agent_cli",
         "target_app_start_instructions",
@@ -114,11 +111,30 @@ pub(super) fn allowed_settings() -> BTreeSet<&'static str> {
         "target_app_tcp_check_host",
         "target_app_tcp_check_port",
         "target_app_process_check_command",
-        "target_app_auto_build",
-        "target_app_auto_build_hour_utc",
     ]
     .into_iter()
     .collect()
+}
+
+pub(super) fn normalize_settings_patch(value: &Value) -> RefineResult<JsonObject> {
+    let updates = value.as_object().ok_or_else(|| {
+        RefineError::InvalidInput("expected an object of {key: value}".to_string())
+    })?;
+    if updates.is_empty() {
+        return Err(RefineError::InvalidInput(
+            "expected an object of {key: value}".to_string(),
+        ));
+    }
+    let allowed = allowed_settings();
+    updates
+        .iter()
+        .map(|(key, value)| {
+            if !allowed.contains(key.as_str()) {
+                return Err(RefineError::InvalidInput(format!("unknown setting: {key}")));
+            }
+            Ok((key.clone(), Value::String(normalize_setting(key, value)?)))
+        })
+        .collect()
 }
 
 pub(super) fn legacy_setting_key(key: &str) -> Option<&'static str> {
@@ -126,8 +142,6 @@ pub(super) fn legacy_setting_key(key: &str) -> Option<&'static str> {
         "target_app_rebuild_command" => Some("target_app_build_command"),
         "target_app_rebuild_instructions" => Some("target_app_build_instructions"),
         "target_app_rebuild_timeout_seconds" => Some("target_app_build_timeout_seconds"),
-        "target_app_auto_rebuild" => Some("target_app_auto_build"),
-        "target_app_auto_rebuild_hour_utc" => Some("target_app_auto_build_hour_utc"),
         _ => None,
     }
 }
@@ -142,6 +156,10 @@ pub(super) fn is_retired_development_request_setting(key: &str) -> bool {
             | "development_request_poll_seconds"
             | "development_request_auto_approve_after_seconds"
             | "development_request_agent_cli"
+            | "target_app_auto_build"
+            | "target_app_auto_build_hour_utc"
+            | "target_app_auto_rebuild"
+            | "target_app_auto_rebuild_hour_utc"
     )
 }
 
@@ -172,18 +190,6 @@ pub(super) fn normalize_setting(key: &str, value: &Value) -> RefineResult<String
             }
         }
         "quality_enabled" => Ok(if value_is_truthy(value) { "1" } else { "0" }.to_string()),
-        "quality_timing" => {
-            let value = as_string(value);
-            if matches!(value.trim(), "post_build" | "post_rebuild") {
-                Ok("post_build".to_string())
-            } else if value.trim() == "pre_merge" {
-                Ok("pre_merge".to_string())
-            } else {
-                Err(RefineError::InvalidInput(
-                    "quality_timing must be one of pre_merge, post_build".to_string(),
-                ))
-            }
-        }
         "target_app_env_json" => {
             let raw = as_string(value);
             let parsed = serde_json::from_str::<Value>(raw.trim()).map_err(|_| {
@@ -219,7 +225,6 @@ pub(super) fn normalize_setting(key: &str, value: &Value) -> RefineResult<String
                 normalize_range(key, value, 1, 65535)
             }
         }
-        "target_app_auto_build_hour_utc" => normalize_range(key, value, 0, 23),
         key if key.ends_with("_timeout_seconds")
             || matches!(
                 key,
@@ -259,14 +264,6 @@ fn normalize_worktree_cleanup_generated_paths(value: &Value) -> RefineResult<Str
         paths.insert(raw.replace('\\', "/"));
     }
     Ok(paths.into_iter().collect::<Vec<_>>().join(", "))
-}
-
-pub(super) fn normalize_quality_timing_lossy(value: &str) -> String {
-    if matches!(value.trim(), "post_build" | "post_rebuild") {
-        "post_build".to_string()
-    } else {
-        DEFAULT_QUALITY_TIMING.to_string()
-    }
 }
 
 pub(super) fn sync_target_app_test_settings(

@@ -1,14 +1,48 @@
 use super::*;
 
 impl FileOperationRegistry {
+    pub fn register_with_id(
+        &self,
+        operation_id: &str,
+        owner: &str,
+        request: Value,
+    ) -> RefineResult<OperationHandle> {
+        let lock = self.mutation_lock()?;
+        if self.operation_path(operation_id).exists() {
+            let existing = self.status(operation_id)?;
+            FileExt::unlock(&lock).ok();
+            return Ok(existing);
+        }
+        let handle = OperationHandle {
+            schema_version: 1,
+            revision: 0,
+            id: operation_id.to_string(),
+            owner: owner.to_string(),
+            state: OperationState::Running,
+            request,
+            progress: empty_object(),
+            result: empty_object(),
+            error: None,
+            external_attempt: None,
+        };
+        self.write(&handle)?;
+        FileExt::unlock(&lock).ok();
+        self.append_log(
+            &handle.id,
+            operation_log_entry(&handle, "info", "Operation registered", None),
+        )?;
+        Ok(handle)
+    }
+
     pub fn register_with_request(
         &self,
         owner: &str,
         request: Value,
     ) -> RefineResult<OperationHandle> {
         let lock = self.mutation_lock()?;
-        self.ensure_request_execution_active(&request)?;
         let handle = OperationHandle {
+            schema_version: 1,
+            revision: 0,
             id: new_operation_id(),
             owner: owner.to_string(),
             state: OperationState::Running,
@@ -16,6 +50,7 @@ impl FileOperationRegistry {
             progress: empty_object(),
             result: empty_object(),
             error: None,
+            external_attempt: None,
         };
         self.write(&handle)?;
         FileExt::unlock(&lock).ok();
@@ -37,7 +72,6 @@ impl FileOperationRegistry {
         request: Value,
     ) -> RefineResult<OperationHandle> {
         let lock = self.mutation_lock()?;
-        self.ensure_request_execution_active(&request)?;
         if let Some(active) = self
             .recover()?
             .into_iter()
@@ -50,6 +84,8 @@ impl FileOperationRegistry {
             )));
         }
         let handle = OperationHandle {
+            schema_version: 1,
+            revision: 0,
             id: new_operation_id(),
             owner: owner.to_string(),
             state: OperationState::Running,
@@ -57,6 +93,7 @@ impl FileOperationRegistry {
             progress: empty_object(),
             result: empty_object(),
             error: None,
+            external_attempt: None,
         };
         self.write(&handle)?;
         FileExt::unlock(&lock).ok();
@@ -67,7 +104,7 @@ impl FileOperationRegistry {
         Ok(handle)
     }
 
-    /// Atomically claims a durable replacement for an interrupted operation.
+    /// Atomically creates or recovers a durable replacement for an interrupted operation.
     ///
     /// The source id and retry identity are written into the replacement request while the
     /// registry mutation lock is held. Concurrent callers, including callers in separate daemon
@@ -150,6 +187,8 @@ impl FileOperationRegistry {
         }
 
         let operation = OperationHandle {
+            schema_version: 1,
+            revision: 0,
             id: new_operation_id(),
             owner: owner.to_string(),
             state: OperationState::Running,
@@ -157,6 +196,7 @@ impl FileOperationRegistry {
             progress: empty_object(),
             result: empty_object(),
             error: None,
+            external_attempt: None,
         };
         self.write(&operation)?;
         self.append_log(

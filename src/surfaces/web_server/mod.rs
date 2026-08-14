@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::process::supervisor::errors::RefineResult;
 use crate::process::supervisor::lifecycle::DaemonStatus;
-use crate::tools::product::project_state::ProjectionSnapshot;
+use crate::tools::host::checkout::RefineCheckoutPaths;
+use crate::tools::product::project_projection::ProjectionSnapshot;
 
-pub const API_CONTRACT_VERSION: &str = "1";
+pub const API_CONTRACT_VERSION: &str = "2";
 pub const IDEMPOTENCY_DIR: &str = "idempotency";
 pub const API_EVENTS_FILE: &str = "api-events.jsonl";
 
@@ -36,10 +37,6 @@ pub const API_GROUPS: &[ApiRouteGroup] = &[
     ApiRouteGroup {
         prefix: "/work",
         capability: "Goals, Features, imports, state transitions",
-    },
-    ApiRouteGroup {
-        prefix: "/workflow",
-        capability: "workflow automation",
     },
     ApiRouteGroup {
         prefix: "/activity",
@@ -106,7 +103,7 @@ pub const API_GROUPS: &[ApiRouteGroup] = &[
         capability: "node registry, activation, ownership transfer",
     },
     ApiRouteGroup {
-        prefix: "/cluster",
+        prefix: "/fleet",
         capability: "node registry and remote operations",
     },
     ApiRouteGroup {
@@ -199,6 +196,9 @@ pub struct InProcessWebServer {
     /// shared by every daemon port under this root.
     pub app_registry_root: Option<PathBuf>,
     pub runtime_root: Option<PathBuf>,
+    /// Request-scoped product-path authority resolved once during production
+    /// daemon bootstrap. Test-only isolated servers may omit it.
+    pub product_paths: Option<RefineCheckoutPaths>,
 }
 
 macro_rules! require_refine_dir {

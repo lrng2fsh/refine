@@ -4,21 +4,35 @@
 
 - **Local Daemon Contract**: the API is primarily the contract between surfaces and the local Refine daemon.
 - **Capability Groups**: routes should map to real system capabilities, not arbitrary page needs.
-- **Surface Alignment**: browser, CLI, desktop, and agent integrations should share API behavior where appropriate.
+- **Surface Alignment**: browser, CLI, MCP, and agent integrations should share API behavior where appropriate.
 - **Not A SaaS Boundary By Default**: the API should not imply that Refine must become a centralized hosted service.
 - **Recoverable Mutations**: API writes should flow through shared services with idempotency, logging, and state repair where needed.
 
 ## Purpose
 
-The API exists so surfaces can talk to the local daemon consistently. It gives browser JavaScript, CLI daemon routing, desktop wrappers, and future agent integrations a shared way to access project status, work items, workflow, processes, chat, settings, files, terminal sessions, diagnostics, and more.
+The API exists so surfaces can talk to the local daemon consistently. It gives browser JavaScript, CLI daemon routing, MCP tools, and future agent integrations a shared way to access project status, work items, workflow, processes, chat, settings, files, terminal sessions, diagnostics, and more.
 
 The API should be treated as local capability plumbing. It is important, but it is not the product center.
 
 ## Expected Role
 
-The API should expose system capability groups that match Refine's product design. Current route groups include system, apps, project, target app, work, workflow, activity, import, dashboard, agents, operations, runner workers, processes, events, quality, chat, settings, governance, guidance, reporters, Reporter-scoped todos, nodes, cluster, changes, cache, performance, files, terminal, diagnostics, and upgrade.
+The API should expose system capability groups that match Refine's product design. Current route groups include system, apps, project, target app, work, workflow, activity, import, dashboard, agents, operations, runner workers, processes, events, quality, chat, settings, governance, guidance, reporters, Reporter-scoped todos, nodes, fleet, changes, cache, performance, files, terminal, diagnostics, and upgrade.
+
+The daemon stores the checkout identity resolved at bootstrap and passes that
+request-scoped authority through system, install, update, source, process, and
+provider handlers. Handlers do not rediscover a checkout from their own CWD or
+construct a user-global runtime service. Port status responses include the
+canonical checkout-local runtime root so clients can diagnose ownership.
 
 Those groups are useful because they map surfaces onto shared behavior. They should not drift into page-specific endpoints when a shared service would express the capability better.
+
+Settings, Quality, Governance, and Guidance routes are the shared configuration contract for browser and CLI. Ordinary Settings and Quality writes remain validated partial patches. Governance scalar patches preserve rules, while every rule replacement carries the observed `rules_revision`; Guidance entries have stable ids, item routes mutate one entry under the repository coordination lock, and both item and compatibility whole-list writes carry the observed `revision`. Stale revisions return `409` without overwriting unrelated state, missing ids return `404`, and successful writes return the normalized authoritative collection.
+
+Browser mutations must present an `Origin` or `Referer` whose authority matches
+the request `Host`. CLI and other non-browser clients may omit those headers.
+The local daemon does not add a separate authorization-token boundary, so
+binding it beyond loopback intentionally grants control to clients that can
+reach the port.
 
 Daemon lifecycle routes use the shared host authority. Start may return its
 observed result directly. Stop and restart first persist and return a
@@ -27,6 +41,17 @@ control outside the daemon's systemd control group or launchd job. A caller can
 read the durable lifecycle operation after shutdown or reconnection and obtain
 the same observed status, lifecycle evidence, failure, and recovery guidance as
 a synchronous CLI caller.
+
+Source-update reads are cached and responsive. Automatic stale refresh and
+manual refresh both return one durable, coalesced supervised-check receipt;
+they do not fetch in an HTTP handler. Source promotion returns one installed
+Agent operation outside Goal capacity. The operation projection includes the
+same redacted attempt identifier and receipt evidence used by SSE and browser
+reconnect, never the raw claim nonce. `POST /operations/{id}/cancel` dispatches
+by owner: ordinary work uses supervised cancellation, while
+`maintenance:source-upgrade` fences and reconciles its exact external helper,
+rollback, executable identity, and prior workflow-admission intent before any
+terminal cancellation result is exposed.
 
 Plan-to-Goal drafting uses the shared `/import/extract` route with purpose `plan_goal`; it returns exactly one unpersisted Goal draft so browser, CLI, and agent adapters can preserve their own explicit review boundary.
 

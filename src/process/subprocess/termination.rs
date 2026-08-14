@@ -1,23 +1,6 @@
 use super::*;
 
 impl FileProcessSupervisor {
-    /// Serializes target-bound workflow cancellation with the complete spawn-to-registration
-    /// window. A cancellation cannot mistake a not-yet-registered worker for an exited worker,
-    /// and a delayed workflow step cannot launch after its exact claim has settled.
-    pub(crate) fn workflow_process_registration_guard(
-        &self,
-        spec: &ManagedProcessSpec,
-    ) -> RefineResult<Option<WorkflowProcessRegistrationLock>> {
-        let Some((claim_id, execution_id, goal_id)) = workflow_process_identity(&spec.metadata)
-        else {
-            return Ok(None);
-        };
-        let workflow_root = workflow_runtime_root(&self.runtime_root);
-        let guard = acquire_workflow_process_registration_lock(&workflow_root)?;
-        validate_running_workflow_claim(&workflow_root, claim_id, execution_id, goal_id)?;
-        Ok(Some(guard))
-    }
-
     /// Requests termination without removing the managed-process record. The process runner owns
     /// final reaping and artifact cleanup, so callers can keep capacity reserved until the real
     /// child has exited.
@@ -185,6 +168,14 @@ impl FileProcessSupervisor {
     where
         F: FnMut(ProcessCleanupStage) -> RefineResult<()>,
     {
+        // Serialize against the launcher's reaper (see `cleanup_lock`): without
+        // this, an archive racing the removal below could resurrect records
+        // for a process this cleanup deliberately retired. Held until return;
+        // the flock releases when the file handle drops.
+        let _cleanup_lock = match self.cleanup_lock(&expected.id) {
+            Ok(lock) => lock,
+            Err(error) => return Err(ConfirmedProcessCleanupFailure { outcome, error }),
+        };
         let handoff_path = self.artifact_handoff_path(&expected.id);
         let handoff = match OpenOptions::new()
             .read(true)
@@ -256,6 +247,7 @@ impl FileProcessSupervisor {
         {
             return Err(ConfirmedProcessCleanupFailure { outcome, error });
         }
+        let _ = fs::remove_file(self.cleanup_lock_path(&expected.id));
         Ok(outcome)
     }
 }

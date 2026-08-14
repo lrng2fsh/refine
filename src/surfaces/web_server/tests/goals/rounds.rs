@@ -160,6 +160,21 @@ fn web_server_appends_and_reads_goal_round_logs() {
         detail.body["goal"]["rounds"][0]["quality_message"],
         "Quality check failed."
     );
+    let planning_write = server.handle(ApiRequest {
+        method: "PATCH".to_string(),
+        path: "/api/goals/GOAL1/rounds/latest/evaluation".to_string(),
+        body: Some(json!({
+            "implementation_plan": {"state": "completed", "phase": "implement"}
+        })),
+    });
+    assert_eq!(planning_write.status, 400, "{}", planning_write.body);
+    assert!(
+        planning_write.body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Workflow-owned evidence")),
+        "{}",
+        planning_write.body
+    );
 
     remove_temp_dir(&temp_root);
 }
@@ -201,7 +216,7 @@ fn native_sse_streams_projected_goal_round_logs() {
     let mut server = server_with_projection();
     server.projection.activity.insert(
         "round-log:GOAL1:0:0".to_string(),
-        crate::tools::product::project_state::ActivitySummaryProjection {
+        crate::tools::product::project_projection::ActivitySummaryProjection {
             entry: ActivityEntry {
                 id: "round-log:GOAL1:0:0".to_string(),
                 datetime: "2026-07-21T12:00:00Z".to_string(),
@@ -216,10 +231,7 @@ fn native_sse_streams_projected_goal_round_logs() {
             searchable_text: "Agent edited the implementation".to_string(),
         },
     );
-    let daemon = LocalHttpDaemon {
-        server,
-        static_root: None,
-    };
+    let daemon = LocalHttpDaemon::new(server, None);
 
     let events = daemon.server_sent_events("events").unwrap();
 
@@ -235,7 +247,7 @@ fn goal_log_activity_page_returns_the_newest_entries() {
         let id = format!("round-log:GOAL1:0:{index:03}");
         server.projection.activity.insert(
             id.clone(),
-            crate::tools::product::project_state::ActivitySummaryProjection {
+            crate::tools::product::project_projection::ActivitySummaryProjection {
                 entry: ActivityEntry {
                     id,
                     datetime: format!("2026-07-21T12:{:02}:{:02}Z", index / 60, index % 60),

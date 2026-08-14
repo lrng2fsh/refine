@@ -190,10 +190,19 @@ function serveStaticTree() {
   });
 }
 
-async function openApp({ fixture = apiFixture, onRequest = null } = {}) {
+async function openApp({
+  fixture = apiFixture,
+  onRequest = null,
+  selectedReporter = "Reporter",
+} = {}) {
   const server = await serveStaticTree();
   const browser = await BROWSER.chromium.launch({ executablePath: BROWSER.executablePath });
   const page = await browser.newPage();
+  if (selectedReporter !== null) {
+    await page.addInitScript((reporter) => {
+      localStorage.setItem("refine_last_reporter", reporter);
+    }, selectedReporter);
+  }
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(String(error.message).split("\n")[0]));
   await page.route("**/api/**", async (route) => {
@@ -220,6 +229,110 @@ async function openApp({ fixture = apiFixture, onRequest = null } = {}) {
     },
   };
 }
+
+test("Reporter onboarding selects an existing Reporter before routed modal navigation", { skip: SKIP }, async () => {
+  const app = await openApp({ selectedReporter: null });
+  try {
+    await app.page.goto(`${app.origin}/#/goals/new`);
+    const onboarding = app.page.locator('[data-testid="reporter-onboarding-dialog"]');
+    await onboarding.waitFor();
+    assert.equal(await onboarding.getAttribute("aria-labelledby"), "reporter-onboarding-title");
+    assert.match(await onboarding.innerText(), /Who are you\?/);
+    assert.match(await onboarding.innerText(), /Controls > Reporter/);
+
+    await onboarding.getByRole("button", { name: "Reporter", exact: true }).click();
+    await app.page.locator('[data-testid="new-goal-modal"]').waitFor();
+    assert.equal(await onboarding.count(), 0);
+    assert.equal(await app.page.locator('[aria-modal="true"]').count(), 1);
+    assert.equal(
+      await app.page.evaluate(() => localStorage.getItem("refine_last_reporter")),
+      "Reporter",
+    );
+
+    await app.page.reload();
+    await app.page.locator('[data-testid="new-goal-modal"]').waitFor();
+    assert.equal(await onboarding.count(), 0, "a persisted valid selection suppresses reload onboarding");
+    assert.deepEqual(app.pageErrors, []);
+  } finally {
+    await app.close();
+  }
+});
+
+test("Reporter onboarding creates and persists the canonical Reporter", { skip: SKIP }, async () => {
+  const requests = [];
+  const reporters = [{ id: 1, name: "Reporter" }];
+  const app = await openApp({
+    selectedReporter: null,
+    async fixture(pathname, request) {
+      if (pathname === "/api/reporters" && request.method() === "POST") {
+        const body = request.postDataJSON();
+        const reporter = { id: 42, name: body.name.trim() };
+        reporters.push(reporter);
+        return { reporter };
+      }
+      if (pathname === "/api/reporters") return { reporters };
+      return apiFixture(pathname);
+    },
+    onRequest(pathname, request) {
+      if (pathname === "/api/reporters") requests.push([request.method(), pathname]);
+    },
+  });
+  try {
+    await app.page.goto(`${app.origin}/#/`);
+    const onboarding = app.page.locator('[data-testid="reporter-onboarding-dialog"]');
+    await onboarding.waitFor();
+    await onboarding.locator("#reporter-onboarding-name").fill("Grace Hopper");
+    await onboarding.locator('[data-testid="reporter-onboarding-create"]').click();
+    await onboarding.waitFor({ state: "detached" });
+
+    assert.equal(
+      await app.page.evaluate(() => localStorage.getItem("refine_last_reporter")),
+      "Grace Hopper",
+    );
+    assert.deepEqual(requests.slice(-2), [
+      ["POST", "/api/reporters"],
+      ["GET", "/api/reporters"],
+    ]);
+    await app.page.reload();
+    await app.page.locator("#dash").waitFor();
+    assert.equal(await onboarding.count(), 0);
+    assert.deepEqual(app.pageErrors, []);
+  } finally {
+    await app.close();
+  }
+});
+
+test("asynchronous Feature detail remains the only modal and onboarding safely resumes", { skip: SKIP }, async () => {
+  const app = await openApp({
+    selectedReporter: null,
+    async fixture(pathname) {
+      if (pathname === "/api/features/FEAT1") {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        return { feature: FEATURE };
+      }
+      return apiFixture(pathname);
+    },
+  });
+  try {
+    await app.page.goto(`${app.origin}/#/features/FEAT1`);
+    const onboarding = app.page.locator('[data-testid="reporter-onboarding-dialog"]');
+    await onboarding.waitFor();
+    await app.page.locator('[data-testid="feature-detail-modal"]').waitFor();
+    assert.equal(await onboarding.count(), 0);
+    assert.equal(await app.page.locator('[aria-modal="true"]').count(), 1);
+    assert.equal(
+      await app.page.evaluate(() => document.activeElement?.closest('[data-testid="feature-detail-modal"]') !== null),
+      true,
+    );
+
+    await app.page.locator('[data-testid="feature-modal-close"]').click();
+    await onboarding.waitFor();
+    assert.equal(await app.page.locator('[aria-modal="true"]').count(), 1);
+    assert.deepEqual(app.pageErrors, []);
+  } finally {
+    await app.close();
+  }
+});
 
 // A screen that throws while rendering is caught by its own error handler and
 // replaced with a placeholder, which is why the marker has to be asserted: the
@@ -323,6 +436,120 @@ test("goal detail renders from the routed URL", { skip: SKIP }, async () => {
   }
 });
 
+test("project status active node drives the browser title, navigation, and Goal label", { skip: SKIP }, async () => {
+  const activeGoal = {
+    ...GOAL,
+    node_id: "port-owner",
+    node_display_name: "Port Owner",
+  };
+  const nodes = [
+    { id: "stale-base", display_name: "Stale Base Node" },
+    { id: "port-owner", display_name: "Port Owner" },
+  ];
+  const fixture = (pathname, request) => {
+    if (pathname.startsWith("/api/project/status")) {
+      return {
+        attached: true,
+        target_root: "/tmp/app",
+        registry_enabled: true,
+        apps: [],
+        nodes,
+        active_node_id: "port-owner",
+        active_node: "Port Owner",
+      };
+    }
+    if (pathname.startsWith("/api/nodes")) {
+      return {
+        nodes,
+        active_node_id: "port-owner",
+        active_node: "Port Owner",
+      };
+    }
+    if (pathname.startsWith("/api/goals/")) return { goal: activeGoal };
+    if (pathname.startsWith("/api/goals")) {
+      return {
+        goals: [activeGoal],
+        facets: { status_counts: {} },
+        page: { page: 1, total: 1 },
+      };
+    }
+    return apiFixture(pathname, request);
+  };
+  const app = await openApp({ fixture });
+  try {
+    await assertScreenRenders(app, {
+      route: "#/goals?node=current",
+      marker: '[data-testid="goals-table"]',
+    });
+    await app.page.waitForFunction(() => document.title === "Port Owner - refine");
+    const activeNodeLabel = app.page.locator("#active-node-label");
+    assert.equal(await app.page.title(), "Port Owner - refine");
+    assert.equal(await activeNodeLabel.textContent(), "Port Owner");
+    assert.equal(await activeNodeLabel.getAttribute("title"), "Port Owner");
+    assert.equal(await app.page.locator(".goals-node-cell").textContent(), "Port Owner");
+    assert.doesNotMatch(
+      [
+        await app.page.title(),
+        await activeNodeLabel.textContent(),
+        await activeNodeLabel.getAttribute("title"),
+        await app.page.locator(".goals-node-cell").textContent(),
+      ].join(" "),
+      /Stale Base Node/,
+    );
+    assert.deepEqual(app.pageErrors, []);
+  } finally {
+    await app.close();
+  }
+});
+
+test("Controls Node selector switches by ID and refreshes the visible Node context", { skip: SKIP }, async () => {
+  let activeNodeId = "node-a";
+  const nodes = [
+    { id: "node-a", display_name: "Alpha" },
+    { id: "node-b", display_name: "Beta" },
+    { id: "node-old", display_name: "Archived", archived: true },
+  ];
+  const requests = [];
+  const fixture = (pathname, request) => {
+    if (pathname === "/api/nodes/activate") {
+      const body = request.postDataJSON();
+      requests.push([request.method(), pathname, body]);
+      activeNodeId = body.node_id;
+      return { active_node_id: activeNodeId };
+    }
+    if (pathname === "/api/project/status") {
+      return {
+        attached: true,
+        target_root: "/tmp/app",
+        registry_enabled: true,
+        apps: [],
+        active_node_id: activeNodeId,
+        active_node: nodes.find((node) => node.id === activeNodeId)?.display_name,
+      };
+    }
+    if (pathname === "/api/nodes") {
+      return { nodes, active_node_id: activeNodeId };
+    }
+    return apiFixture(pathname, request);
+  };
+  const app = await openApp({ fixture });
+  try {
+    await assertScreenRenders(app, { route: "#/", marker: "#dash" });
+    const selector = app.page.locator('[data-testid="global-node"]');
+    assert.deepEqual(await selector.locator("option").allTextContents(), ["Alpha", "Beta"]);
+    assert.equal(await selector.inputValue(), "node-a");
+    await selector.selectOption("node-b");
+    await app.page.waitForFunction(() => document.title === "Beta - refine");
+    assert.equal(new URL(app.page.url()).hash, "#/");
+    assert.equal(await selector.inputValue(), "node-b");
+    assert.equal(await app.page.locator("#active-node-label").textContent(), "Beta");
+    assert.deepEqual(requests, [["POST", "/api/nodes/activate", { node_id: "node-b" }]]);
+    assert.deepEqual(app.pageErrors, []);
+  } finally {
+    await app.close();
+  }
+});
+
 test("features list renders from the routed URL", { skip: SKIP }, async () => {
   const app = await openApp();
   try {
@@ -332,6 +559,55 @@ test("features list renders from the routed URL", { skip: SKIP }, async () => {
       forbiddenText: ["No Features match the current filters"],
     });
     assert.equal(await app.page.locator("#features-table tbody tr").count(), 1);
+  } finally {
+    await app.close();
+  }
+});
+
+test("shared table columns wrap long unbroken content within their cells", { skip: SKIP }, async () => {
+  const app = await openApp();
+  try {
+    await assertScreenRenders(app, { route: "#/", marker: "#dash" });
+    const layout = await app.page.evaluate(() => {
+      const fixture = document.createElement("div");
+      fixture.style.width = "260px";
+      fixture.innerHTML = `
+        <table class="table" data-testid="table-overflow-fixture">
+          <thead><tr>
+            <th>UnbrokenHeaderThatMustStayInsideItsColumn</th>
+            <th>Other</th>
+          </tr></thead>
+          <tbody><tr>
+            <td>averylongassigneeemailaddress@example-with-a-long-domain.invalid</td>
+            <td><code>unbroken-code-value-that-also-must-wrap</code></td>
+          </tr></tbody>
+        </table>`;
+      document.body.appendChild(fixture);
+
+      const table = fixture.querySelector("table");
+      const cells = [...fixture.querySelectorAll("th, td")];
+      return {
+        tableFitsContainer: table.getBoundingClientRect().right
+          <= fixture.getBoundingClientRect().right + 0.5,
+        cells: cells.map((cell) => {
+          const range = document.createRange();
+          range.selectNodeContents(cell);
+          const cellRect = cell.getBoundingClientRect();
+          const contentRect = range.getBoundingClientRect();
+          return {
+            overflowWrap: getComputedStyle(cell).overflowWrap,
+            contentFits: contentRect.left >= cellRect.left - 0.5
+              && contentRect.right <= cellRect.right + 0.5,
+          };
+        }),
+      };
+    });
+
+    assert.equal(layout.tableFitsContainer, true);
+    assert.ok(layout.cells.length > 0);
+    assert.ok(layout.cells.every((cell) => cell.overflowWrap === "anywhere"));
+    assert.ok(layout.cells.every((cell) => cell.contentFits));
+    assert.deepEqual(app.pageErrors, []);
   } finally {
     await app.close();
   }
@@ -590,7 +866,7 @@ test("Todo List renders an item-first workspace with responsive list navigation"
       drawToolbar();
     });
 
-    const desktop = await app.page.evaluate(() => {
+    const wideScreen = await app.page.evaluate(() => {
       const rail = document.querySelector(".todo-list-rail").getBoundingClientRect();
       const workspace = document.querySelector(".todo-workspace").getBoundingClientRect();
       const composer = document.querySelector(".todo-add-form").getBoundingClientRect();
@@ -603,7 +879,7 @@ test("Todo List renders an item-first workspace with responsive list navigation"
         completedCount: document.querySelector(".todo-completed-section h4 span").textContent,
       };
     });
-    assert.deepEqual(desktop, {
+    assert.deepEqual(wideScreen, {
       railBeforeWorkspace: true,
       composerBeforeItems: true,
       title: "Release",
@@ -968,7 +1244,7 @@ test("Goals Node column widens accessibly, stays bounded, and survives rerenders
   }
 });
 
-test("Goals mobile cards ignore desktop Node width and show the complete label", { skip: SKIP }, async () => {
+test("Goals mobile cards ignore wide-screen Node width and show the complete label", { skip: SKIP }, async () => {
   const app = await openApp();
   try {
     await app.page.setViewportSize({ width: 700, height: 800 });

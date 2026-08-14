@@ -31,7 +31,6 @@ impl FileQualityService {
             tests: stored.tests,
             legacy_commands: stored.legacy_commands,
             enabled: "1".to_string(),
-            timing: stored.timing,
         })
     }
 
@@ -43,7 +42,7 @@ impl FileQualityService {
         if let Some(instructions) = patch.instructions {
             let trimmed = instructions.trim();
             stored.instructions = if trimmed.is_empty() {
-                DEFAULT_INSTRUCTIONS.to_string()
+                default_quality_instructions().to_string()
             } else {
                 trimmed.to_string()
             };
@@ -58,10 +57,9 @@ impl FileQualityService {
             stored.tests = tests;
         }
         // `enabled` remains accepted on the compatibility wire shape, but every candidate is
-        // evaluated. It cannot disable Quality.
-        if let Some(timing) = patch.timing {
-            stored.timing = normalize_timing(&timing)?;
-        }
+        // evaluated. It cannot disable Quality. Retired timing input is also discarded because
+        // Quality always follows Implement and precedes Governance.
+        let _ = (patch.enabled, patch.timing);
         stored.migration_version = SETTINGS_MIGRATION_VERSION;
         self.write_stored_settings(&stored)?;
         self.load_settings()
@@ -89,30 +87,6 @@ impl FileQualityService {
         if stored.migration_version < SETTINGS_MIGRATION_VERSION {
             let node_service = FileNodeRegistryService::new(&self.refine_dir);
             let mut registry = node_service.load_registry()?;
-            if !existed {
-                let timings = registry
-                    .nodes
-                    .iter()
-                    .map(|node| {
-                        node.settings
-                            .get("quality_timing")
-                            .and_then(Value::as_str)
-                            .map(normalize_timing_lossy)
-                            .unwrap_or_else(|| PRE_MERGE.to_string())
-                    })
-                    .collect::<std::collections::BTreeSet<_>>();
-                if timings.len() > 1 {
-                    return Err(RefineError::Conflict(
-                        "legacy Node quality_timing values diverge; migration cannot choose one project-wide Quality timing"
-                            .to_string(),
-                    ));
-                }
-                stored.timing = timings
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| PRE_MERGE.to_string());
-            }
-
             let mut commands = stored.legacy_commands.clone();
             for node in &registry.nodes {
                 if legacy_quality_enabled(&node.settings) {
@@ -123,7 +97,7 @@ impl FileQualityService {
 
             // Stage imported state without advancing the migration marker. If Node cleanup or
             // the final write fails, retry sees both the staged commands and remaining legacy
-            // state, so enforced QA cannot disappear between attempts.
+            // state, so enforced Quality cannot disappear between attempts.
             self.write_stored_settings(&stored)?;
             #[cfg(test)]
             if self.migration_failure_after_stage {
@@ -244,7 +218,6 @@ struct StoredQualitySettings {
     instructions: String,
     tests: Vec<String>,
     legacy_commands: Vec<String>,
-    timing: String,
     migration_version: u32,
 }
 
@@ -253,13 +226,12 @@ impl StoredQualitySettings {
         Self {
             business_requirements: self.business_requirements.trim().to_string(),
             instructions: if self.instructions.trim().is_empty() {
-                DEFAULT_INSTRUCTIONS.to_string()
+                default_quality_instructions().to_string()
             } else {
                 self.instructions.trim().to_string()
             },
             tests: normalize_tests(self.tests),
             legacy_commands: normalize_commands(self.legacy_commands),
-            timing: normalize_timing_lossy(&self.timing),
             migration_version: self.migration_version,
         }
     }
@@ -269,10 +241,9 @@ impl Default for StoredQualitySettings {
     fn default() -> Self {
         Self {
             business_requirements: String::new(),
-            instructions: DEFAULT_INSTRUCTIONS.to_string(),
+            instructions: default_quality_instructions().to_string(),
             tests: Vec::new(),
             legacy_commands: Vec::new(),
-            timing: PRE_MERGE.to_string(),
             migration_version: 0,
         }
     }

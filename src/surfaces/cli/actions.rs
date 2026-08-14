@@ -7,8 +7,9 @@ use crate::model::workflow::GoalStatus;
 use crate::tools::host::installation::InstallTarget;
 
 mod agents;
-mod cluster;
+mod config;
 mod features;
+mod fleet;
 mod goals;
 mod logs;
 mod nodes;
@@ -18,8 +19,12 @@ mod todos;
 mod workflow;
 
 pub use agents::{AgentAction, CliAgentProfile};
-pub use cluster::ClusterAction;
+pub use config::{
+    ConfigAction, ConfigDomain, ConfigGovernanceAction, ConfigGuidanceAction, ConfigPayload,
+    ConfigQualityAction, ConfigSettingsAction,
+};
 pub use features::FeatureAction;
+pub use fleet::FleetAction;
 pub use goals::GoalAction;
 pub use logs::LogAction;
 pub use nodes::NodeAction;
@@ -39,6 +44,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Inspect and configure Settings, Quality, Governance, and Guidance for the active app.
+    /// Project selection, workflow control, nodes, fleet, Reporters, Todos, and agent authentication remain in their named command groups.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Manage which target application this Refine instance operates on.
     /// Attach, clone, switch, register, and diagnose target app repositories.
     Project {
@@ -73,11 +84,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: NodeAction,
     },
-    /// Operate the cluster (the fleet of nodes): register and bootstrap nodes,
-    /// distribute unclaimed Goal ownership, and run remote commands.
-    Cluster {
+    /// Operate the fleet (the fleet of nodes): register and bootstrap nodes,
+    /// distribute queued Goal ownership, and run remote commands.
+    Fleet {
         #[command(subcommand)]
-        action: ClusterAction,
+        action: FleetAction,
     },
     /// Inspect the activity log: list, tail, query, and export entries, or build a support bundle.
     Log {
@@ -101,8 +112,8 @@ pub enum Commands {
         #[cfg_attr(not(test), arg(skip = None))]
         target_root: Option<PathBuf>,
     },
-    /// Print a machine-readable JSON catalog of every CLI command with descriptions.
-    /// Load this once instead of exploring --help per subcommand.
+    /// Print a machine-readable JSON catalog of supported user-facing CLI commands.
+    /// Hidden worker entry points and checkout-launcher operations are intentionally omitted.
     Commands,
     /// Serve the Refine website as a local static file server (no daemon or project state required).
     Website {

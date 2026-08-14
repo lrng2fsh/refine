@@ -4,6 +4,10 @@ use crate::model::log::RoundLogEntry;
 use crate::model::workflow::GoalStatus;
 use crate::model::{JsonObject, Timestamp};
 
+mod implementation_plan;
+
+pub use implementation_plan::*;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GoalPriority {
@@ -88,27 +92,33 @@ pub struct GoalRound {
     /// Versioned context pinned before this round's implementation agent starts.
     #[serde(default)]
     pub agent_context: Option<serde_json::Value>,
+    /// Workflow-owned, versioned evidence for this round's implementation planning pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementation_plan: Option<ImplementationPlan>,
     /// Structured guidance selection for current rounds; legacy strings remain readable.
     pub guidance_decision: Option<serde_json::Value>,
     #[serde(default)]
     pub implementation_report: Option<String>,
     #[serde(default)]
     pub implementation_reported_at: Option<Timestamp>,
-    /// Quality ordering durably committed to this candidate round.
-    #[serde(default)]
+    /// Legacy Quality ordering retained only while reading historical rounds.
+    #[serde(default, skip_serializing)]
     pub workflow_quality_timing: Option<WorkflowQualityTiming>,
     /// Git remote durably committed before publishing and integrating this candidate.
     #[serde(default)]
     pub workflow_git_remote: Option<String>,
-    /// Successful Ready Merge integration evidence for this exact candidate.
+    /// Successful Governance integration evidence for this exact candidate.
     #[serde(default)]
     pub workflow_integration: Option<RoundIntegration>,
     /// Durable evidence for replaying a round whose candidate is already integrated.
     #[serde(default)]
     pub workflow_reconciliation: Option<serde_json::Value>,
-    /// Durable evidence linking a stale Ready Merge round to its automatically queued successor.
+    /// Durable evidence linking a stale integrated round to its automatically queued successor.
     #[serde(default)]
     pub workflow_recovery: Option<serde_json::Value>,
+    /// Provenance for a Round drafted automatically from a Governance finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_retry: Option<AutomaticRoundRetry>,
     pub governance: Option<RoundGovernance>,
     pub quality: Option<RoundQuality>,
     pub logs: Vec<RoundLogEntry>,
@@ -167,6 +177,10 @@ pub struct RoundGovernance {
     pub governance_details: Option<JsonObject>,
     pub governance_checked_at: Option<Timestamp>,
     pub governance_rule_actions: Vec<JsonObject>,
+    #[serde(default)]
+    pub recovery_analysis: Option<String>,
+    #[serde(default)]
+    pub recovery_round_prompt: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -175,6 +189,24 @@ pub struct RoundQuality {
     pub quality_message: Option<String>,
     pub quality_details: Option<JsonObject>,
     pub quality_checked_at: Option<Timestamp>,
+    #[serde(default)]
+    pub agent_report: Option<String>,
+    #[serde(default)]
+    pub candidate_commit: Option<String>,
+    #[serde(default)]
+    pub tests_added_or_updated: Vec<String>,
+    #[serde(default)]
+    pub tests_run: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AutomaticRoundRetry {
+    pub kind: String,
+    /// One-based source Round number.
+    pub source_round: usize,
+    /// One-based retry number within the current user-authored series.
+    pub attempt: u32,
+    pub generated_at: Timestamp,
 }
 
 #[cfg(test)]
@@ -195,6 +227,7 @@ mod tests {
         });
         let legacy_round: GoalRound = serde_json::from_value(legacy).unwrap();
         assert_eq!(legacy_round.workflow_quality_timing, None);
+        assert_eq!(legacy_round.implementation_plan, None);
         assert_eq!(legacy_round.workflow_git_remote, None);
         assert_eq!(legacy_round.workflow_integration, None);
         assert_eq!(legacy_round.workflow_recovery, None);
@@ -206,9 +239,11 @@ mod tests {
             current_round.workflow_quality_timing,
             Some(WorkflowQualityTiming::PostBuild)
         );
-        assert_eq!(
-            serde_json::to_value(current_round).unwrap()["workflow_quality_timing"],
-            "post_build"
+        assert!(
+            serde_json::to_value(current_round)
+                .unwrap()
+                .get("workflow_quality_timing")
+                .is_none()
         );
     }
 }

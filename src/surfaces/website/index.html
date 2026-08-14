@@ -117,7 +117,7 @@
           <h2 id="compare-title">The management layer, compared.</h2>
           <p>
             Running an agent by hand works for one task. Wrapping agents in loops scales the
-            effort but not the oversight, and desktop orchestrators stop at the edge of one
+            effort but not the oversight, and local orchestrators stop at the edge of one
             machine. Refine keeps the agents you already use and adds the management layer the
             rest are missing.
           </p>
@@ -167,7 +167,7 @@
                 <td>One terminal</td>
                 <td>SSH scripts you maintain</td>
                 <td>One Mac</td>
-                <td class="compare-refine"><span class="mark yes">✓</span> Node cluster</td>
+                <td class="compare-refine"><span class="mark yes">✓</span> Node fleet</td>
               </tr>
               <tr>
                 <th scope="row">Live process visibility</th>
@@ -222,7 +222,7 @@
             <h3>Agent fleet</h3>
             <p>
               Orchestrate your agent fleet across decentralized repositories, branches, processes,
-              and your node cluster. Connect any MCP client to the always-on local endpoint, and
+              and your fleet of nodes. Connect any MCP client to the always-on local endpoint, and
               cheap feedback loops keep agent work moving while git keeps everyone in sync.
             </p>
           </article>
@@ -371,30 +371,6 @@
           <h2 id="start-title">Install Refine locally, then attach the app you want agents to work on.</h2>
         </div>
         <div class="start-layout">
-          <article class="install-panel">
-            <div class="panel-heading">
-              <h3>Install yourself</h3>
-              <a href="/scripts/install.sh">raw script</a>
-            </div>
-            <div class="code-copy">
-              <pre><code data-origin-template="curl -fsSL {origin}/scripts/install.sh | bash">curl -fsSL /scripts/install.sh | bash</code></pre>
-              <button
-                class="copy-button copy-button-on-code"
-                type="button"
-                data-copy-template="curl -fsSL {origin}/scripts/install.sh | bash"
-                aria-label="Copy install command"
-              >
-                <svg aria-hidden="true" viewBox="0 0 24 24">
-                  <path d="M8 8h10v12H8z"></path>
-                  <path d="M6 16H4V4h12v2"></path>
-                </svg>
-              </button>
-            </div>
-            <p>
-              The installer checks the host, installs or repairs missing tools when approved,
-              starts Refine, and opens the browser UI on your machine.
-            </p>
-          </article>
           <article class="install-panel accent">
             <div class="panel-heading">
               <h3>Install with your agent</h3>
@@ -418,8 +394,9 @@
               </button>
             </div>
             <p>
-              Give this URL to Codex, OpenClaw, Claude Code, Gemini, Copilot, or another coding
-              agent so it can install Refine with explicit checks and report exact blockers.
+              Give this URL to OpenClaw, Codex, Claude Code, Gemini, Copilot, Grok Build, or
+              another coding agent so it can install Refine with explicit checks and report
+              exact blockers.
             </p>
           </article>
         </div>

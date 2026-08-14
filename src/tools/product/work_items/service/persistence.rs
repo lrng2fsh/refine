@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::json;
 
 impl FileWorkItemService {
     pub(super) fn with_goal_reporter_registered<T>(
@@ -17,7 +18,8 @@ impl FileWorkItemService {
 
     pub(super) fn projection_snapshot(
         &self,
-    ) -> RefineResult<crate::tools::product::project_state::ProjectionSnapshot> {
+    ) -> RefineResult<std::sync::Arc<crate::tools::product::project_projection::ProjectionSnapshot>>
+    {
         if let Some(cache_dir) = &self.projection_cache_dir {
             // Same explicit runtime root as ownership resolution: inferring it from
             // the cache directory pointed the store at a nested cache path.
@@ -25,13 +27,15 @@ impl FileWorkItemService {
                 .active_node_root
                 .as_ref()
                 .map(|runtime_root| {
-                    FileProjectStateStore::with_runtime_root(&self.refine_dir, runtime_root)
+                    FileProjectProjectionStore::with_runtime_root(&self.refine_dir, runtime_root)
                 })
-                .unwrap_or_else(|| FileProjectStateStore::new(&self.refine_dir));
-            store.load_or_refresh_projection(cache_dir)
+                .unwrap_or_else(|| FileProjectProjectionStore::new(&self.refine_dir));
+            // The shared snapshot avoids deep-cloning every Goal per query; a
+            // current projection costs one stat walk.
+            store.load_or_refresh_projection_shared(cache_dir)
         } else {
-            let store = FileProjectStateStore::new(&self.refine_dir);
-            store.rebuild_projection()
+            let store = FileProjectProjectionStore::new(&self.refine_dir);
+            store.rebuild_projection().map(std::sync::Arc::new)
         }
     }
 
@@ -148,12 +152,30 @@ impl FileWorkItemService {
                 goal_path.display()
             ))
         })?;
-        let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        let mut value: Value = serde_json::from_slice(&bytes).map_err(|error| {
             RefineError::Serialization(format!(
                 "failed to parse Goal {}: {error}",
                 goal_path.display()
             ))
         })?;
+        if value
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(status, "in-progress" | "qa" | "ready-merge" | "build"))
+        {
+            value["status"] = Value::String(current.goal.status.as_str().to_string());
+            if let Some(round) = value
+                .get_mut("rounds")
+                .and_then(Value::as_array_mut)
+                .and_then(|rounds| rounds.last_mut())
+            {
+                round["workflow_status_migration"] = json!({
+                    "target": current.goal.status.as_str(),
+                    "migrated_at": now_timestamp()
+                });
+            }
+            write_json_atomically(&goal_path, &value)?;
+        }
         Ok((goal_path, value))
     }
 
@@ -218,6 +240,9 @@ impl FileWorkItemService {
         );
         if !matches!(status, GoalStatus::Failed) {
             clear_latest_round_failure(object);
+        }
+        if !is_automated_status(status) {
+            clear_latest_round_workflow_attempt(object);
         }
         object.insert("updated".to_string(), Value::String(now_timestamp()));
         write_json_atomically(goal_path, value)

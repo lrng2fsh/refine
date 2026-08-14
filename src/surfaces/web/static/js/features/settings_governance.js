@@ -78,10 +78,10 @@ function renderSettingsGovernanceTab(gov) {
     <section class="settings-section" data-testid="governance-explanation">
       <h3>How Governance works</h3>
       <p class="muted small" style="margin-bottom:0">
-        After implementation, Governance inspects the Goal candidate against these Rules,
-        using Product and Constitution as context. A rule violation stops the Goal before
-        build and review; with no rules, the Goal continues. Changes save automatically
-        for subsequent checks and do not start a check now.
+        After Quality, Governance inspects the final Goal candidate against Product,
+        Constitution, Rules, and Guidance. A passing candidate is integrated before Review.
+        A rule finding can draft a fresh recovery Round up to the configured limit.
+        Changes save automatically and do not start a check now.
       </p>
     </section>
 
@@ -105,6 +105,15 @@ function renderSettingsGovernanceTab(gov) {
     })}
 
     <section class="settings-section">
+      <h3>Automatic Quality and Governance recovery</h3>
+      <label for="s-governance-max-retries">Maximum automatic recovery Rounds</label>
+      <input id="s-governance-max-retries" type="number" min="0" step="1"
+             value="${htmlEscape(String(gov.max_automatic_round_retries ?? 5))}"
+             data-testid="governance-max-automatic-round-retries">
+      <p class="muted small">Shared across Quality and Governance. Default: 5. Set to 0 to move the first finding to Failed.</p>
+    </section>
+
+    <section class="settings-section">
       <h3>${renderSettingsGuideLabel("Rules", "governance-rules")}</h3>
       <p class="muted small" style="margin-top:0">
         One-line rules the Governance agent applies before and after implementation.
@@ -113,7 +122,9 @@ function renderSettingsGovernanceTab(gov) {
         <p class="muted small" style="color:var(--warn)">
           Governance is incomplete. Goal execution continues until Product and Constitution are both filled in.
         </p>`}
-      ${renderGovernanceRules(gov.rules || [])}
+      <div data-governance-rules-revision="${htmlEscape(String(gov.rules_revision || 0))}">
+        ${renderGovernanceRules(gov.rules || [])}
+      </div>
       <div class="actions" style="margin-top:10px">
         <button class="secondary" id="s-governance-add-rule" data-testid="governance-add-rule">Add rule</button>
         <button class="secondary" id="s-governance-generate" data-testid="governance-generate">Generate rules</button>
@@ -122,11 +133,29 @@ function renderSettingsGovernanceTab(gov) {
 }
 
 async function autosaveSettingsGovernance() {
-  await api("PATCH", "/api/governance", {
-    product: $("#s-governance-product").value,
-    constitution: $("#s-governance-constitution").value,
-    rules: collectGovernanceRules(),
-  });
+  const revisionRoot = $("[data-governance-rules-revision]");
+  try {
+    const saved = await api("PATCH", "/api/governance", {
+      product: $("#s-governance-product").value,
+      constitution: $("#s-governance-constitution").value,
+      rules: collectGovernanceRules(),
+      rules_revision: Number.parseInt(revisionRoot?.dataset.governanceRulesRevision || "0", 10),
+      max_automatic_round_retries: Math.max(0, Number.parseInt($("#s-governance-max-retries").value || "5", 10)),
+    });
+    if (revisionRoot) revisionRoot.dataset.governanceRulesRevision = String(saved.rules_revision || 0);
+    $$(".governance-rule-input").forEach((input, index) => {
+      const rule = (saved.rules || [])[index];
+      if (!rule) return;
+      input.value = rule.text || "";
+      input.dataset.ruleId = rule.id || "";
+      input.dataset.created = rule.created || "";
+      input.dataset.source = rule.source || "manual";
+    });
+    return saved;
+  } catch (e) {
+    if (e.status === 409) await refreshSettingsTab("governance", { force: true });
+    throw e;
+  }
 }
 
 function bindSettingsGovernanceTab(tabSlug = "governance") {
@@ -135,7 +164,7 @@ function bindSettingsGovernanceTab(tabSlug = "governance") {
   bindSettingsMarkdownFields(root);
   bindSettingsAutosave(
     root,
-    "#s-governance-product, #s-governance-constitution, .governance-rule-input",
+    "#s-governance-product, #s-governance-constitution, #s-governance-max-retries, .governance-rule-input",
     autosaveSettingsGovernance,
   );
   bindOnce($("#s-governance-add-rule"), "click", () => addGovernanceRuleRow());

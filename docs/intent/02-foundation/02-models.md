@@ -24,10 +24,23 @@ Models should be the stable center of the system. Surfaces may rename controls, 
 Current implementation details that matter to intent:
 
 - `Goal` and `Feature` are explicit Rust model types.
-- Goal statuses are named workflow states: backlog, todo, in-progress, qa, ready-merge, build, review, done, failed, and cancelled.
+- Goal statuses are named workflow states: backlog, todo, plan, implement, quality, governance, review, done, failed, and cancelled. Legacy status names are accepted only while reading or migrating older records.
 - Goals can belong to Features with an order, letting Refine advance ordered work without forcing every Goal into a sequence.
 - Active work is owned by a node so distributed or multi-instance operation can be reasoned about explicitly.
 - Projections exist so the system can stay fast without replacing flat files as the source of truth.
+- Scheduler indexes should scale with active work rather than total project
+  history. Read projections should keep a bounded per-record working set and
+  load deep searchable text only when a query needs it.
+- A Goal Round may carry a versioned `implementation_plan`. It binds proposal,
+  independent criticism, final checklist, phase/process/Git evidence, failures,
+  and implementation discrepancies to the exact Round, pinned context digest,
+  Goal/Round context, implementation and target branches, and base commit.
+  The proposal and final plan remain human-readable: one plain-language,
+  top-down paragraph explaining what will change and why, followed by any
+  number of stable, one-line checklist items that clearly advance that plan and
+  capture concerns that cannot safely be ignored. Detailed verification belongs
+  to execution evidence. Missing planning evidence remains valid for legacy
+  records.
 
 Future model changes should preserve these properties: human readability, agent readability, stable workflow meaning, and clear node ownership for active work.
 

@@ -9,8 +9,11 @@ fn unique_temp_dir(name: &str) -> PathBuf {
 #[test]
 fn workflow_goal_agent_prompt_excludes_interactive_checkout_guidance() {
     let spec = "# Goal Agent Specification\n\n## Latest Round\n\n### Request\n\nLATEST_SENTINEL";
-    let prompt =
-        goal_agent_protocol_prompt(spec, Path::new("/runtime/processes/goal-agent.signal.json"));
+    let prompt = goal_agent_protocol_prompt(
+        spec,
+        Path::new("/runtime/processes/goal-agent.signal.json"),
+        None,
+    );
 
     assert!(!prompt.contains("Active Refine executable"));
     assert!(!prompt.contains("checkout-local `./r`"));
@@ -23,6 +26,186 @@ fn workflow_goal_agent_prompt_excludes_interactive_checkout_guidance() {
             < prompt.find("# Goal Agent Specification").unwrap()
     );
     assert!(prompt.trim_end().ends_with("LATEST_SENTINEL"));
+}
+
+#[test]
+fn planning_sessions_require_the_phase_specific_structured_result() {
+    let signal = Path::new("/runtime/processes/goal-agent.signal.json");
+    let plan = goal_agent_protocol_prompt("PLAN_SENTINEL", signal, Some("plan"));
+    let criticize = goal_agent_protocol_prompt("CRITICIZE_SENTINEL", signal, Some("criticize"));
+    let revise = goal_agent_protocol_prompt("REVISE_SENTINEL", signal, Some("revise"));
+
+    for prompt in [&plan, &criticize, &revise] {
+        assert!(prompt.contains("required `planning_result`"));
+        assert!(prompt.contains("never omitted or quoted as a string"));
+        assert!(prompt.contains("zero-based integer indexes"));
+        assert!(prompt.contains("never use names"));
+        assert!(prompt.contains("\"guidance_applied\":[0]"));
+        assert!(!prompt.contains("implementation_evidence"));
+        assert!(prompt.contains(signal.to_str().unwrap()));
+        assert!(!prompt.contains("{{"));
+    }
+    assert!(plan.contains("\"checklist\""));
+    assert!(criticize.contains("\"findings\""));
+    assert!(revise.contains("\"criticism_resolutions\""));
+}
+
+#[test]
+fn completion_signal_rejects_guidance_names_as_a_schema_error() {
+    let root = unique_temp_dir("goal-agent-invalid-guidance-signal");
+    fs::create_dir_all(&root).unwrap();
+    let signal_path = root.join("goal-agent.signal.json");
+    fs::write(
+        &signal_path,
+        r#"{"state":"completed","message":"planned","guidance_applied":["Intent and architecture"],"planning_result":{"summary":"Plan summary.","checklist":[]}}"#,
+    )
+    .unwrap();
+
+    let error = SignalReader::default().take(&signal_path).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("does not match the required schema")
+    );
+    assert!(error.to_string().contains("guidance_applied"));
+    assert!(signal_path.is_file());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn completion_signal_allows_partial_json_only_for_the_write_grace_period() {
+    let root = unique_temp_dir("goal-agent-partial-signal");
+    fs::create_dir_all(&root).unwrap();
+    let signal_path = root.join("goal-agent.signal.json");
+    fs::write(&signal_path, r#"{"state":"completed"#).unwrap();
+    let mut reader = SignalReader::new(Duration::ZERO);
+
+    assert!(reader.take(&signal_path).unwrap().is_none());
+    let error = reader.take(&signal_path).unwrap_err();
+
+    assert!(error.to_string().contains("remained invalid JSON"));
+    assert!(signal_path.is_file());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn planning_session_returns_the_structured_result_from_its_completion_signal() {
+    let _env_guard = crate::tools::host::agent_providers::smoke_ai_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = unique_temp_dir("goal-agent-planning-result");
+    let runtime_root = root.join("run/8082");
+    let app_root = root.join("app");
+    let provider = root.join("smoke-ai");
+    fs::create_dir_all(&app_root).unwrap();
+    fs::write(
+        &provider,
+        "#!/bin/sh\nprintf '%s\\n' '{\"state\":\"completed\",\"message\":\"planned\",\"guidance_applied\":[],\"planning_result\":{\"summary\":\"Change the boundary so debug workers use the active executable.\",\"checklist\":[{\"id\":\"P1\",\"description\":\"Pass the active executable to supervised workers.\"}]}}' > \"$REFINE_AGENT_SIGNAL_PATH\"\nsleep 10\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&provider).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&provider, permissions).unwrap();
+    let previous = std::env::var_os("REFINE_SMOKE_AI_PATH");
+    unsafe {
+        std::env::set_var("REFINE_SMOKE_AI_PATH", &provider);
+    }
+
+    let mut metadata = Map::new();
+    metadata.insert("goal_id".to_string(), json!("GOAL-PLAN"));
+    metadata.insert("implementation_phase".to_string(), json!("plan"));
+    let result = run_goal_agent(
+        GoalAgentLaunch {
+            runtime_root,
+            cwd: app_root,
+            provider: "smoke-ai".to_string(),
+            prompt: "plan".to_string(),
+            metadata,
+            completion_timeout: None,
+        },
+        |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(result.output, "planned");
+    assert_eq!(
+        result.planning_result,
+        Some(json!({
+            "summary": "Change the boundary so debug workers use the active executable.",
+            "checklist": [{
+                "id": "P1",
+                "description": "Pass the active executable to supervised workers."
+            }]
+        }))
+    );
+
+    unsafe {
+        if let Some(previous) = previous {
+            std::env::set_var("REFINE_SMOKE_AI_PATH", previous);
+        } else {
+            std::env::remove_var("REFINE_SMOKE_AI_PATH");
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn goal_agent_hard_cap_terminates_a_session_without_a_completion_signal() {
+    let _env_guard = crate::tools::host::agent_providers::smoke_ai_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = unique_temp_dir("goal-agent-completion-timeout");
+    let runtime_root = root.join("run/8082");
+    let app_root = root.join("app");
+    let provider = root.join("smoke-ai");
+    fs::create_dir_all(&app_root).unwrap();
+    fs::write(&provider, "#!/bin/sh\nsleep 10\n").unwrap();
+    let mut permissions = fs::metadata(&provider).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&provider, permissions).unwrap();
+    let previous = std::env::var_os("REFINE_SMOKE_AI_PATH");
+    unsafe {
+        std::env::set_var("REFINE_SMOKE_AI_PATH", &provider);
+    }
+
+    let started_at = std::time::Instant::now();
+    let error = run_goal_agent(
+        GoalAgentLaunch {
+            runtime_root: runtime_root.clone(),
+            cwd: app_root,
+            provider: "smoke-ai".to_string(),
+            prompt: "test timeout".to_string(),
+            metadata: Map::from_iter([("goal_id".to_string(), json!("GOAL-TIMEOUT"))]),
+            completion_timeout: Some(Duration::from_millis(200)),
+        },
+        |_| {},
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("did not produce a valid completion signal")
+    );
+    assert!(started_at.elapsed() < Duration::from_secs(2));
+    assert!(
+        FileProcessSupervisor::new(&runtime_root)
+            .list()
+            .unwrap()
+            .is_empty()
+    );
+
+    unsafe {
+        if let Some(previous) = previous {
+            std::env::set_var("REFINE_SMOKE_AI_PATH", previous);
+        } else {
+            std::env::remove_var("REFINE_SMOKE_AI_PATH");
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -50,8 +233,11 @@ fn workflow_goal_agent_providers_receive_the_same_composed_specification() {
     };
     let spec =
         "# Goal Agent Specification\n\n## Latest Round\n\n### Request\n\nLATEST_PROVIDER_SENTINEL";
-    let prompt =
-        goal_agent_protocol_prompt(spec, Path::new("/runtime/processes/goal-agent.signal.json"));
+    let prompt = goal_agent_protocol_prompt(
+        spec,
+        Path::new("/runtime/processes/goal-agent.signal.json"),
+        None,
+    );
 
     for provider in [
         "claude",
@@ -112,6 +298,7 @@ fn workflow_goal_agent_is_discoverable_and_attachable_while_running() {
                 provider: "smoke-ai".to_string(),
                 prompt: "test".to_string(),
                 metadata,
+                completion_timeout: None,
             },
             |_| {},
         )
@@ -161,6 +348,7 @@ fn workflow_goal_agent_is_discoverable_and_attachable_while_running() {
             provider: "smoke-ai".to_string(),
             prompt: "duplicate".to_string(),
             metadata: duplicate_metadata,
+            completion_timeout: None,
         },
         |_| {},
     );
@@ -224,6 +412,7 @@ fn workflow_goal_agent_surfaces_needs_input_and_continues_same_session() {
                 provider: "smoke-ai".to_string(),
                 prompt: "test".to_string(),
                 metadata,
+                completion_timeout: None,
             },
             |attention| {
                 let _ = attention_tx.send(attention);
@@ -291,10 +480,13 @@ fn workflow_goal_agent_handoff_survives_dead_process_recovery() {
             provider: "smoke-ai".to_string(),
             prompt: "test".to_string(),
             metadata,
+            completion_timeout: None,
         },
         |_| {},
-        |supervisor, process| {
+        |supervisor, process, settlement| {
             assert!(!FileProcessSupervisor::process_is_alive(process)?);
+            assert_eq!(settlement.process_id, process.id);
+            assert!(settlement.output.contains("transcript survives recovery"));
             let stdout_path = Path::new(process.stdout_path.as_deref().unwrap());
             assert!(stdout_path.is_file());
 
@@ -401,6 +593,7 @@ fn workflow_goal_agent_pty_uses_configured_final_environment_for_file_transport(
             provider: "smoke-ai".to_string(),
             prompt,
             metadata: Map::from_iter([("goal_id".to_string(), json!("GOAL-FINAL-ENV"))]),
+            completion_timeout: None,
         },
         |_| {},
     )
@@ -451,6 +644,7 @@ fn workflow_goal_agent_early_exec_failure_preserves_errno_and_cleans_channels() 
             provider: "smoke-ai".to_string(),
             prompt: "large launch failure ".to_string() + &"x".repeat(158_078),
             metadata: Map::from_iter([("goal_id".to_string(), json!("GOAL-EXEC-FAIL"))]),
+            completion_timeout: None,
         },
         |_| {},
     )
@@ -516,6 +710,7 @@ fn silent_goal_agent_remains_autonomous_without_requesting_input() {
             provider: "smoke-ai".to_string(),
             prompt: "test".to_string(),
             metadata,
+            completion_timeout: None,
         },
         |request| attention.push(request),
     )

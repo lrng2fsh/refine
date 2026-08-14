@@ -41,7 +41,9 @@ async function refreshSettings(options = {}) {
     return;
   }
   try {
+    const nodeGeneration = captureNodeContextGeneration();
     const data = await loadSettingsSurfaceData(surface, activeSlug);
+    if (!data || !isNodeContextGenerationCurrent(nodeGeneration)) return;
     drawSettingsSurface(surface, data, activeSlug);
   } catch (e) {
     const root = document.getElementById("settings-content");
@@ -71,7 +73,9 @@ async function refreshSettingsTab(slug, options = {}) {
     return;
   }
   try {
+    const nodeGeneration = captureNodeContextGeneration();
     const data = await loadSettingsSurfaceData(surface, activeSlug);
+    if (!data || !isNodeContextGenerationCurrent(nodeGeneration)) return;
     updateSettingsTabContent(
       activeSlug,
       renderSettingsTabBody(surface, activeSlug, data),
@@ -83,9 +87,11 @@ async function refreshSettingsTab(slug, options = {}) {
 }
 
 async function loadSettingsSurfaceData() {
+  const nodeGeneration = captureNodeContextGeneration();
   const surface = arguments[0] || settingsSurfaceForRoute();
   const activeSlug = arguments[1] || readSettingsTab(surface);
   const project = await api("GET", "/api/project/status");
+  if (!isNodeContextGenerationCurrent(nodeGeneration)) return null;
   state.project = project;
   updateActiveNodeLabel();
   if (project.attached === false) {
@@ -94,7 +100,7 @@ async function loadSettingsSurfaceData() {
   }
   const needs = settingsSurfaceDataNeeds(surface, activeSlug);
   const [
-    s, diag, reps, gov, quality, dash, nodes, guidance, performance, processes, releases,
+    s, diag, reps, gov, quality, dash, nodes, guidance, processes, releases, source,
   ] = await Promise.all([
     needs.settings ? api("GET", "/api/settings") : Promise.resolve({}),
     needs.diagnostics ? api("GET", "/api/diagnostics") : Promise.resolve({}),
@@ -104,12 +110,19 @@ async function loadSettingsSurfaceData() {
     needs.dashboard ? api("GET", "/api/dashboard") : Promise.resolve({}),
     needs.nodes ? api("GET", "/api/nodes") : Promise.resolve({}),
     needs.guidance ? api("GET", "/api/guidance") : Promise.resolve({}),
-    needs.performance ? api("GET", typeof performanceApiPath === "function"
-      ? performanceApiPath()
-      : "/api/performance") : Promise.resolve({}),
     needs.processes ? api("GET", "/api/processes") : Promise.resolve({}),
     needs.releases ? api("GET", "/api/system/releases") : Promise.resolve({}),
+    needs.source
+      ? api("GET", "/api/system/source", undefined, { recordError: false }).catch((error) => ({
+          source_update: {
+            enabled: false,
+            update_available: false,
+            title: error.message || "Refine update status unavailable",
+          },
+        }))
+      : Promise.resolve({}),
   ]);
+  if (!isNodeContextGenerationCurrent(nodeGeneration)) return null;
   state.project = project;
   state.reporters = reps.reporters || [];
   updateActiveNodeLabel();
@@ -138,10 +151,10 @@ async function loadSettingsSurfaceData() {
     activeNodeId,
     activeNodeLabel,
     guidanceItems: guidance.guidance || [],
-    performance: performance || {},
-    performanceBackend: (performance || {}).backend || (diag || {}).backend || {},
+    guidanceRevision: guidance.revision || 0,
     processes: processes || {},
     releases: releases.releases || { operations: [] },
+    source: source || {},
     cli: (settings.agent_cli || "claude").toLowerCase(),
     projectApps,
     currentProject,
@@ -160,27 +173,16 @@ function settingsSurfaceDataNeeds(surface, slug) {
     dashboard: false,
     nodes: false,
     guidance: false,
-    performance: false,
     processes: false,
     releases: false,
+    source: false,
   };
   if (surface === SETTINGS_SURFACES.settings) {
     if (slug === "releases") {
       needs.releases = true;
     } else if (slug === "processes") {
-      needs.settings = true;
-      needs.diagnostics = true;
-      needs.dashboard = true;
       needs.processes = true;
-    } else if (slug === "performance") {
-      needs.settings = true;
-      needs.diagnostics = true;
-      needs.reporters = true;
-      needs.governance = true;
-      needs.dashboard = true;
-      needs.nodes = true;
-      needs.guidance = true;
-      needs.performance = true;
+      needs.source = true;
     }
   } else if (surface === SETTINGS_SURFACES.node) {
     if (slug === "releases") {
@@ -194,19 +196,8 @@ function settingsSurfaceDataNeeds(surface, slug) {
       needs.settings = true;
       needs.nodes = true;
     } else if (slug === "processes") {
-      needs.settings = true;
-      needs.diagnostics = true;
-      needs.dashboard = true;
       needs.processes = true;
-    } else if (slug === "performance") {
-      needs.settings = true;
-      needs.diagnostics = true;
-      needs.reporters = true;
-      needs.governance = true;
-      needs.dashboard = true;
-      needs.nodes = true;
-      needs.guidance = true;
-      needs.performance = true;
+      needs.source = true;
     }
   } else if (surface === SETTINGS_SURFACES.project) {
     if (slug === "quality") {
@@ -244,8 +235,7 @@ function detachedSettingsSurfaceData(project = {}) {
     activeNodeId,
     activeNodeLabel,
     guidanceItems: [],
-    performance: {},
-    performanceBackend: {},
+    guidanceRevision: 0,
     processes: {
       runner_reachable: false,
       paused: false,
@@ -370,7 +360,7 @@ function setSettingsControlValue(el, value) {
     el.setAttribute("aria-pressed", enabled ? "true" : "false");
     el.classList.toggle("warn", !enabled);
     if (el.id === "s-quality-enabled") {
-      el.textContent = enabled ? "QA enabled" : "QA disabled";
+      el.textContent = enabled ? "Quality enabled" : "Quality disabled";
     }
   } else if (el instanceof HTMLInputElement && (el.type === "checkbox" || el.type === "radio")) {
     el.checked = value === "1";
@@ -730,7 +720,6 @@ const SETTINGS_SURFACES = {
     storageKey: "refine_system_tab",
     tabs: [
       { slug: "processes", label: "Processes" },
-      { slug: "performance", label: "Performance" },
       { slug: "releases", label: "Refine (dev)" },
     ],
   },
@@ -739,10 +728,9 @@ const SETTINGS_SURFACES = {
     basePath: "#/node",
     storageKey: "refine_node_tab",
     tabs: [
+      { slug: "processes", label: "Processes" },
       { slug: "application", label: "Application" },
       { slug: "reporters", label: "Reporters" },
-      { slug: "processes", label: "Processes" },
-      { slug: "performance", label: "Performance" },
       { slug: "target-app", label: "Target App Config" },
       { slug: "runtime", label: "Runtime Config" },
       { slug: "releases", label: "Refine (dev)" },
@@ -953,10 +941,7 @@ function renderSettingsTabBody(surface, slug, data) {
       return renderSettingsReleasesTab(data.releases);
     }
     if (slug === "processes") {
-      return renderProcessesTab(data.processes, data.s, data.diag, data.dash);
-    }
-    if (slug === "performance") {
-      return renderSettingsPerformanceTab(data.performance, data.performanceBackend);
+      return renderProcessesTab(data.processes, data.source);
     }
   }
   if (surface === SETTINGS_SURFACES.node) {
@@ -964,10 +949,7 @@ function renderSettingsTabBody(surface, slug, data) {
       return renderSettingsReleasesTab(data.releases);
     }
     if (slug === "processes") {
-      return renderProcessesTab(data.processes, data.s, data.diag, data.dash);
-    }
-    if (slug === "performance") {
-      return renderSettingsPerformanceTab(data.performance, data.performanceBackend);
+      return renderProcessesTab(data.processes, data.source);
     }
     if (slug === "reporters") {
       return renderSettingsReportersTab(data.reps, data.activeNodeLabel);
@@ -1056,24 +1038,10 @@ function bindSettingsTabBody(surface, slug, data) {
   }
   if (surface === SETTINGS_SURFACES.settings) {
     if (slug === "releases") bindSettingsReleasesTab(data.releases);
-    else if (slug === "processes") bindSettingsProcessesTab(data.s);
-    else if (slug === "performance") {
-      bindSettingsPerformanceTab(
-        data.s, data.diag, data.reps, null, data.gov,
-        data.dash, { nodes: data.nodes, counts: data.nodeCounts },
-        { guidance: data.guidanceItems }, data.performanceBackend,
-      );
-    }
+    else if (slug === "processes") bindSettingsProcessesTab(data.source);
   } else if (surface === SETTINGS_SURFACES.node) {
     if (slug === "releases") bindSettingsReleasesTab(data.releases);
-    else if (slug === "processes") bindSettingsProcessesTab(data.s);
-    else if (slug === "performance") {
-      bindSettingsPerformanceTab(
-        data.s, data.diag, data.reps, null, data.gov,
-        data.dash, { nodes: data.nodes, counts: data.nodeCounts },
-        { guidance: data.guidanceItems }, data.performanceBackend,
-      );
-    }
+    else if (slug === "processes") bindSettingsProcessesTab(data.source);
     else if (slug === "reporters") bindSettingsReportersTab();
     else if (slug === "application") {
       bindSettingsApplicationTab(data.currentProject);
@@ -1084,7 +1052,7 @@ function bindSettingsTabBody(surface, slug, data) {
   } else if (surface === SETTINGS_SURFACES.project) {
     if (slug === "quality") bindSettingsQualityTab();
     else if (slug === "governance") bindSettingsGovernanceTab();
-    else if (slug === "guidance") bindSettingsGuidanceTab(data.guidanceItems);
+    else if (slug === "guidance") bindSettingsGuidanceTab(data.guidanceItems, "guidance", data.guidanceRevision);
   }
 }
 

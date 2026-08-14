@@ -124,7 +124,7 @@ pub enum GoalAction {
         #[arg(long)]
         edit_latest: bool,
     },
-    /// Queue a Goal for the agent workflow: moves backlog work to todo so automation can claim it.
+    /// Queue a Goal for the agent workflow: moves backlog work to todo so automation can start it.
     Start {
         /// Goal id.
         id: String,
@@ -140,37 +140,19 @@ pub enum GoalAction {
         #[cfg_attr(not(test), arg(skip = None))]
         target_root: Option<PathBuf>,
     },
-    /// Retry a failed stage for a Goal: --stage quality returns it to QA, --stage merge to ready-merge.
+    /// Retry a failed stage for a Goal: --stage quality or --stage governance.
     Retry {
         /// Goal id.
         id: String,
         #[cfg_attr(test, arg(long, hide = true))]
         #[cfg_attr(not(test), arg(skip = None))]
         target_root: Option<PathBuf>,
-        /// Stage to retry: "quality" (back to QA) or "merge" (back to ready-merge).
+        /// Stage to retry: "quality" or "governance".
         #[arg(long, default_value = "quality")]
         stage: String,
     },
     /// Approve a reviewed Goal and mark it done.
     Approve {
-        /// Goal id.
-        id: String,
-        #[cfg_attr(test, arg(long, hide = true))]
-        #[cfg_attr(not(test), arg(skip = None))]
-        target_root: Option<PathBuf>,
-    },
-    /// Internal verification alias retained for QA and compatibility.
-    #[command(hide = true)]
-    Verify {
-        /// Goal id.
-        id: String,
-        #[cfg_attr(test, arg(long, hide = true))]
-        #[cfg_attr(not(test), arg(skip = None))]
-        target_root: Option<PathBuf>,
-    },
-    /// Deprecated alias for approving a reviewed Goal.
-    #[command(hide = true)]
-    Merge {
         /// Goal id.
         id: String,
         #[cfg_attr(test, arg(long, hide = true))]

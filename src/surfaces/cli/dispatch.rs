@@ -1,8 +1,12 @@
 mod agents;
-mod cluster;
+mod config;
+mod config_input;
+#[cfg(test)]
+pub(crate) use config::dispatch_config;
 mod daemon_transport;
 mod discovery;
 mod features;
+mod fleet;
 mod goals;
 mod logs;
 mod nodes;
@@ -17,9 +21,11 @@ use system::{port_status_with_processes, selected_process_ports, stop_system_pro
 #[cfg(not(test))]
 use agents::dispatch_agent_daemon;
 #[cfg(not(test))]
-use cluster::dispatch_cluster_daemon;
+use config::dispatch_config as dispatch_config_daemon;
 #[cfg(not(test))]
 use features::dispatch_feature_daemon;
+#[cfg(not(test))]
+use fleet::dispatch_fleet_daemon;
 #[cfg(not(test))]
 use goals::dispatch_goal_daemon;
 #[cfg(not(test))]
@@ -41,6 +47,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::process::Command;
+use std::sync::Arc;
 #[cfg(not(test))]
 use std::sync::mpsc;
 #[cfg(not(test))]
@@ -65,13 +72,17 @@ use crate::surfaces::web_server::{
 use crate::tools::host::agent_providers::{
     AgentProviderService, HostAgentProviderService, ProviderInvocation,
 };
-use crate::tools::host::cluster::{ClusterService, FileClusterService, NodeRemoteUpdate};
+use crate::tools::host::checkout::RefineCheckoutPaths;
 use crate::tools::host::daemon_lifecycle::{
     DaemonLifecycleAction, FileHostDaemonLifecycleService, execute_daemon_lifecycle,
     uninstall_daemon_installation,
 };
 use crate::tools::host::deployed_update::{
-    DeployedUpdateOptions, FileDeployedUpdateHost, discover_refine_checkout, run_deployed_update,
+    DeployedUpdateOptions, FileDeployedUpdateHost, discover_refine_checkout,
+    resolve_agent_provider, run_deployed_update,
+};
+use crate::tools::host::fleet::{
+    FLEET_RUNBOOK_PATH, FileFleetService, FleetService, NodeRemoteUpdate, fleet_manage_prompt,
 };
 use crate::tools::host::git_sync::FileGitSyncService;
 use crate::tools::host::installation::{FileInstallationService, InstallationService};
@@ -84,15 +95,15 @@ use crate::tools::observability::diagnostics::{DiagnosticsService, FileDiagnosti
 use crate::tools::observability::processes::FileProcessStatusService;
 use crate::tools::observability::support_bundle::{FileSupportBundleService, SupportBundleService};
 use crate::tools::product::goal_exports::FileGoalExportService;
+use crate::tools::product::governance_integration::FileGovernanceIntegrationService;
 use crate::tools::product::imports::FileImportService;
-use crate::tools::product::merging::FileMergerService;
 use crate::tools::product::next_actions::FileNextActionsService;
 use crate::tools::product::nodes::FileNodeRegistryService;
 use crate::tools::product::process_control::FileProcessControlService;
-use crate::tools::product::project_registry::{FileProjectRegistryService, ProjectRegistryService};
-use crate::tools::product::project_state::{
-    FileProjectStateStore, ProjectStateStore, ProjectionQuery, ProjectionSnapshot,
+use crate::tools::product::project_projection::{
+    FileProjectProjectionStore, ProjectionQuery, ProjectionSnapshot,
 };
+use crate::tools::product::project_registry::{FileProjectRegistryService, ProjectRegistryService};
 use crate::tools::product::todos::FileTodoService;
 use crate::tools::product::work_items::FileWorkItemService;
 use crate::tools::product::worktree_cleanup::{FileWorktreeCleanupService, WorktreeCleanupOptions};
@@ -116,13 +127,37 @@ pub fn dispatch(cli: Cli) -> RefineResult<()> {
 
     #[cfg(not(test))]
     let cli = match cli.command {
+        Commands::Config { action } => {
+            let result = dispatch_config_daemon(action).map_err(config::structured_config_error)?;
+            print_json(&result);
+            return Ok(());
+        }
         Commands::Project { action } => return dispatch_project_daemon(action),
         Commands::Goal { action } => return dispatch_goal_daemon(action),
         Commands::Feature { action } => return dispatch_feature_daemon(action),
         Commands::Todo { action } => return dispatch_todo(action),
         Commands::Workflow { action } => return dispatch_workflow_daemon(action),
         Commands::Node { action } => return dispatch_node_daemon(action),
-        Commands::Cluster { action } => return dispatch_cluster_daemon(action),
+        Commands::Fleet {
+            action: FleetAction::Request(words),
+        } => return fleet::dispatch_request(words),
+        Commands::Fleet {
+            action:
+                FleetAction::Manage {
+                    request,
+                    provider,
+                    runtime_root,
+                    port,
+                },
+        } => return fleet::dispatch_manage(request, provider, runtime_root, port),
+        Commands::Fleet {
+            action:
+                FleetAction::Distribute {
+                    instructions: Some(instructions),
+                    ..
+                },
+        } => return fleet::dispatch_distribute_instructions(instructions),
+        Commands::Fleet { action } => return dispatch_fleet_daemon(action),
         Commands::Log { action } => return dispatch_log_daemon(action),
         Commands::Agent { action } => return dispatch_agent_daemon(action),
         Commands::System {
@@ -136,10 +171,11 @@ pub fn dispatch(cli: Cli) -> RefineResult<()> {
     };
 
     match cli.command {
+        command @ Commands::Config { .. } => config::dispatch_command(command),
         command @ Commands::Website { .. } => website::dispatch_command(command),
         command @ Commands::System { .. } => system::dispatch_command(command),
         command @ Commands::Node { .. } => nodes::dispatch_command(command),
-        command @ Commands::Cluster { .. } => cluster::dispatch_command(command),
+        command @ Commands::Fleet { .. } => fleet::dispatch_command(command),
         command @ Commands::Next { .. } => discovery::dispatch_command(command),
         command @ Commands::Commands => discovery::dispatch_command(command),
         command @ Commands::Log { .. } => logs::dispatch_command(command),
@@ -161,7 +197,14 @@ pub(super) fn run_system_start(
     once: bool,
     foreground: bool,
 ) -> RefineResult<()> {
-    let runtime_root = absolute_cli_path(runtime_root)?;
+    #[cfg(not(test))]
+    let product_paths = RefineCheckoutPaths::discover()?;
+    #[cfg(test)]
+    let product_paths: Option<RefineCheckoutPaths> = None;
+    #[cfg(not(test))]
+    let runtime_root = resolve_system_runtime_root_for_paths(runtime_root, &product_paths)?;
+    #[cfg(test)]
+    let runtime_root = resolve_system_runtime_root(runtime_root)?;
     let cache_dir = cache_dir.map(absolute_cli_path).transpose()?;
     let static_root = static_root.map(absolute_cli_path).transpose()?;
     if !foreground && !once {
@@ -253,7 +296,8 @@ pub(super) fn run_system_start(
             let cache_root = cache_dir
                 .clone()
                 .unwrap_or_else(|| port_runtime_root.join("cache"));
-            let store = FileProjectStateStore::with_runtime_root(&refine_dir, &port_runtime_root);
+            let store =
+                FileProjectProjectionStore::with_runtime_root(&refine_dir, &port_runtime_root);
             store.load_or_refresh_projection(&cache_root)?
         } else {
             eprintln!("refine: no active project; using empty project cache");
@@ -278,16 +322,26 @@ pub(super) fn run_system_start(
     if let Some(degradation) = project_degradation {
         status.degraded_integrations.push(degradation);
     }
-    let mut daemon = LocalHttpDaemon {
-        server: InProcessWebServer {
+    let mut daemon = LocalHttpDaemon::new(
+        InProcessWebServer {
             status: status.clone(),
             projection: snapshot,
             target_root: None,
             app_registry_root: Some(runtime_root.clone()),
             runtime_root: Some(port_runtime_root),
+            product_paths: {
+                #[cfg(not(test))]
+                {
+                    Some(product_paths)
+                }
+                #[cfg(test)]
+                {
+                    product_paths
+                }
+            },
         },
-        static_root: static_root.or_else(default_static_root),
-    };
+        static_root.or_else(default_static_root),
+    );
     if let Err(error) = daemon.recover_runtime_state_with_progress(|message| {
         lifecycle.record_startup_progress(actual_port, message);
         eprintln!("refine: {message}");
@@ -296,7 +350,8 @@ pub(super) fn run_system_start(
         return Err(error);
     }
     let status = lifecycle.mark_ready(status)?;
-    daemon.server.status = status;
+    Arc::make_mut(&mut daemon.server).status = status;
+    daemon.warm_caches_in_background();
     eprintln!("running foreground Refine daemon at http://{addr}");
     if once {
         daemon.serve_once(listener)?;
@@ -323,6 +378,7 @@ pub(super) fn system_status_response(runtime_root: PathBuf) -> RefineResult<serd
         "current_version": env!("CARGO_PKG_VERSION"),
         "launch_mode": current_launch_mode(),
         "executable_path": current_launch_executable(),
+        "runtime_root": runtime_root,
         "api_contract_version": API_CONTRACT_VERSION,
         "running_ports": running_ports,
         "ports": ports,
@@ -385,6 +441,22 @@ pub(super) fn absolute_cli_path(path: PathBuf) -> RefineResult<PathBuf> {
         })?;
         Ok(cwd.join(path))
     }
+}
+
+pub(super) fn resolve_system_runtime_root(path: PathBuf) -> RefineResult<PathBuf> {
+    #[cfg(test)]
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    let paths = RefineCheckoutPaths::discover()?;
+    resolve_system_runtime_root_for_paths(path, &paths)
+}
+
+pub(super) fn resolve_system_runtime_root_for_paths(
+    path: PathBuf,
+    paths: &RefineCheckoutPaths,
+) -> RefineResult<PathBuf> {
+    paths.resolve_runtime_compatibility(&path)
 }
 
 #[cfg(not(test))]
@@ -472,8 +544,41 @@ fn refine_dir_for_target_root(target_root: &Path) -> RefineResult<PathBuf> {
     prepare_refine_dir(target_root)
 }
 
+/// Work-item service for direct (daemonless) CLI commands. Backed by the
+/// snapshot cache under the state directory's `runtime/` so a single command
+/// parses one snapshot instead of rebuilding the projection from every record.
+fn direct_work_item_service(target_root: &Path) -> RefineResult<FileWorkItemService> {
+    let refine_dir = refine_dir_for_target_root(target_root)?;
+    let cache_dir = refine_dir.join("runtime/cache");
+    Ok(FileWorkItemService::with_snapshot_cache(refine_dir, cache_dir))
+}
+
 pub(super) fn explicit_target_root_path(command: &Commands) -> Option<&PathBuf> {
     match command {
+        Commands::Config { action } => match action {
+            ConfigAction::Show { target_root, .. } => target_root.as_ref(),
+            ConfigAction::Settings { action } => match action {
+                ConfigSettingsAction::Show { target_root }
+                | ConfigSettingsAction::Set { target_root, .. } => target_root.as_ref(),
+            },
+            ConfigAction::Quality { action } => match action {
+                ConfigQualityAction::Show { target_root }
+                | ConfigQualityAction::Set { target_root, .. } => target_root.as_ref(),
+            },
+            ConfigAction::Governance { action } => match action {
+                ConfigGovernanceAction::Show { target_root }
+                | ConfigGovernanceAction::Set { target_root, .. }
+                | ConfigGovernanceAction::GenerateRules { target_root, .. } => target_root.as_ref(),
+            },
+            ConfigAction::Guidance { action } => match action {
+                ConfigGuidanceAction::List { target_root }
+                | ConfigGuidanceAction::Add { target_root, .. }
+                | ConfigGuidanceAction::Edit { target_root, .. }
+                | ConfigGuidanceAction::Enable { target_root, .. }
+                | ConfigGuidanceAction::Disable { target_root, .. }
+                | ConfigGuidanceAction::Remove { target_root, .. } => target_root.as_ref(),
+            },
+        },
         Commands::Project { action } => match action {
             ProjectAction::Status { target_root, .. }
             | ProjectAction::Attach { target_root, .. }
@@ -502,8 +607,6 @@ pub(super) fn explicit_target_root_path(command: &Commands) -> Option<&PathBuf> 
             | GoalAction::Cancel { target_root, .. }
             | GoalAction::Retry { target_root, .. }
             | GoalAction::Approve { target_root, .. }
-            | GoalAction::Verify { target_root, .. }
-            | GoalAction::Merge { target_root, .. }
             | GoalAction::Undo { target_root, .. }
             | GoalAction::Delete { target_root, .. }
             | GoalAction::AssignFeature { target_root, .. }
@@ -550,20 +653,21 @@ pub(super) fn explicit_target_root_path(command: &Commands) -> Option<&PathBuf> 
             | NodeAction::Transfer { target_root, .. } => target_root.as_ref(),
             NodeAction::Init { .. } => None,
         },
-        Commands::Cluster { action } => match action {
-            ClusterAction::List { target_root }
-            | ClusterAction::Show { target_root, .. }
-            | ClusterAction::AddNode { target_root, .. }
-            | ClusterAction::EditNode { target_root, .. }
-            | ClusterAction::EnableNode { target_root, .. }
-            | ClusterAction::DisableNode { target_root, .. }
-            | ClusterAction::RemoveNode { target_root, .. }
-            | ClusterAction::Bootstrap { target_root, .. }
-            | ClusterAction::Distribute { target_root, .. }
-            | ClusterAction::Sync { target_root }
-            | ClusterAction::Run { target_root, .. }
-            | ClusterAction::Transfer { target_root, .. }
-            | ClusterAction::Maintenance { target_root } => target_root.as_ref(),
+        Commands::Fleet { action } => match action {
+            FleetAction::List { target_root }
+            | FleetAction::Show { target_root, .. }
+            | FleetAction::AddNode { target_root, .. }
+            | FleetAction::EditNode { target_root, .. }
+            | FleetAction::EnableNode { target_root, .. }
+            | FleetAction::DisableNode { target_root, .. }
+            | FleetAction::RemoveNode { target_root, .. }
+            | FleetAction::Bootstrap { target_root, .. }
+            | FleetAction::Distribute { target_root, .. }
+            | FleetAction::Sync { target_root }
+            | FleetAction::Run { target_root, .. }
+            | FleetAction::Transfer { target_root, .. }
+            | FleetAction::Maintenance { target_root } => target_root.as_ref(),
+            FleetAction::Manage { .. } | FleetAction::Request(_) => None,
         },
         Commands::Log { action } => match action {
             LogAction::List { target_root, .. }
@@ -580,6 +684,7 @@ pub(super) fn explicit_target_root_path(command: &Commands) -> Option<&PathBuf> 
         Commands::System { action } => match action {
             SystemAction::Doctor { target_root, .. } => target_root.as_ref(),
             SystemAction::Install { .. }
+            | SystemAction::Performance { .. }
             | SystemAction::Repair { .. }
             | SystemAction::Update { .. }
             | SystemAction::ReleasePlan { .. }
@@ -588,6 +693,8 @@ pub(super) fn explicit_target_root_path(command: &Commands) -> Option<&PathBuf> 
             | SystemAction::SourceStatus { .. }
             | SystemAction::SourcePromote { .. }
             | SystemAction::SourcePromoteHelper { .. }
+            | SystemAction::SourceUpgradeCapability { .. }
+            | SystemAction::SourceCheckWorker { .. }
             | SystemAction::DaemonLifecycleHelper { .. }
             | SystemAction::RunnerWorker { .. }
             | SystemAction::Rollback { .. }

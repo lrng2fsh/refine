@@ -20,72 +20,6 @@ impl FileOperationRegistry {
             .join(format!("{operation_id}.logs.jsonl"))
     }
 
-    pub(super) fn workflow_cancellation_path(&self, execution_id: &str) -> PathBuf {
-        let encoded = execution_id
-            .as_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        self.operations_dir()
-            .join(".workflow-cancellations")
-            .join(format!("{encoded}.json"))
-    }
-
-    pub(super) fn workflow_cancellation(&self, execution_id: &str) -> RefineResult<Option<Value>> {
-        let path = self.workflow_cancellation_path(execution_id);
-        match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-                RefineError::Serialization(format!(
-                    "failed to parse workflow cancellation {}: {error}",
-                    path.display()
-                ))
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(RefineError::Io(format!(
-                "failed to read workflow cancellation {}: {error}",
-                path.display()
-            ))),
-        }
-    }
-
-    pub(super) fn ensure_request_execution_active(&self, request: &Value) -> RefineResult<()> {
-        let Some(execution_id) = request
-            .get("execution_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|execution_id| !execution_id.is_empty())
-        else {
-            return Ok(());
-        };
-        if self.workflow_cancellation(execution_id)?.is_some() {
-            return Err(RefineError::Conflict(format!(
-                "Workflow execution {execution_id} was cancelled before operation registration"
-            )));
-        }
-        Ok(())
-    }
-
-    pub(super) fn persist_workflow_cancellation(&self, execution_id: &str) -> RefineResult<Value> {
-        let cancellation = json!({
-            "execution_id": execution_id,
-            "cancelled_at": now_timestamp(),
-            "error": {
-                "code": "workflow_execution_cancelled",
-                "message": format!(
-                    "Workflow execution {execution_id} was cancelled before or while an operation was active"
-                ),
-                "execution_id": execution_id
-            }
-        });
-        let encoded = serde_json::to_vec_pretty(&cancellation).map_err(|error| {
-            RefineError::Serialization(format!(
-                "failed to encode workflow cancellation for {execution_id}: {error}"
-            ))
-        })?;
-        replace_file_durably(&self.workflow_cancellation_path(execution_id), &encoded)?;
-        Ok(cancellation)
-    }
-
     pub(super) fn mutation_lock(&self) -> RefineResult<fs::File> {
         fs::create_dir_all(self.operations_dir()).map_err(|error| {
             RefineError::Io(format!(
@@ -113,6 +47,65 @@ impl FileOperationRegistry {
             ))
         })?;
         Ok(file)
+    }
+
+    /// Remove terminal-state operation records and their logs once they age out
+    /// of the retention window. No deletion path existed at all, so completed
+    /// operations — and the runtime projection assembled from them — grew for
+    /// the life of the installation.
+    pub fn cleanup_terminal_operations(&self, retention: Duration) -> RefineResult<usize> {
+        let dir = self.operations_dir();
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let cutoff = SystemTime::now()
+            .checked_sub(retention)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let lock = self.mutation_lock()?;
+        let mut removed = 0usize;
+        let entries = fs::read_dir(&dir).map_err(|error| {
+            RefineError::Io(format!(
+                "failed to read operation registry {}: {error}",
+                dir.display()
+            ))
+        })?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(operation_id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let old_enough = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .is_some_and(|modified| modified < cutoff);
+            if !old_enough {
+                continue;
+            }
+            let terminal = fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<OperationHandle>(&bytes).ok())
+                .is_some_and(|operation| {
+                    matches!(
+                        operation.state,
+                        OperationState::Succeeded
+                            | OperationState::Failed
+                            | OperationState::Cancelled
+                    )
+                });
+            if !terminal {
+                continue;
+            }
+            if fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+            let _ = fs::remove_file(self.log_path(operation_id));
+        }
+        FileExt::unlock(&lock).ok();
+        Ok(removed)
     }
 
     pub fn active_launch_guard(&self, operation_id: &str) -> RefineResult<OperationLaunchGuard> {
@@ -179,6 +172,50 @@ impl FileOperationRegistry {
         for operation in self.recover()? {
             if !operation_active(&operation.state) {
                 continue;
+            }
+            let capability_reconciles_restart = operation
+                .request
+                .get("restart_recovery")
+                .and_then(Value::as_str)
+                == Some("capability");
+            if capability_reconciles_restart {
+                let associated = processes
+                    .iter()
+                    .filter(|process| {
+                        process_operation_id(process).as_deref() == Some(operation.id.as_str())
+                    })
+                    .collect::<Vec<_>>();
+                let capability_attempt = operation
+                    .external_attempt
+                    .as_ref()
+                    .is_some_and(|attempt| !attempt.state.terminal());
+                if associated.len() == 1 || capability_attempt {
+                    self.append_log(
+                        &operation.id,
+                        operation_log_entry(
+                            &operation,
+                            "info",
+                            if associated.len() == 1 {
+                                "Operation adopted its supervised process after restart"
+                            } else {
+                                "Operation delegated external-attempt recovery to its owning capability"
+                            },
+                            Some(crate::model::JsonObject::from_iter([(
+                                "process_id".to_string(),
+                                associated
+                                    .first()
+                                    .map(|process| json!(process.id))
+                                    .unwrap_or(Value::Null),
+                            )])),
+                        ),
+                    )?;
+                    recovered.push(operation);
+                    continue;
+                }
+                // Zero matching processes is interruption evidence. More than
+                // one is an ownership violation and falls through to normal
+                // recovery, which terminates every correlated process before
+                // settling a single authoritative operation.
             }
             let deferred_cancellation = matches!(operation.state, OperationState::Cancelling)
                 && cancellation_terminal_is_deferred(&operation);

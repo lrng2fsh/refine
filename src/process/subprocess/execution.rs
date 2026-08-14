@@ -48,7 +48,6 @@ impl FileProcessSupervisor {
     {
         self.validate_launch(&spec)?;
         let launch_guard = self.operation_launch_guard(&spec)?;
-        let workflow_registration_guard = self.workflow_process_registration_guard(&spec)?;
         fs::create_dir_all(self.processes_dir()).map_err(|error| {
             RefineError::Io(format!(
                 "failed to create process registry {}: {error}",
@@ -123,18 +122,17 @@ impl FileProcessSupervisor {
             started_at: now_millis_string(),
             exit_code: None,
         };
-        if let Err(error) = self.write_process(&process) {
+        if let Err(error) = self.write_process_transient(&process) {
             let _ = child.kill();
             let _ = child.wait();
             return Err(error);
         }
-        if let Err(error) = self.create_process_identity(&process) {
+        if let Err(error) = self.create_process_identity_transient(&process) {
             let _ = child.kill();
             let _ = child.wait();
             let _ = self.remove_process_artifacts(&process);
             return Err(error);
         }
-        drop(workflow_registration_guard);
         drop(launch_guard);
 
         let stdout = child.stdout.take().ok_or_else(|| {

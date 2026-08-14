@@ -11,7 +11,25 @@ impl LocalHttpDaemon {
     ) -> RefineResult<()> {
         if let Some(runtime_root) = &self.server.runtime_root {
             report("recovering supervised operations");
-            FileOperationRegistry::new(runtime_root).recover_active_supervised()?;
+            let operation_registry = FileOperationRegistry::new(runtime_root);
+            operation_registry.recover_active_supervised()?;
+            let source_upgrade_present = runtime_root
+                .join(crate::tools::host::source_promotion::SOURCE_PROMOTION_STATE_FILE)
+                .exists()
+                || operation_registry
+                    .recover()?
+                    .into_iter()
+                    .any(|operation| operation.owner == "maintenance:source-upgrade");
+            if source_upgrade_present && let Some(paths) = &self.server.product_paths {
+                paths.validate_source_checkout()?;
+                report("reconciling restart-safe source-upgrade attempt");
+                crate::tools::host::source_promotion::FileSourcePromotionService::new(
+                    paths.checkout.clone(),
+                    runtime_root,
+                    self.server.status.port,
+                )
+                .reconcile_interrupted_agent()?;
+            }
             report("recovering incomplete Quality cancellations");
             QualityOperationRunner::recover_cancelled_operations_for_runtime(runtime_root)?;
         }
@@ -23,14 +41,19 @@ impl LocalHttpDaemon {
                     "Daemon restarted before the provider turn completed.",
                 )?;
         }
-        report("warming project and runtime caches");
-        let _ = self.server.warm_current_projection_cache()?;
-        report("warming diagnostics cache");
-        self.server.warm_diagnostics_cache()?;
-        report("warming static asset cache");
-        self.warm_static_cache()?;
-        report("startup cache warming complete");
         Ok(())
+    }
+
+    /// Cache warming runs after readiness: every cache here rebuilds on demand,
+    /// so a request racing the warm pays that request's own cost at worst,
+    /// while holding the port closed for warming delayed every boot.
+    pub fn warm_caches_in_background(&self) {
+        let daemon = self.clone();
+        thread::spawn(move || {
+            let _ = daemon.server.warm_current_projection_cache();
+            let _ = daemon.server.warm_diagnostics_cache();
+            let _ = daemon.warm_static_cache();
+        });
     }
 
     pub(super) fn warm_static_cache(&self) -> RefineResult<()> {
@@ -80,6 +103,7 @@ impl LocalHttpDaemon {
             Some(self.start_agent_automation_loop(AGENT_WORKFLOW_INTERVAL))
         };
         let _git_sync_loop = self.start_git_sync_loop();
+        let _retention_loop = self.start_retention_loop();
         self.serve_listener(listener, Some(lifecycle_shutdown(lifecycle, port)))
     }
 }

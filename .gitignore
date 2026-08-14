@@ -11,9 +11,12 @@ dist/
 
 # Rust build artifacts
 /target/
-/desktop/src-tauri/target/
 /xtask/target/
 /tests/fixtures/smoke-ai/target/
+
+# Checkout-local deployed Refine artifacts
+/bin/
+/.refine-deployed
 
 # JavaScript test dependencies
 /node_modules/

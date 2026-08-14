@@ -128,10 +128,10 @@
 }
 .status-pill.backlog     { background: var(--color-neutral-soft); color: var(--color-text-muted); }
 .status-pill.todo        { background: var(--color-neutral-soft); color: var(--color-text-muted); }
-.status-pill.in-progress { background: var(--color-warning-soft); color: var(--color-warning); }
-.status-pill.qa          { background: var(--color-success-soft); color: #0f766e; }
-.status-pill.ready-merge { background: #fff0d7; color: #9a5b00; }
-.status-pill.build { background: var(--color-warning-soft); color: var(--color-warning); }
+.status-pill.plan { background: var(--color-warning-soft); color: var(--color-warning); }
+.status-pill.implement { background: #fff0d7; color: #9a5b00; }
+.status-pill.quality { background: var(--color-success-soft); color: #0f766e; }
+.status-pill.governance { background: #ede9fe; color: #6d28d9; }
 
 .source-promotion-facts {
   display: grid;
@@ -295,8 +295,8 @@ button.settings-tab:hover:not(:disabled) {
   text-transform: lowercase;
 }
 .role-pill.agent  { background: #fff4d0; color: #875e00; }
-.role-pill.merger { background: #ffeac2; color: #7a4500; }
-.merger-row td:last-child { color: var(--muted); }
+.role-pill.governance_integrator { background: #ffeac2; color: #7a4500; }
+.governance_integrator-row td:last-child { color: var(--muted); }
 
 .governance-rule-row {
   display: grid;
@@ -614,6 +614,8 @@ select {
   text-align: left;
   padding: 12px;
   border-bottom: 1px solid var(--color-border-subtle);
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
 .table th {
   color: var(--color-text-muted);
@@ -718,35 +720,12 @@ select {
 .process-table .memory-col { width: 92px; }
 .process-table .elapsed-col { width: 76px; }
 .process-table .details-col { width: 18%; }
-.managed-process-table .process-col { width: 18%; }
-.managed-process-table .actions-col { width: 326px; }
-.managed-process-table tr.supervisor-child[hidden] {
-  display: none;
-}
-.agents-process-table .agent-col { width: 22%; }
-.agents-process-table .round-col { width: 68px; }
-.agents-process-table .idle-col { width: 68px; }
-.agents-process-table .agent-actions-col { width: 92px; }
-.runner-workers-table .worker-col { width: 160px; }
-.runner-workers-table .goal-col { width: 120px; }
-.runner-workers-table .queue-col { width: 72px; }
-.runner-workers-table .worker-actions-col { width: 188px; }
-.runner-workers-table td:first-child {
-  overflow: hidden;
-}
-.runner-workers-table td:first-child a,
-.runner-workers-table td:first-child code {
-  display: inline-block;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  vertical-align: bottom;
-}
-.runner-workers-table td:first-child code {
-  white-space: nowrap;
-}
-.process-table td[data-process-details],
-.process-table .runner-work-details {
+.process-manager-table .process-col { width: 170px; }
+.process-manager-table .memory-col { width: 112px; }
+.process-manager-table .cpu-col { width: 116px; }
+.process-manager-table .details-col { width: auto; }
+.process-manager-table .actions-col { width: 340px; }
+.process-table td[data-process-details] {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -773,49 +752,8 @@ select {
   padding-left: 9px;
   padding-right: 9px;
 }
-.process-tree-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-.process-tree-toggle {
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-color: transparent;
-  background: transparent;
-  color: var(--color-text-muted);
-  flex: 0 0 auto;
-}
-.process-tree-toggle:hover:not(:disabled) {
-  background: var(--color-surface-muted);
-  border-color: var(--color-border);
-  color: var(--fg);
-}
-.process-tree-spacer {
-  width: 22px;
-  height: 1px;
-  flex: 0 0 auto;
-}
-.supervisor-child-label {
-  padding-left: 16px;
-  position: relative;
-}
-.supervisor-child-label::before {
-  content: "";
-  position: absolute;
-  left: 6px;
-  top: 50%;
-  width: 12px;
-  border-top: 1px solid var(--color-border);
-}
 @media (max-width: 760px) {
-  .process-table td[data-process-details],
-  .process-table .runner-work-details {
+  .process-table td[data-process-details] {
     overflow: visible;
     text-overflow: clip;
     white-space: normal;
@@ -827,16 +765,6 @@ select {
   .process-table .process-actions .actions {
     justify-content: flex-start;
     flex-wrap: wrap;
-  }
-  .runner-workers-table td:first-child {
-    overflow: visible;
-  }
-  .runner-workers-table td:first-child a,
-  .runner-workers-table td:first-child code {
-    display: inline;
-    max-width: none;
-    white-space: normal;
-    overflow-wrap: anywhere;
   }
 }
 .target-app-action-slot {

@@ -1,5 +1,50 @@
 use super::*;
 
+#[test]
+fn source_worker_inherits_debug_executable_without_installed_binary() {
+    let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .unwrap();
+    let runtime_root = checkout.join("run/4557");
+    let test_executable = std::env::current_exe().unwrap();
+
+    let selected = runner_executable_for_invocation(&runtime_root, &test_executable).unwrap();
+
+    assert_eq!(selected, test_executable.canonicalize().unwrap());
+    assert_ne!(selected, checkout.join("bin/refine"));
+}
+
+#[test]
+fn installed_worker_inherits_the_stable_checkout_binary() {
+    let checkout = std::env::temp_dir().join(format!(
+        "refine-installed-worker-executable-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(checkout.join("src")).unwrap();
+    std::fs::create_dir_all(checkout.join("docs/runbooks")).unwrap();
+    std::fs::create_dir_all(checkout.join("bin")).unwrap();
+    std::fs::write(checkout.join("Cargo.toml"), "[package]\nname='refine'\n").unwrap();
+    std::fs::write(checkout.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(checkout.join("docs/runbooks/install.md"), "# Install\n").unwrap();
+    std::fs::write(checkout.join("r"), "#!/bin/sh\n").unwrap();
+    std::fs::write(checkout.join("bin/refine"), "installed\n").unwrap();
+    std::fs::write(
+        checkout.join(".refine-deployed"),
+        "mode=deployed\nrelease_bin=bin/refine\n",
+    )
+    .unwrap();
+
+    let selected =
+        runner_executable_for_invocation(&checkout.join("run/4557"), &checkout.join("bin/refine"))
+            .unwrap();
+
+    assert_eq!(
+        selected,
+        checkout.join("bin/refine").canonicalize().unwrap()
+    );
+    std::fs::remove_dir_all(checkout).unwrap();
+}
+
 fn worker_record(state: &str, worker_kind: &str) -> ManagedProcess {
     ManagedProcess {
         id: format!("process-{state}-{worker_kind}"),
@@ -64,6 +109,339 @@ fn settled_worker_records_are_not_adopted_as_a_running_workflow_runner() {
         WORKFLOW_RUNNER,
         Some(canonical_registry)
     ));
+}
+
+#[test]
+fn paused_workflow_suppresses_background_repository_workers_until_resumed() {
+    let runtime_root = std::env::temp_dir().join(format!(
+        "refine-paused-background-runners-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let supervisor = FileProcessSupervisor::new(&runtime_root);
+    supervisor.set_workflow_paused(true).unwrap();
+
+    for worker_kind in PAUSE_AWARE_BACKGROUND_RUNNERS {
+        assert!(
+            run_worker(worker_kind, runtime_root.clone(), None, None, None).is_ok(),
+            "{worker_kind} must exit without scanning repositories while paused"
+        );
+        assert!(matches!(
+            FileRunnerWorkerService::new(&runtime_root)
+                .ensure_background_worker(worker_kind)
+                .unwrap(),
+            BackgroundWorkerEnsure::Paused
+        ));
+    }
+
+    supervisor.set_workflow_paused(false).unwrap();
+    assert!(
+        !background_automation_is_paused(&runtime_root).unwrap(),
+        "clearing the same pause gate must make background workers launchable again"
+    );
+
+    std::fs::remove_dir_all(runtime_root).unwrap();
+}
+
+#[test]
+fn user_stop_kills_and_disables_a_background_worker_until_start() {
+    let runtime_root = std::env::temp_dir().join(format!(
+        "refine-user-stopped-background-runner-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let supervisor = FileProcessSupervisor::new(&runtime_root);
+    let (command, args) = if cfg!(windows) {
+        (
+            "cmd".to_string(),
+            vec!["/C".to_string(), "ping -n 300 127.0.0.1 >NUL".to_string()],
+        )
+    } else {
+        ("sleep".to_string(), vec!["300".to_string()])
+    };
+    let process = supervisor
+        .launch(ManagedProcessSpec {
+            owner: ProcessOwner::Runner,
+            command,
+            args,
+            cwd: None,
+            env: Vec::new(),
+            stdin: None,
+            limits: None,
+            authorization_command: None,
+            sensitive: false,
+            metadata: serde_json::from_value(json!({
+                "kind": "runner",
+                "worker_kind": GIT_SYNC_RUNNER
+            }))
+            .unwrap(),
+        })
+        .unwrap();
+    let service = FileRunnerWorkerService::new(&runtime_root);
+
+    assert!(matches!(
+        service
+            .set_background_worker_enabled(GIT_SYNC_RUNNER, false)
+            .unwrap(),
+        BackgroundWorkerEnsure::Disabled
+    ));
+    assert!(!FileProcessSupervisor::process_is_alive(&process).unwrap());
+    assert!(
+        supervisor
+            .pause_state()
+            .unwrap()
+            .disabled_background_workers
+            .contains(GIT_SYNC_RUNNER)
+    );
+
+    supervisor.set_workflow_paused(true).unwrap();
+    assert!(matches!(
+        service
+            .set_background_worker_enabled(GIT_SYNC_RUNNER, true)
+            .unwrap(),
+        BackgroundWorkerEnsure::Paused
+    ));
+    assert!(
+        !supervisor
+            .pause_state()
+            .unwrap()
+            .disabled_background_workers
+            .contains(GIT_SYNC_RUNNER)
+    );
+
+    std::fs::remove_dir_all(runtime_root).unwrap();
+}
+
+#[test]
+fn pause_at_ensure_is_quiet_and_invalid_pause_state_is_an_error() {
+    let runtime_root = std::env::temp_dir().join(format!(
+        "refine-pause-at-background-ensure-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let pause_root = runtime_root.clone();
+    let _hook = install_background_worker_hook(move |worker_kind, boundary| {
+        if worker_kind == GIT_SYNC_RUNNER && boundary == BackgroundWorkerBoundary::EnsureLaunch {
+            FileProcessSupervisor::new(&pause_root)
+                .set_workflow_paused(true)
+                .unwrap();
+        }
+    });
+    assert!(matches!(
+        FileRunnerWorkerService::new(&runtime_root)
+            .ensure_background_worker(GIT_SYNC_RUNNER)
+            .unwrap(),
+        BackgroundWorkerEnsure::Paused
+    ));
+
+    std::fs::write(
+        FileProcessSupervisor::new(&runtime_root).pause_state_path(),
+        "{invalid",
+    )
+    .unwrap();
+    for worker_kind in PAUSE_AWARE_BACKGROUND_RUNNERS {
+        let error = FileRunnerWorkerService::new(&runtime_root)
+            .ensure_background_worker(worker_kind)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse process control"),
+            "{error}"
+        );
+    }
+    std::fs::remove_dir_all(runtime_root).unwrap();
+}
+
+#[test]
+fn running_background_repository_workers_quiesce_at_pause_boundaries() {
+    let runtime_root = std::env::temp_dir().join(format!(
+        "refine-running-background-runners-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let supervisor = FileProcessSupervisor::new(&runtime_root);
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+
+    let git_runtime_root = runtime_root.clone();
+    let git_finished = finished_tx.clone();
+    let git_worker = std::thread::spawn(move || {
+        git_finished
+            .send((
+                GIT_SYNC_RUNNER,
+                run_git_sync_worker(&git_runtime_root, None),
+            ))
+            .unwrap();
+    });
+    let cleanup_runtime_root = runtime_root.clone();
+    let cleanup_worker = std::thread::spawn(move || {
+        finished_tx
+            .send((
+                WORKTREE_CLEANUP_RUNNER,
+                run_worktree_cleanup_worker(&cleanup_runtime_root, None),
+            ))
+            .unwrap();
+    });
+
+    std::thread::sleep(Duration::from_millis(50));
+    supervisor.set_workflow_paused(true).unwrap();
+    for _ in PAUSE_AWARE_BACKGROUND_RUNNERS {
+        let (worker_kind, result) = finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("background repository worker did not quiesce after workflow pause");
+        assert!(result.is_ok(), "{worker_kind} exited with {result:?}");
+        result.unwrap();
+    }
+    git_worker.join().unwrap();
+    cleanup_worker.join().unwrap();
+
+    std::fs::remove_dir_all(runtime_root).unwrap();
+}
+
+#[test]
+fn repository_workers_skip_blocked_operations_then_do_work_after_resume() {
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+
+    let root = std::env::temp_dir().join(format!(
+        "refine-paused-background-operation-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let target_root = root.join("app");
+    let registry_root = root.join("registry");
+    let runtime_root = root.join("runtime");
+    std::fs::create_dir_all(&target_root).unwrap();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["config", "user.name", "Test User"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&target_root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(target_root.join("README.md"), "base\n").unwrap();
+    for args in [vec!["add", "README.md"], vec!["commit", "-m", "base"]] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&target_root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let target_root = target_root.canonicalize().unwrap();
+    let registry = crate::model::project::AppRegistry {
+        version: 1,
+        active_app: Some(target_root.display().to_string()),
+        apps: std::collections::BTreeMap::new(),
+    };
+    FileProjectRegistryService::new(&registry_root, None)
+        .save(&registry)
+        .unwrap();
+    let refine_dir = refine_dir_for_target_root(&target_root).unwrap();
+    std::fs::create_dir_all(&refine_dir).unwrap();
+    FileSettingsService::with_active_root(&refine_dir, &runtime_root)
+        .update(&json!({
+            "state_sync_debounce_seconds": "1",
+            "project_update_pulse_interval_seconds": "0",
+            "worktree_cleanup_after_seconds": "0"
+        }))
+        .unwrap();
+
+    let supervisor = FileProcessSupervisor::new(&runtime_root);
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let (event_tx, event_rx) = mpsc::channel();
+    let hook_release = Arc::clone(&release);
+    let _blocked_hook = install_background_worker_hook(move |worker_kind, boundary| {
+        if !matches!(
+            boundary,
+            BackgroundWorkerBoundary::BeforeOperation | BackgroundWorkerBoundary::AfterOperation
+        ) {
+            return;
+        }
+        event_tx.send((worker_kind.to_string(), boundary)).unwrap();
+        if boundary == BackgroundWorkerBoundary::BeforeOperation {
+            let (lock, ready) = &*hook_release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = ready.wait(released).unwrap();
+            }
+        }
+    });
+    let git_runtime = runtime_root.clone();
+    let git_registry = registry_root.clone();
+    let git_worker =
+        std::thread::spawn(move || run_git_sync_worker(&git_runtime, Some(&git_registry)));
+    let cleanup_runtime = runtime_root.clone();
+    let cleanup_registry = registry_root.clone();
+    let cleanup_worker = std::thread::spawn(move || {
+        run_worktree_cleanup_worker(&cleanup_runtime, Some(&cleanup_registry))
+    });
+    let mut blocked_workers = BTreeSet::new();
+    while blocked_workers.len() < PAUSE_AWARE_BACKGROUND_RUNNERS.len() {
+        let (worker_kind, boundary) = event_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("both repository workers must reach their operation boundary");
+        assert_eq!(boundary, BackgroundWorkerBoundary::BeforeOperation);
+        blocked_workers.insert(worker_kind);
+    }
+    supervisor.set_workflow_paused(true).unwrap();
+    let (lock, ready) = &*release;
+    *lock.lock().unwrap() = true;
+    ready.notify_all();
+    assert!(git_worker.join().unwrap().is_ok());
+    assert!(cleanup_worker.join().unwrap().is_ok());
+    assert!(
+        event_rx
+            .try_iter()
+            .all(|(_, boundary)| { boundary != BackgroundWorkerBoundary::AfterOperation })
+    );
+    drop(_blocked_hook);
+
+    supervisor.set_workflow_paused(false).unwrap();
+    let (event_tx, event_rx) = mpsc::channel();
+    let _resumed_hook = install_background_worker_hook(move |worker_kind, boundary| {
+        if matches!(
+            boundary,
+            BackgroundWorkerBoundary::BeforeOperation | BackgroundWorkerBoundary::AfterOperation
+        ) {
+            event_tx.send((worker_kind.to_string(), boundary)).unwrap();
+        }
+    });
+    let git_runtime = runtime_root.clone();
+    let git_registry = registry_root.clone();
+    let git_worker =
+        std::thread::spawn(move || run_git_sync_worker(&git_runtime, Some(&git_registry)));
+    let cleanup_runtime = runtime_root.clone();
+    let cleanup_registry = registry_root.clone();
+    let cleanup_worker = std::thread::spawn(move || {
+        run_worktree_cleanup_worker(&cleanup_runtime, Some(&cleanup_registry))
+    });
+    let mut completed_workers = BTreeSet::new();
+    while completed_workers.len() < PAUSE_AWARE_BACKGROUND_RUNNERS.len() {
+        let (worker_kind, boundary) = event_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("both resumed repository workers must perform an operation");
+        if boundary == BackgroundWorkerBoundary::AfterOperation {
+            completed_workers.insert(worker_kind);
+        }
+    }
+    supervisor.set_workflow_paused(true).unwrap();
+    assert!(git_worker.join().unwrap().is_ok());
+    assert!(cleanup_worker.join().unwrap().is_ok());
+    assert_eq!(
+        completed_workers,
+        BTreeSet::from([
+            GIT_SYNC_RUNNER.to_string(),
+            WORKTREE_CLEANUP_RUNNER.to_string()
+        ])
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

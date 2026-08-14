@@ -2,21 +2,76 @@ use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+fn cargo_launch_reports_and_reuses_the_actual_debug_executable() {
+    let actual = PathBuf::from("/checkout/target/debug/refine");
+    assert_eq!(
+        select_launch_executable("cargo", Some("cargo".to_string()), Some(actual.clone())),
+        Some(actual.display().to_string())
+    );
+    assert_eq!(
+        select_launch_executable(
+            "cargo",
+            Some("/foreign/bin/refine".to_string()),
+            Some(actual.clone())
+        ),
+        Some(actual.display().to_string())
+    );
+    assert_eq!(
+        select_launch_executable(
+            "binary",
+            Some("/checkout/bin/refine".to_string()),
+            Some(actual.clone())
+        ),
+        Some("/checkout/bin/refine".to_string())
+    );
+}
+
+#[test]
 fn file_lifecycle_persists_port_scoped_status() {
     let temp_root = unique_temp_dir("lifecycle-status");
     let runtime_root = RuntimeRoot {
         root: temp_root.join("run"),
     };
-    let service = FileDaemonLifecycleService::new(runtime_root);
+    let service = FileDaemonLifecycleService::new(runtime_root.clone());
 
     let started = service.recover(4555).unwrap();
     assert!(started.daemon_healthy);
     assert!(service.status_path(4555).exists());
     assert_eq!(service.status(4555).unwrap().worker_state, "idle");
 
+    let (command, args) = if cfg!(windows) {
+        (
+            "cmd".to_string(),
+            vec!["/C".to_string(), "ping -n 300 127.0.0.1 >NUL".to_string()],
+        )
+    } else {
+        ("sleep".to_string(), vec!["300".to_string()])
+    };
+    let launch = |root: &std::path::Path, owner| {
+        FileProcessSupervisor::new(root)
+            .launch(ManagedProcessSpec {
+                owner,
+                command: command.clone(),
+                args: args.clone(),
+                cwd: None,
+                env: Vec::new(),
+                stdin: None,
+                limits: None,
+                authorization_command: None,
+                sensitive: false,
+                metadata: Default::default(),
+            })
+            .unwrap()
+    };
+    let port_root = runtime_root.port_root(4555);
+    let runner = launch(&port_root, ProcessOwner::Runner);
+    let agent = launch(&port_root.join("agents"), ProcessOwner::Agent);
+
     let stopped = service.stop_runtime(4555).unwrap();
     assert!(!stopped.daemon_healthy);
     assert_eq!(service.status(4555).unwrap().worker_state, "stopped");
+    assert!(!FileProcessSupervisor::process_is_alive(&runner).unwrap());
+    assert!(!FileProcessSupervisor::process_is_alive(&agent).unwrap());
 
     fs::remove_dir_all(temp_root).unwrap();
 }

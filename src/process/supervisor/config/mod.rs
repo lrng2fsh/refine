@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,7 @@ use crate::process::supervisor::coordination::{
 use crate::process::supervisor::errors::RefineError;
 use crate::process::supervisor::errors::RefineResult;
 use crate::tools::product::nodes::FileNodeRegistryService;
-use crate::tools::product::project_state::ActiveGoalIndex;
+use crate::tools::product::project_projection::ActiveGoalIndex;
 use crate::tools::product::todos::FileTodoService;
 
 pub const SETTINGS_FILE: &str = "settings.json";
@@ -25,10 +26,7 @@ pub const GOVERNANCE_FILE: &str = "governance.json";
 pub const GUIDANCE_FILE: &str = "guidance.json";
 pub const REPORTERS_FILE: &str = "reporters.json";
 const REPORTER_CASCADE_FILE: &str = "reporter-cascade.json";
-const QUALITY_SETTINGS_FILE: &str = "quality/settings.json";
-const QUALITY_TIMING_KEY: &str = "quality_timing";
 const RETIRED_SUPERVISOR_STALL_KEY: &str = "supervisor_agent_stall_seconds";
-const DEFAULT_QUALITY_TIMING: &str = "pre_merge";
 
 mod governance;
 mod governance_codec;
@@ -97,6 +95,15 @@ fn normalize_reporter_name(name: &str) -> RefineResult<String> {
 
 fn now_timestamp() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+fn new_config_item_id(prefix: &str) -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{prefix}-{}-{}",
+        Utc::now().timestamp_micros(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 #[cfg(test)]

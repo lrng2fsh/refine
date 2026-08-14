@@ -77,18 +77,14 @@ fn web_server_rebuilds_projection_cache_and_serves_changes_performance_routes() 
         performance.body["operations"],
         json!(["cache.rebuild", "provider.turn"])
     );
-    let cached = FileProjectStateStore::new(&refine_dir)
+    // The report is served from the in-memory event ring; reading it must not
+    // write a cached copy into the projection snapshot (a write on a read
+    // path that also grew the snapshot).
+    let cached = FileProjectProjectionStore::new(&refine_dir)
         .load_projection_snapshot(&runtime_root.join("cache"))
         .unwrap()
         .unwrap();
-    assert_eq!(
-        cached
-            .runtime
-            .performance
-            .unwrap()
-            .get("filtered_event_count"),
-        Some(&json!(1))
-    );
+    assert_eq!(cached.runtime.performance, None);
 
     remove_temp_dir(&temp_root);
 }
@@ -185,7 +181,7 @@ fn web_server_hard_resets_git_worktree() {
     server.runtime_root = Some(runtime_root.clone());
     let reset = server.handle(ApiRequest {
         method: "POST".to_string(),
-        path: "/api/runner-workers/merger/hard-reset-worktree".to_string(),
+        path: "/api/runner-workers/governance-integrator/hard-reset-worktree".to_string(),
         body: None,
     });
     assert_eq!(reset.status, 202);

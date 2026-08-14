@@ -13,7 +13,7 @@ fn web_server_route_groups_cover_static_web_surface() {
         "/cache",
         "/changes",
         "/chat",
-        "/cluster",
+        "/fleet",
         "/dashboard",
         "/diagnostics",
         "/events",
@@ -35,7 +35,6 @@ fn web_server_route_groups_cover_static_web_surface() {
         "/todos",
         "/upgrade",
         "/work",
-        "/workflow",
     ] {
         assert!(groups.contains(prefix), "missing route group {prefix}");
     }
@@ -90,6 +89,7 @@ fn static_main_nav_consolidates_context_and_controls() {
     let theme = fs::read_to_string(static_root.join("js/theme.js")).unwrap();
     let theme_css = fs::read_to_string(static_root.join("css/theme.css")).unwrap();
     let target_app = fs::read_to_string(static_root.join("js/target-app.js")).unwrap();
+    let node_context = fs::read_to_string(static_root.join("js/node-context.js")).unwrap();
     let releases =
         fs::read_to_string(static_root.join("js/features/settings_releases.js")).unwrap();
 
@@ -118,6 +118,7 @@ fn static_main_nav_consolidates_context_and_controls() {
 
     for control_id in [
         r#"id="target-app-indicator""#,
+        r#"id="global-node""#,
         r#"id="global-reporter""#,
         r#"id="agent-status-indicator""#,
         r#"id="btn-source-update""#,
@@ -137,14 +138,49 @@ fn static_main_nav_consolidates_context_and_controls() {
     }
 
     assert!(menu.contains(r#"class="nav-control-status target-app-state""#));
+    let node_select = menu.find(r#"id="global-node""#).unwrap();
+    let reporter_select = menu.find(r#"id="global-reporter""#).unwrap();
+    assert!(
+        node_select < reporter_select,
+        "Node should be immediately before Reporter"
+    );
+    assert!(menu[node_select..reporter_select].contains(r#"aria-label="Node""#));
+    assert!(menu[node_select..reporter_select].contains(r#"data-testid="global-node""#));
+    assert!(node_context.contains("function reconcileNodeContext"));
+    assert!(
+        node_context.contains(r#"api("GET", "/api/project/status", undefined, { cache: false })"#)
+    );
+    assert!(node_context.contains(r#"api("GET", "/api/nodes", undefined, { cache: false })"#));
     assert!(menu.contains(r#"class="nav-control-status agent-status-label""#));
     assert!(menu.contains(r#"class="nav-control-status nav-source-update-status""#));
     assert!(menu.contains(r#"class="nav-control-status nav-theme-status""#));
+    assert!(menu.contains("<span>Report a bug to Refine Devs</span>"));
+    assert!(!menu.contains("<span>Report a bug</span>"));
     assert!(menu.contains(r#"aria-pressed="false""#));
     assert!(theme.contains(r#"const STORAGE_KEY = "refine_color_theme""#));
     assert!(theme.contains(r#"new CustomEvent("refine-theme-change""#));
     assert!(theme_css.contains(r#"html[data-theme="dark"]"#));
     assert!(theme_css.contains("color-scheme: dark"));
+    assert!(index.contains(
+        r#"<img class="brand-logo brand-logo-light" src="/static/images/refine_logo_transparent.png" alt="refine">"#
+    ));
+    assert!(index.contains(
+        r#"<img class="brand-logo brand-logo-dark" src="/static/images/refine_logo_transparent_darkmode.png" alt="refine">"#
+    ));
+    assert!(theme_css.contains(
+        r#".brand-logo-dark {
+  display: none;
+}"#
+    ));
+    assert!(theme_css.contains(
+        r#"html[data-theme="dark"] .brand-logo-light {
+  display: none;
+}
+html[data-theme="dark"] .brand-logo-dark {
+  display: block;
+}"#
+    ));
+    assert!(!theme_css.contains("filter: brightness(1.55) saturate(1.05)"));
     let theme_script = index
         .find(r#"<script src="/static/js/theme.js"></script>"#)
         .expect("theme bootstrap should be loaded");
@@ -263,10 +299,7 @@ fn local_http_daemon_serves_static_assets() {
     .unwrap();
     fs::create_dir_all(temp_root.join("css")).unwrap();
     fs::write(temp_root.join("css/base.css"), "body { color: black; }").unwrap();
-    let daemon = LocalHttpDaemon {
-        server: server_with_projection(),
-        static_root: Some(temp_root.clone()),
-    };
+    let daemon = LocalHttpDaemon::new(server_with_projection(), Some(temp_root.clone()));
     daemon.recover_runtime_state().unwrap();
 
     let response = daemon.handle_wire_request(HttpRequest {
@@ -433,7 +466,7 @@ fn web_server_accepts_static_ui_bulk_api_aliases() {
     assert_eq!(bulk_done.body["updated"], 2);
 
     FileWorkItemService::new(&refine_dir)
-        .set_goal_status_unchecked("GOAL3", &GoalStatus::InProgress)
+        .set_goal_status_unchecked("GOAL3", &GoalStatus::Implement)
         .unwrap();
     let bulk_cancel = server.handle(ApiRequest {
         method: "POST".to_string(),
