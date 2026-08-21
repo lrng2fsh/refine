@@ -1,0 +1,27 @@
+# Goal Agents
+
+## Key Ideas
+
+- **Workflow Owned**: a Goal Agent implements one active Goal; surfaces attach to it rather than creating a substitute.
+- **Native Harness**: Refine launches the configured provider CLI in its own managed PTY.
+- **Background By Default**: the agent works without requiring an attached user.
+- **Pinned Context**: the current Round records the exact semantic context used by every planning and implementation phase.
+- **Replaceable Process**: the local session may be lost and restarted without changing synchronized authority.
+
+## Purpose
+
+Goal Agents make automated workflow and interactive inspection the same experience. Refine owns context, process lifecycle, worktree isolation, workflow state, and evidence; the configured CLI owns its tools, approvals, conversation behavior, and provider-specific UX.
+
+## Expected Role
+
+When a Goal enters implementation, Refine creates or reuses its isolated worktree, pins Goal/Round/governance/guidance context, and launches the current Plan, Criticize, Revise, or Implement phase as a managed process. Browser and CLI attachment resolve the current local phase process and never create a duplicate merely to inspect it.
+
+The shared prompt serializer renders pinned context as readable Markdown. For each Guidance candidate it exposes a zero-based Completion Index while withholding the stable configuration id, so Plan, Criticize, Revise, and Implement share one unambiguous completion identifier. Planning phases must leave Git unchanged. Completed proposal, criticism, final-plan, checklist, verification, governance, and implementation artifacts are synchronized semantic evidence; process, operation, and session identifiers are local and are not copied into those artifacts. Completion signals use one typed contract across phases and accept only integer indexes for applied Guidance. The agent writes and parse-checks a temporary completion signal before atomically replacing the active signal. Refine still tolerates a briefly partial legacy direct write and offers bounded same-session repair after a stable malformed JSON transport write. A typed-schema failure — including a string-valued Guidance identifier, an unknown enum, or a planning-phase completion that omits the required `planning_result` object — is instead preserved with its path-aware diagnostic and ends the live session without a replacement instruction. The configured completion and idle watchdogs continue to bound an unattended live session. Opening the exact live workflow Goal Agent from the Toolbar is a one-way exception: the request queues a background attachment operation without waiting, the runtime first persists timeout protection and a unique matching acknowledgment, and the Toolbar reports the open only after the operation observes that acknowledgment from the same still-live session. The runtime retains only a bounded recent acknowledgment window. An attachment that loses a deadline or process-exit race fails instead of presenting a dead session as open. CLI attachment, ordinary input and resize, and non-Goal Toolbar sessions do not grant this protection.
+
+If input is genuinely required, the live local agent may wait and expose that state. Silence alone does not imply a request for help. If the process or daemon restarts, a replacement worker may consume the same pinned context and preserved planning artifacts. Workflow status, node assignment, and Round determine whether it may continue.
+
+Timeout protection bypasses only the automatic completion and idle watchdog verdicts. A valid completion signal still settles the phase; needs-input behavior, transcript capture, natural process exit, explicit Stop, Goal cancellation, worktree retention, and workflow ownership remain unchanged. Stopping the local agent confirms exit, retains its worktree and branch, and conditionally requeues an otherwise unchanged Goal. Explicit Goal cancellation remains terminal and cannot be weakened by Stop. General toolbar, Plan Mode, and Standalone agents remain independent sessions; Goal Agents are the intentional Goal-keyed attachment exception.
+
+## Future Direction
+
+Goal Agents should gain better session continuity, attention routing, fleet-aware attachment, and cooperative handoff while preserving one principle: synchronized Goal state owns meaning, and every surface observes the local agent actually doing the work.

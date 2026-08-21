@@ -4,7 +4,7 @@ mod projects;
 mod settings_governance;
 mod target_app;
 mod todos;
-use crate::process::supervisor::config::{
+use crate::infrastructure::process::supervisor::config::{
     ConfigService, FileGovernanceService, FileGuidanceService, FileReporterService,
     FileSettingsService,
 };
@@ -14,26 +14,32 @@ use std::thread;
 use chrono::Utc;
 use serde_json::{Value, json};
 
-use crate::model::workflow::GoalStatus;
-use crate::process::runner::FileRunnerWorkerService;
-use crate::process::subprocess::{FileProcessSupervisor, ProcessOwner, ProcessSupervisor};
-use crate::process::supervisor::errors::{RefineError, RefineResult};
-use crate::process::supervisor::lifecycle::{current_launch_executable, current_launch_mode};
-use crate::process::supervisor::operations::{
+use crate::application::agent_io::prompts::{PromptTemplate, render};
+use crate::application::fleet::nodes::{
+    FileNodeRegistryService, NodeUpdate, detached_nodes_response,
+};
+use crate::application::fleet::service::{FileFleetService, FleetService, NodeRemoteUpdate};
+use crate::application::guidance::FileNextActionsService;
+use crate::application::maintenance::worktrees::{
+    FileWorktreeCleanupService, WorktreeCleanupOptions,
+};
+use crate::application::projects::projection::{DashboardProjectionQuery, ProjectionQuery};
+use crate::application::projects::registry::{ProjectRegistryService, registry_apps_array};
+use crate::application::system::target_apps::TargetAppGeneratedConfig;
+use crate::application::todos::FileTodoService;
+use crate::application::work_items::BulkGoalSelection;
+use crate::application::workers::FileRunnerWorkerService;
+use crate::application::workflow::WorkflowEngine;
+use crate::error::{RefineError, RefineResult};
+use crate::infrastructure::agents::invocation::{AgentProviderService, ProviderInvocation};
+use crate::infrastructure::process::subprocess::{
+    FileProcessSupervisor, ProcessOwner, ProcessSupervisor,
+};
+use crate::infrastructure::process::supervisor::lifecycle::current_launch_executable;
+use crate::infrastructure::process::supervisor::operations::{
     FileOperationRegistry, OperationRegistry, OperationState,
 };
-use crate::prompts::{PromptTemplate, render};
-use crate::tools::host::agent_providers::{AgentProviderService, ProviderInvocation};
-use crate::tools::host::fleet::{FileFleetService, FleetService, NodeRemoteUpdate};
-use crate::tools::host::target_apps::TargetAppGeneratedConfig;
-use crate::tools::product::next_actions::FileNextActionsService;
-use crate::tools::product::nodes::{FileNodeRegistryService, NodeUpdate, detached_nodes_response};
-use crate::tools::product::project_projection::{DashboardProjectionQuery, ProjectionQuery};
-use crate::tools::product::project_registry::{ProjectRegistryService, registry_apps_array};
-use crate::tools::product::todos::FileTodoService;
-use crate::tools::product::work_items::BulkGoalSelection;
-use crate::tools::product::worktree_cleanup::{FileWorktreeCleanupService, WorktreeCleanupOptions};
-use crate::workflow::WorkflowEngine;
+use crate::model::workflow::GoalStatus;
 
 use super::support::*;
 use super::*;
@@ -79,6 +85,7 @@ pub(super) fn dashboard_attention_items(
     indicators: &[String],
     runner_reachable: bool,
     workflow_paused: bool,
+    state_sync_health: Option<&crate::application::persistence_sync::health::StateSyncHealth>,
 ) -> Vec<Value> {
     let mut items = indicators
         .iter()
@@ -93,6 +100,23 @@ pub(super) fn dashboard_attention_items(
             })
         })
         .collect::<Vec<_>>();
+    if let Some(health) = state_sync_health {
+        if health.status == "failed" {
+            let since = health.failure_since.as_deref().unwrap_or("an unknown time");
+            items.push(json!({
+                "kind": "banner",
+                "severity": "error",
+                "message": format!("State sync has failed since {since}. All-node counts are local and non-authoritative until synchronization recovers.")
+            }));
+        } else if health.status == "stale" {
+            let since = health.stale_since.as_deref().unwrap_or("an unknown time");
+            items.push(json!({
+                "kind": "banner",
+                "severity": "warn",
+                "message": format!("State sync is stale since {since}. All-node counts are local and non-authoritative.")
+            }));
+        }
+    }
     if workflow_paused {
         items.push(json!({
             "kind": "banner",
@@ -111,22 +135,104 @@ pub(super) fn dashboard_attention_items(
 
 fn dashboard_active_node(
     service: &FileNodeRegistryService,
-) -> RefineResult<crate::tools::product::nodes::ActiveNodeIdentity> {
+) -> RefineResult<crate::application::fleet::nodes::ActiveNodeIdentity> {
     service.active_identity()
 }
 
+/// The canonical generated-rules shape shown to the agent. The parser also
+/// accepts `items`, bare arrays, `{rule}` objects, bare strings, and plain
+/// text lines.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct GeneratedGovernanceRulesContract {
+    rules: Vec<String>,
+}
+
+impl crate::application::agent_io::structured_output::Contract
+    for GeneratedGovernanceRulesContract
+{
+    const LABEL: &'static str = "generated Governance rules JSON";
+
+    fn example() -> Self {
+        GeneratedGovernanceRulesContract {
+            rules: vec!["one concise rule".to_string()],
+        }
+    }
+}
+
+/// The canonical target-app config shape shown to the agent. The parser also
+/// accepts legacy command spellings and string-typed timeouts.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct TargetAppConfigContract {
+    start_instructions: String,
+    stop_instructions: String,
+    build_instructions: String,
+    test_command: String,
+    status_command: String,
+    cwd: String,
+    env: serde_json::Map<String, Value>,
+    start_timeout_seconds: u64,
+    stop_timeout_seconds: u64,
+    build_timeout_seconds: u64,
+    test_timeout_seconds: u64,
+    status_timeout_seconds: u64,
+    log_path: String,
+    http_check_url: String,
+    tcp_check_host: String,
+    tcp_check_port: String,
+    process_check_command: String,
+    notes: String,
+}
+
+impl crate::application::agent_io::structured_output::Contract for TargetAppConfigContract {
+    const LABEL: &'static str = "target-app config JSON";
+
+    fn example() -> Self {
+        TargetAppConfigContract {
+            start_instructions: "...".to_string(),
+            stop_instructions: "...".to_string(),
+            build_instructions: "...".to_string(),
+            test_command: "...".to_string(),
+            status_command: "...".to_string(),
+            cwd: ".".to_string(),
+            env: serde_json::Map::new(),
+            start_timeout_seconds: 120,
+            stop_timeout_seconds: 60,
+            build_timeout_seconds: 300,
+            test_timeout_seconds: 600,
+            status_timeout_seconds: 10,
+            log_path: "".to_string(),
+            http_check_url: "".to_string(),
+            tcp_check_host: "".to_string(),
+            tcp_check_port: "".to_string(),
+            process_check_command: "".to_string(),
+            notes: "".to_string(),
+        }
+    }
+}
+
 fn governance_generation_prompt(product: &str, constitution: &str) -> String {
+    let rules_contract =
+        <GeneratedGovernanceRulesContract as crate::application::agent_io::structured_output::Contract>::contract_json();
     render(
         PromptTemplate::GovernanceGeneration,
-        &[("product", product), ("constitution", constitution)],
+        &[
+            ("product", product),
+            ("constitution", constitution),
+            ("rules_contract", &rules_contract),
+        ],
     )
 }
 
 fn target_app_generation_prompt(target_root: &std::path::Path) -> String {
     let target_root = target_root.display().to_string();
+    let target_app_contract =
+        <TargetAppConfigContract as crate::application::agent_io::structured_output::Contract>::contract_json();
     render(
         PromptTemplate::TargetAppGeneration,
-        &[("target_root", &target_root)],
+        &[
+            ("target_root", &target_root),
+            ("target_app_contract", &target_app_contract),
+        ],
     )
 }
 
@@ -163,7 +269,14 @@ fn target_config_u64(value: &Value, key: &str, fallback: u64) -> u64 {
 }
 
 fn parse_generated_target_app_config(output: &str) -> Option<TargetAppGeneratedConfig> {
-    let value = serde_json::from_str::<Value>(output).ok()?;
+    let value = crate::application::agent_io::structured_output::json_candidates(
+        output,
+        &crate::application::agent_io::structured_output::DecodeOptions::new(
+            <TargetAppConfigContract as crate::application::agent_io::structured_output::Contract>::LABEL,
+        ),
+    )
+    .into_iter()
+    .next()?;
     let cfg = value.get("config").unwrap_or(&value);
     let env = cfg
         .get("env")
@@ -261,7 +374,12 @@ fn generated_governance_rule(text: &str, index: usize) -> Value {
 }
 
 fn parse_generated_governance_rules(output: &str) -> Vec<Value> {
-    if let Ok(value) = serde_json::from_str::<Value>(output) {
+    for value in crate::application::agent_io::structured_output::json_candidates(
+        output,
+        &crate::application::agent_io::structured_output::DecodeOptions::new(
+            <GeneratedGovernanceRulesContract as crate::application::agent_io::structured_output::Contract>::LABEL,
+        ),
+    ) {
         let rules = value
             .get("rules")
             .or_else(|| value.get("items"))
@@ -393,16 +511,18 @@ fn contributor_ranking_rows(
     });
     rows.into_iter()
         .enumerate()
-        .map(|(index, (reporter, reported, delivered, delivery_rate, score))| {
-            json!({
-                "rank": index + 1,
-                "contributor": reporter,
-                "reported": reported,
-                "delivered": delivered,
-                "delivery_rate": delivery_rate * 100.0,
-                "score": score,
-            })
-        })
+        .map(
+            |(index, (reporter, reported, delivered, delivery_rate, score))| {
+                json!({
+                    "rank": index + 1,
+                    "contributor": reporter,
+                    "reported": reported,
+                    "delivered": delivered,
+                    "delivery_rate": delivery_rate * 100.0,
+                    "score": score,
+                })
+            },
+        )
         .collect()
 }
 
@@ -452,10 +572,7 @@ mod contributor_ranking_tests {
     fn volume_outranks_a_perfect_but_tiny_record() {
         let mut stats = BTreeMap::new();
         // Two filed, two delivered: perfect rate, little contribution.
-        stats.insert(
-            "reporter-a".to_string(),
-            counts(&[(GoalStatus::Done, 2)]),
-        );
+        stats.insert("reporter-a".to_string(), counts(&[(GoalStatus::Done, 2)]));
         // 120 filed, 40 delivered: far more shipped work despite the lower rate.
         stats.insert(
             "reporter-b".to_string(),

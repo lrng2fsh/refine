@@ -38,16 +38,16 @@ fn wrapper_always_selects_the_production_binary() {
 }
 
 #[test]
-fn wrapper_system_install_builds_only_when_source_changed() {
-    let temp_root = wrapper_fixture("wrapper-system-install");
+fn wrapper_system_service_install_bootstraps_only_a_missing_binary() {
+    let temp_root = wrapper_fixture("wrapper-system-service-install");
     let cargo_log = temp_root.join("cargo.log");
     let path_env = fixture_path_env(&temp_root);
 
-    // First install: no production binary yet, so the wrapper builds and
+    // First registration: no production binary yet, so the wrapper builds and
     // publishes it before delegating to the installed binary.
     let output = Command::new("bash")
         .arg("r")
-        .args(["system", "install", "--port", "8082"])
+        .args(["system", "service-install", "--port", "8082"])
         .current_dir(&temp_root)
         .env("PATH", &path_env)
         .output()
@@ -59,9 +59,11 @@ fn wrapper_system_install_builds_only_when_source_changed() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("production binary is missing; building it before system install"));
+    assert!(
+        stdout.contains("production binary is missing; building it before system service-install")
+    );
     assert!(stdout.contains("production binary updated"));
-    assert!(stdout.contains("installed-command=system install --port 8082"));
+    assert!(stdout.contains("installed-command=system service-install --port 8082"));
     assert_eq!(
         fs::read_to_string(&cargo_log).unwrap().trim(),
         format!(
@@ -76,11 +78,11 @@ fn wrapper_system_install_builds_only_when_source_changed() {
         "mode=deployed\nrelease_bin=bin/refine\n"
     );
 
-    // Second install with unchanged source: no rebuild, straight delegation.
+    // A later registration with unchanged source delegates without rebuilding.
     fs::remove_file(&cargo_log).unwrap();
     let unchanged = Command::new("bash")
         .arg("r")
-        .args(["system", "install", "--port", "8082"])
+        .args(["system", "service-install", "--port", "8082"])
         .current_dir(&temp_root)
         .env("PATH", &path_env)
         .output()
@@ -88,14 +90,14 @@ fn wrapper_system_install_builds_only_when_source_changed() {
     assert!(unchanged.status.success());
     assert_eq!(
         String::from_utf8_lossy(&unchanged.stdout).trim(),
-        "installed-command=system install --port 8082"
+        "installed-command=system service-install --port 8082"
     );
     assert!(!cargo_log.exists(), "unchanged source must not rebuild");
 
     // Dry runs and help never build.
     let dry_run = Command::new("bash")
         .arg("r")
-        .args(["system", "install", "--port", "8082"])
+        .args(["system", "service-install", "--port", "8082"])
         .current_dir(&temp_root)
         .env("REFINE_R_DRY_RUN", "1")
         .env("PATH", &path_env)
@@ -105,7 +107,7 @@ fn wrapper_system_install_builds_only_when_source_changed() {
     assert!(!cargo_log.exists(), "dry-run must not build the release");
     let help = Command::new("bash")
         .arg("r")
-        .args(["system", "install", "--port", "8082", "--help"])
+        .args(["system", "service-install", "--port", "8082", "--help"])
         .current_dir(&temp_root)
         .env("PATH", &path_env)
         .output()
@@ -113,24 +115,25 @@ fn wrapper_system_install_builds_only_when_source_changed() {
     assert!(help.status.success());
     assert!(!cargo_log.exists(), "help must not build the release");
 
-    // Changed source with a failing build: the failure propagates, service
-    // registration never runs, and the published binary is untouched.
+    // Changed source does not make service registration an implicit build or
+    // update operation. The existing published binary remains authoritative.
     let installed_before = fs::read(temp_root.join("bin/refine")).unwrap();
     let marker_before = fs::read(temp_root.join(".refine-deployed")).unwrap();
     fs::write(temp_root.join("Cargo.toml"), "[package]\nname='fixture'\n").unwrap();
     write_failing_fake_cargo(&temp_root, &cargo_log, 23);
-    let failed = Command::new("bash")
+    let changed = Command::new("bash")
         .arg("r")
-        .args(["system", "install", "--port", "8082"])
+        .args(["system", "service-install", "--port", "8082"])
         .current_dir(&temp_root)
         .env("PATH", &path_env)
         .output()
         .unwrap();
-    assert_eq!(failed.status.code(), Some(23));
-    assert!(
-        !String::from_utf8_lossy(&failed.stdout).contains("installed-command="),
-        "service registration must not run"
+    assert!(changed.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&changed.stdout).trim(),
+        "installed-command=system service-install --port 8082"
     );
+    assert!(!cargo_log.exists(), "service registration must not rebuild");
     assert_eq!(
         fs::read(temp_root.join("bin/refine")).unwrap(),
         installed_before
@@ -237,7 +240,8 @@ fn wrapper_system_build_and_clean_manage_the_production_binary() {
         .unwrap();
     assert!(rebuild.status.success());
     assert!(
-        String::from_utf8_lossy(&rebuild.stdout).contains("production binary is already up to date")
+        String::from_utf8_lossy(&rebuild.stdout)
+            .contains("production binary is already up to date")
     );
     assert!(cargo_log.exists(), "system build always runs the build");
 
@@ -271,6 +275,129 @@ fn wrapper_system_build_and_clean_manage_the_production_binary() {
     assert!(!cargo_log.exists());
 
     fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn wrapper_system_update_runs_the_fixed_local_sequence() {
+    let temp_root = wrapper_fixture("wrapper-system-update");
+    let operation_log = temp_root.join("operation.log");
+    let path_env = fixture_path_env(&temp_root);
+
+    fs::create_dir_all(temp_root.join("bin")).unwrap();
+    fs::write(
+        temp_root.join("bin/refine"),
+        "#!/usr/bin/env bash\nprintf 'refine:%s\\n' \"$*\" >> \"$REFINE_TEST_OPERATION_LOG\"\n",
+    )
+    .unwrap();
+    make_executable(&temp_root.join("bin/refine"));
+
+    let fake_git = temp_root.join("fake-bin/git");
+    fs::write(
+        &fake_git,
+        "#!/usr/bin/env bash\nprintf 'git:%s\\n' \"$*\" >> \"$REFINE_TEST_OPERATION_LOG\"\nif [ \"${1:-}\" = \"rev-list\" ]; then printf '1\\n'; fi\n",
+    )
+    .unwrap();
+    make_executable(&fake_git);
+
+    let fake_cargo = temp_root.join("fake-bin/cargo");
+    fs::write(
+        &fake_cargo,
+        format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf 'cargo:%s\\n' \"$*\" >> \"$REFINE_TEST_OPERATION_LOG\"\nmkdir -p '{0}/target/release'\ncat > '{0}/target/release/refine' <<'EOF'\n#!/usr/bin/env bash\nprintf 'refine:%s\\n' \"$*\" >> \"$REFINE_TEST_OPERATION_LOG\"\nEOF\nchmod +x '{0}/target/release/refine'\n",
+            temp_root.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&fake_cargo);
+
+    let output = Command::new("bash")
+        .arg("r")
+        .args(["system", "update"])
+        .current_dir(&temp_root)
+        .env("PATH", &path_env)
+        .env("REFINE_TEST_OPERATION_LOG", &operation_log)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let operations = fs::read_to_string(&operation_log).unwrap();
+    let lines: Vec<_> = operations.lines().collect();
+    assert_eq!(lines[0], "git:fetch --quiet");
+    assert_eq!(lines[1], "git:rev-list --count HEAD..@{upstream}");
+    assert_eq!(lines[2], "refine:system stop");
+    assert_eq!(lines[3], "git:stash");
+    assert_eq!(lines[4], "git:pull");
+    assert!(lines[5].starts_with("cargo:build --release --locked"));
+    assert_eq!(lines[6], "refine:system start");
+    assert_eq!(lines.len(), 7, "unexpected operations:\n{operations}");
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn wrapper_system_update_does_nothing_when_upstream_has_no_new_commits() {
+    let temp_root = wrapper_fixture("wrapper-system-update-current");
+    let operation_log = temp_root.join("operation.log");
+    let path_env = fixture_path_env(&temp_root);
+
+    fs::create_dir_all(temp_root.join("bin")).unwrap();
+    fs::write(
+        temp_root.join("bin/refine"),
+        "#!/usr/bin/env bash\nprintf 'refine:%s\\n' \"$*\" >> \"$REFINE_TEST_OPERATION_LOG\"\n",
+    )
+    .unwrap();
+    make_executable(&temp_root.join("bin/refine"));
+
+    let fake_git = temp_root.join("fake-bin/git");
+    fs::write(
+        &fake_git,
+        "#!/usr/bin/env bash\nprintf 'git:%s\\n' \"$*\" >> \"$REFINE_TEST_OPERATION_LOG\"\nif [ \"${1:-}\" = \"rev-list\" ]; then printf '0\\n'; fi\n",
+    )
+    .unwrap();
+    make_executable(&fake_git);
+
+    let output = Command::new("bash")
+        .arg("r")
+        .args(["system", "update"])
+        .current_dir(&temp_root)
+        .env("PATH", &path_env)
+        .env("REFINE_TEST_OPERATION_LOG", &operation_log)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "refine: already up to date; no update required\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&operation_log).unwrap(),
+        "git:fetch --quiet\ngit:rev-list --count HEAD..@{upstream}\n"
+    );
+    assert!(!temp_root.join("cargo.log").exists());
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn wrapper_system_update_dry_run_reports_the_fixed_sequence() {
+    let repo = env!("CARGO_MANIFEST_DIR");
+    let output = Command::new("bash")
+        .arg("r")
+        .args(["system", "update"])
+        .current_dir(repo)
+        .env("REFINE_R_DRY_RUN", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "mode=update\ncommand=git fetch --quiet\ncommand=git rev-list --count HEAD..@{upstream}\ncondition=continue only when upstream has new commits\ncommand=./r system stop\ncommand=git stash\ncommand=git pull\ncommand=./r system build\ncommand=./r system start\n"
+    );
 }
 
 #[test]
@@ -362,15 +489,18 @@ fn wrapper_test_command_routes_to_cargo_and_xtask_suites() {
 }
 
 #[test]
-fn install_runbook_uses_system_install_as_the_complete_build_and_registration_boundary() {
+fn install_runbook_distinguishes_product_installation_from_service_registration() {
     let repo = env!("CARGO_MANIFEST_DIR");
     let runbook = fs::read_to_string(format!("{repo}/docs/runbooks/install.md")).unwrap();
     let gitignore = fs::read_to_string(format!("{repo}/.gitignore")).unwrap();
 
     assert!(!runbook.contains("scripts/install.sh"));
     assert!(runbook.contains("## Update Refine"));
-    assert!(runbook.contains("./r system install --port <port>"));
-    assert!(runbook.contains("builds the locked release binary"));
+    assert!(runbook.contains("./r system service-install --port <port>"));
+    assert!(runbook.contains("./r system service-uninstall --port <port>"));
+    assert!(!runbook.contains("./r system install --port"));
+    assert!(!runbook.contains("./r system uninstall --port"));
+    assert!(runbook.contains("bootstraps the locked release binary"));
     assert!(runbook.contains("./r system start --port <port>"));
     assert!(runbook.contains("Default: `8082`"));
     assert!(runbook.contains("Do not offer `smoke-ai` during installation"));

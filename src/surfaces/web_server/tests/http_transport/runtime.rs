@@ -51,7 +51,7 @@ fn local_http_daemon_stays_responsive_while_plan_start_waits_for_git() {
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let lock_root = app_root.clone();
     let lock_thread = thread::spawn(move || {
-        crate::tools::host::git_sync::with_repository_git_lock(&lock_root, || {
+        crate::infrastructure::git::with_repository_git_lock(&lock_root, || {
             locked_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             Ok(())
@@ -117,9 +117,7 @@ fn startup_recovery_no_longer_blocks_on_cache_warming() {
     // every warmed cache rebuilds on demand, so holding the port closed for
     // warming only delayed boot. Recovery itself reports no warming steps.
     assert!(
-        messages
-            .iter()
-            .all(|message| !message.contains("warming")),
+        messages.iter().all(|message| !message.contains("warming")),
         "recovery emitted cache-warming steps: {messages:?}"
     );
 }

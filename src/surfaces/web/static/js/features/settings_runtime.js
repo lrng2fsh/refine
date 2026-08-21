@@ -57,6 +57,24 @@ function renderNodeRuntimeConfigSections(s, activeNodeLabel, cli) {
     ["1800",  "30 minutes"],
     ["3600",  "1 hour"],
   ];
+  const staleThresholdOptions = [
+    ["300",  "5 minutes"],
+    ["900",  "15 minutes"],
+    ["1800", "30 minutes"],
+    ["3600", "1 hour"],
+  ];
+  const autoRecoveryOptions = [
+    ["remote", "Automatic (remote wins; this node's Goals stay live)"],
+    ["off",    "Off — hold conflicts for operator review"],
+  ];
+  const agentResolutionOptions = [
+    ["on",  "On — an agent merges both intents before any authority fallback"],
+    ["off", "Off — contested merges fail closed immediately"],
+  ];
+  const conflictResolutionOptions = [
+    ["on",  "On — an agent resolves the conflicted refresh in place"],
+    ["off", "Off — a conflicted refresh aborts and queues a recovery Round"],
+  ];
   const providerOptions = [
     ["claude", "Claude Code (default)"],
     ["codex", "OpenAI Codex"],
@@ -69,9 +87,16 @@ function renderNodeRuntimeConfigSections(s, activeNodeLabel, cli) {
   const agentLimitPause = String(s.agent_limit_pause_seconds ?? "60");
   const backlogPromote = String(s.backlog_promote_after_seconds ?? "3600");
   const worktreeCleanup = String(s.worktree_cleanup_after_seconds ?? "0");
-  const worktreeCleanupGeneratedPaths = String(s.worktree_cleanup_generated_paths ?? "");
   const stateDebounce = String(s.state_sync_debounce_seconds ?? "5");
   const remoteFetchInterval = String(s.project_update_pulse_interval_seconds ?? "300");
+  const staleThreshold = String(s.state_sync_stale_threshold_seconds ?? "900");
+  const autoRecovery = String(s.state_sync_auto_recovery ?? "remote");
+  const agentResolution = String(s.state_sync_agent_resolution ?? "on");
+  const conflictResolution = String(s.workflow_conflict_resolution ?? "on");
+  const parallelRunCap = String(s.parallel_run_cap ?? "").trim();
+  const automaticResourceBudgetPercent = String(
+    s.automatic_agent_resource_budget_percent ?? "70",
+  ).trim();
   return `
     <section class="settings-section">
       <h3>Runtime configuration</h3>
@@ -85,8 +110,18 @@ function renderNodeRuntimeConfigSections(s, activeNodeLabel, cli) {
         id: "s-cap",
         label: "Parallel-run cap",
         guideItemId: "runtime-parallel-run-cap",
-        valueLabel: s.parallel_run_cap || 5,
-        control: `<input type="number" id="s-cap" data-testid="runtime-parallel-run-cap" value="${s.parallel_run_cap || 5}">`,
+        description: "Automatic reserves most CPU and memory for Docker and other shared-host work. Enter a number to override that conservative recommendation.",
+        valueLabel: parallelRunCap || "Automatic",
+        emptyLabel: "Automatic",
+        control: `<input type="number" id="s-cap" data-testid="runtime-parallel-run-cap" min="1" placeholder="Automatic" value="${htmlEscape(parallelRunCap)}">`,
+      })}
+      ${renderSettingsEditableField({
+        id: "s-automatic-resource-budget-percent",
+        label: "Automatic resource budget percent",
+        guideItemId: "runtime-automatic-resource-budget-percent",
+        description: "Automatic mode applies this percentage to detected logical CPU cores and currently available memory, leaving the remainder for Docker, target applications, and other shared-host work.",
+        valueLabel: `${htmlEscape(automaticResourceBudgetPercent)}%`,
+        control: `<input type="number" id="s-automatic-resource-budget-percent" data-testid="runtime-automatic-resource-budget-percent" min="1" max="100" value="${htmlEscape(automaticResourceBudgetPercent)}">`,
       })}
       ${renderSettingsEditableField({
         id: "s-pattern",
@@ -179,22 +214,11 @@ function renderNodeRuntimeConfigSections(s, activeNodeLabel, cli) {
         id: "s-worktree-cleanup-delay",
         label: "Inactive worktree retention",
         guideItemId: "runtime-worktree-cleanup",
-        description: "hibernate clean Goal worktrees with no live process or operation after this delay. Dirty, standalone, state, and unrecognized ignored content remain protected.",
+        description: "hibernate clean Goal worktrees with no live process or operation after this delay. Ignored build and cache content is discarded with the checkout; dirty, standalone, and state worktrees remain protected.",
         valueLabel: optionLabel(worktreeCleanupOptions, worktreeCleanup),
         control: `<select id="s-worktree-cleanup-delay" data-testid="runtime-worktree-cleanup-delay">
           ${worktreeCleanupOptions.map(([v, lbl]) => `<option value="${v}" ${worktreeCleanup === v ? "selected" : ""}>${lbl}</option>`).join("")}
         </select>`,
-      })}
-      ${renderSettingsEditableField({
-        id: "s-worktree-cleanup-generated-paths",
-        label: "Additional generated worktree paths",
-        guideItemId: "runtime-worktree-cleanup",
-        description: "optional comma-delimited relative cache paths that may be deleted before an inactive worktree. Cargo target directories and Node node_modules are detected automatically; all other ignored content blocks cleanup.",
-        valueLabel: worktreeCleanupGeneratedPaths || "None",
-        control: `<input type="text" id="s-worktree-cleanup-generated-paths"
-                         data-testid="runtime-worktree-cleanup-generated-paths"
-                         placeholder=".venv, build"
-                         value="${htmlEscape(worktreeCleanupGeneratedPaths)}">`,
       })}
       ${renderSettingsEditableField({
         id: "s-state-sync-debounce",
@@ -214,6 +238,46 @@ function renderNodeRuntimeConfigSections(s, activeNodeLabel, cli) {
         valueLabel: optionLabel(remoteFetchOptions, remoteFetchInterval),
         control: `<select id="s-project-update-pulse" data-testid="runtime-project-update-pulse">
           ${remoteFetchOptions.map(([v, lbl]) => `<option value="${v}" ${remoteFetchInterval === v ? "selected" : ""}>${lbl}</option>`).join("")}
+        </select>`,
+      })}
+      ${renderSettingsEditableField({
+        id: "s-state-sync-stale-threshold",
+        label: "State sync stale threshold",
+        guideItemId: "runtime-project-update-pulse",
+        description: "marks node-local sync health stale when no successful remote reconciliation occurs within this interval.",
+        valueLabel: optionLabel(staleThresholdOptions, staleThreshold),
+        control: `<select id="s-state-sync-stale-threshold" data-testid="runtime-state-sync-stale-threshold">
+          ${staleThresholdOptions.map(([v, lbl]) => `<option value="${v}" ${staleThreshold === v ? "selected" : ""}>${lbl}</option>`).join("")}
+        </select>`,
+      })}
+      ${renderSettingsEditableField({
+        id: "s-state-sync-auto-recovery",
+        label: "State sync conflict recovery",
+        guideItemId: "runtime-project-update-pulse",
+        description: "when nodes diverge, converge automatically: remote is authoritative except Goals this node owned at the last agreed state, which keep their local copy. The displaced side is always retained on a recovery ref.",
+        valueLabel: optionLabel(autoRecoveryOptions, autoRecovery),
+        control: `<select id="s-state-sync-auto-recovery" data-testid="runtime-state-sync-auto-recovery">
+          ${autoRecoveryOptions.map(([v, lbl]) => `<option value="${v}" ${autoRecovery === v ? "selected" : ""}>${lbl}</option>`).join("")}
+        </select>`,
+      })}
+      ${renderSettingsEditableField({
+        id: "s-state-sync-agent-resolution",
+        label: "State sync agent resolution",
+        guideItemId: "runtime-project-update-pulse",
+        description: "when the same record changes on two nodes, let the installed agent resolve the conflict in an isolated workspace first; only a merge it cannot justify escalates as a decision.",
+        valueLabel: optionLabel(agentResolutionOptions, agentResolution),
+        control: `<select id="s-state-sync-agent-resolution" data-testid="runtime-state-sync-agent-resolution">
+          ${agentResolutionOptions.map(([v, lbl]) => `<option value="${v}" ${agentResolution === v ? "selected" : ""}>${lbl}</option>`).join("")}
+        </select>`,
+      })}
+      ${renderSettingsEditableField({
+        id: "s-workflow-conflict-resolution",
+        label: "Candidate refresh agent resolution",
+        guideItemId: "runtime-project-update-pulse",
+        description: "when a Goal's candidate no longer rebases onto the target it will merge into, let the installed agent resolve the conflicted refresh in place; turning it off aborts the refresh and queues the fenced integration recovery Round instead.",
+        valueLabel: optionLabel(conflictResolutionOptions, conflictResolution),
+        control: `<select id="s-workflow-conflict-resolution" data-testid="runtime-workflow-conflict-resolution">
+          ${conflictResolutionOptions.map(([v, lbl]) => `<option value="${v}" ${conflictResolution === v ? "selected" : ""}>${lbl}</option>`).join("")}
         </select>`,
       })}
       ${renderSettingsEditableField({
@@ -253,6 +317,43 @@ function renderNodeRuntimeConfigSections(s, activeNodeLabel, cli) {
 
 function renderRuntimeUpgradeBanner(upgrade) {
   if (!upgrade) return "";
+  if (upgrade.runtime_kind === "source") {
+    const source = upgrade.source || {};
+    const upstream = source.upstream || {};
+    const remoteRef = [upstream.remote, upstream.branch].filter(Boolean).join("/") || "upstream";
+    const relationshipLabels = {
+      current: `Up to date with ${remoteRef}`,
+      behind: `Behind ${remoteRef}`,
+      ahead: `Ahead of ${remoteRef}`,
+      diverged: `Diverged from ${remoteRef}`,
+    };
+    if (source.running_from_head === true && relationshipLabels[source.relationship]) {
+      return `
+        <div class="runtime-version-status" data-testid="runtime-upgrade-status">
+          <span data-testid="runtime-upgrade-message">Running from HEAD · ${htmlEscape(relationshipLabels[source.relationship])}</span>
+        </div>`;
+    }
+    const unknownLabels = {
+      executable_provenance_unverified: "executable provenance is unavailable",
+      checkout_head_unavailable: "checkout HEAD is unavailable",
+      executable_checkout_mismatch: "the running executable does not match checkout HEAD",
+      upstream_cache_unavailable: "cached upstream evidence is unavailable",
+      upstream_cache_unknown: "cached upstream evidence is unavailable",
+      upstream_cache_stale: "cached upstream evidence is stale",
+      cached_checkout_path_mismatch: "cached evidence belongs to another checkout",
+      cached_checkout_identity_unavailable: "cached checkout identity is unavailable",
+      cached_checkout_identity_mismatch: "cached checkout identity does not match HEAD",
+      cached_upstream_identity_unavailable: "cached upstream identity is unavailable",
+      cached_upstream_identity_mismatch: "cached upstream identities disagree",
+      cached_relationship_identity_mismatch: "cached relationship contradicts its commit identities",
+      cached_relationship_unavailable: "cached upstream relationship is unavailable",
+    };
+    const reason = unknownLabels[source.unknown_reason] || "runtime provenance is unavailable";
+    return `
+      <div class="runtime-version-status" data-testid="runtime-upgrade-status">
+        <span data-testid="runtime-upgrade-message">Source runtime status unknown · ${htmlEscape(reason)}</span>
+      </div>`;
+  }
   const current = upgrade.current_version || "unknown";
   const latest = upgrade.latest_version || "";
   if (upgrade.upgrade_available) {
@@ -273,12 +374,6 @@ function renderRuntimeUpgradeBanner(upgrade) {
           </svg>
         </button>
       </div>`;
-  }
-  if (upgrade.local_development) {
-    return latest ? `
-      <div class="runtime-version-status" data-testid="runtime-upgrade-status">
-        <span data-testid="runtime-upgrade-message">Running latest ${htmlEscape(latest)}</span>
-      </div>` : "";
   }
   if (current && latest && current === latest) {
     return `
@@ -335,6 +430,7 @@ async function autosaveSettingsRuntime(options = {}) {
   const chosen = $("#s-cli").value;
   await api("PATCH", "/api/settings", {
     parallel_run_cap: $("#s-cap").value,
+    automatic_agent_resource_budget_percent: $("#s-automatic-resource-budget-percent").value,
     branch_name_pattern: $("#s-pattern").value,
     agent_idle_timeout_seconds: $("#s-idle").value,
     agent_hard_cap_seconds: $("#s-hard").value,
@@ -346,9 +442,12 @@ async function autosaveSettingsRuntime(options = {}) {
     chat_idle_timeout_seconds: $("#s-chat-idle").value,
     backlog_promote_after_seconds: $("#s-backlog-promote").value,
     worktree_cleanup_after_seconds: $("#s-worktree-cleanup-delay").value,
-    worktree_cleanup_generated_paths: $("#s-worktree-cleanup-generated-paths").value,
     state_sync_debounce_seconds: $("#s-state-sync-debounce").value,
     project_update_pulse_interval_seconds: $("#s-project-update-pulse").value,
+    state_sync_stale_threshold_seconds: $("#s-state-sync-stale-threshold").value,
+    state_sync_auto_recovery: $("#s-state-sync-auto-recovery").value,
+    state_sync_agent_resolution: $("#s-state-sync-agent-resolution").value,
+    workflow_conflict_resolution: $("#s-workflow-conflict-resolution").value,
     file_browser_ignore_patterns: $("#s-file-browser-ignore").value,
     agent_cli: chosen,
   });
@@ -362,7 +461,7 @@ function bindNodeRuntimeConfigControls() {
   const root = document.querySelector('[data-tab-pane="runtime"]');
   const autosaveRuntime = bindSettingsAutosave(
     root,
-    "#s-cap, #s-pattern, #s-idle, #s-hard, #s-worker-memory, #s-ui-memory, #s-worker-cpu-priority, #s-resource-isolation, #s-agent-limit-pause, #s-chat-idle, #s-backlog-promote, #s-worktree-cleanup-delay, #s-worktree-cleanup-generated-paths, #s-state-sync-debounce, #s-project-update-pulse, #s-file-browser-ignore",
+    "#s-cap, #s-automatic-resource-budget-percent, #s-pattern, #s-idle, #s-hard, #s-worker-memory, #s-ui-memory, #s-worker-cpu-priority, #s-resource-isolation, #s-agent-limit-pause, #s-chat-idle, #s-backlog-promote, #s-worktree-cleanup-delay, #s-state-sync-debounce, #s-project-update-pulse, #s-state-sync-stale-threshold, #s-state-sync-auto-recovery, #s-state-sync-agent-resolution, #s-workflow-conflict-resolution, #s-file-browser-ignore",
     autosaveSettingsRuntime,
     { event: "settings-editable-commit" },
   );
@@ -377,7 +476,7 @@ function bindNodeRuntimeConfigControls() {
   bindOnce(syncNow, "click", async () => {
     await withButtonBusy(syncNow, "Syncing...", async () => {
       try {
-        const queued = await api("POST", "/api/project/sync", {});
+        const queued = await api("POST", "/api/sync", {});
         const result = await resolveBackgroundOperationResponse(
           queued,
           "Refine state synchronization queued",

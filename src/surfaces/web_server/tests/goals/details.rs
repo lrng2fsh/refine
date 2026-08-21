@@ -373,7 +373,7 @@ fn web_server_manages_nodes_and_transfers_goal_ownership() {
     });
     assert_eq!(activated.status, 200);
     assert_eq!(activated.body["active_node_id"], "remote-qa");
-    assert!(runtime_root.join("active-node.json").exists());
+    assert!(refine_dir.join("runtime/active-node.json").exists());
     assert!(!refine_dir.join("active-node.json").exists());
 
     let transfer = server.handle(ApiRequest {
@@ -461,7 +461,7 @@ fn stale_default_label_never_relabels_default_owned_goal_projections() {
     });
     assert_eq!(created.status, 201);
     fs::write(
-        refine_dir.join(crate::tools::product::nodes::NODE_REGISTRY_FILE),
+        refine_dir.join(crate::application::fleet::nodes::NODE_REGISTRY_FILE),
         serde_json::json!({
             "nodes": [{
                 "id": "default",

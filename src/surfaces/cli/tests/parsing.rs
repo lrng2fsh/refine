@@ -93,6 +93,84 @@ fn project_worktree_cleanup_is_dry_run_by_default_and_requires_explicit_apply() 
 }
 
 #[test]
+fn sync_is_the_only_state_convergence_command() {
+    let plain = Cli::try_parse_from(["refine", "sync"]).unwrap();
+    assert!(matches!(
+        plain.command,
+        Commands::Sync {
+            preview: false,
+            authority: None,
+            target_root: None,
+            ..
+        }
+    ));
+
+    let preview = Cli::try_parse_from(["refine", "sync", "--preview"]).unwrap();
+    assert!(matches!(
+        preview.command,
+        Commands::Sync { preview: true, .. }
+    ));
+
+    let terminal = Cli::try_parse_from([
+        "refine",
+        "sync",
+        "--authority",
+        "live",
+        "--path",
+        "shared/state.json",
+    ])
+    .unwrap();
+    assert!(matches!(
+        terminal.command,
+        Commands::Sync {
+            preview: false,
+            authority: Some(CliSyncAuthority::Live),
+            ref paths,
+            ..
+        } if *paths == vec![std::path::PathBuf::from("shared/state.json")]
+    ));
+
+    // Path exceptions only refine an explicit authority, and the preview is
+    // read-only: it never carries a decision.
+    assert!(
+        Cli::try_parse_from(["refine", "sync", "--path", "goals/00/EXAMPLE/goal.json"]).is_err()
+    );
+    assert!(Cli::try_parse_from(["refine", "sync", "--preview", "--authority", "live"]).is_err());
+}
+
+#[test]
+fn retired_project_sync_and_state_recovery_commands_do_not_parse() {
+    for argv in [
+        vec!["refine", "project", "sync"],
+        vec!["refine", "project", "state-recovery", "preview"],
+        vec!["refine", "project", "state-recovery", "run"],
+        vec![
+            "refine",
+            "project",
+            "state-recovery",
+            "run",
+            "--authority",
+            "remote",
+        ],
+        vec![
+            "refine",
+            "project",
+            "state-recovery",
+            "apply",
+            "--authority",
+            "remote",
+            "--preview-file",
+            "/tmp/preview.json",
+        ],
+    ] {
+        assert!(
+            Cli::try_parse_from(&argv).is_err(),
+            "retired sync surface remained parseable: {argv:?}"
+        );
+    }
+}
+
+#[test]
 fn todo_commands_parse_explicit_reporter_and_identifiers() {
     let parsed = Cli::try_parse_from([
         "refine",

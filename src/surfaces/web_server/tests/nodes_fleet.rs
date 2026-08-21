@@ -90,6 +90,133 @@ fn web_server_manages_fleet_operations_over_nodes() {
 }
 
 #[test]
+fn web_server_copies_validated_runtime_settings_between_nodes() {
+    let temp_root = unique_temp_dir("http-node-copy-runtime-settings");
+    let refine_dir = temp_root.join(".refine");
+    let mut server = server_with_projection();
+    server.target_root = Some(temp_root.clone());
+
+    let registered = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/fleet/nodes".to_string(),
+        body: Some(json!({"id": "node-b"})),
+    });
+    assert_eq!(registered.status, 200, "{:?}", registered.body);
+    FileSettingsService::for_node(&refine_dir, "node-b")
+        .update(&json!({
+            "automatic_agent_resource_budget_percent": 40,
+            "parallel_run_cap": 2,
+            "target_app_url": "https://source.invalid"
+        }))
+        .unwrap();
+    FileSettingsService::new(&refine_dir)
+        .update(&json!({"target_app_url": "https://destination.invalid"}))
+        .unwrap();
+
+    let copied = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/nodes/copy-settings".to_string(),
+        body: Some(json!({"source_node_id": "node-b", "section": "runtime"})),
+    });
+    assert_eq!(copied.status, 200, "{:?}", copied.body);
+    assert_eq!(copied.body["source_node_id"], "node-b");
+    assert_eq!(copied.body["destination_node_id"], "default");
+    let destination = FileSettingsService::new(&refine_dir).load().unwrap();
+    assert_eq!(destination["automatic_agent_resource_budget_percent"], "40");
+    assert_eq!(destination["parallel_run_cap"], "2");
+    assert_eq!(destination["target_app_url"], "https://destination.invalid");
+
+    let invalid = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/nodes/copy-settings".to_string(),
+        body: Some(json!({"source_node_id": "node-b", "section": "quality"})),
+    });
+    assert_eq!(invalid.status, 400, "{:?}", invalid.body);
+
+    remove_temp_dir(&temp_root);
+}
+
+/// The daemon's fleet fan-out during a rolling upgrade: the node still on the
+/// previous build answers the API-contract gate, and the route reports that
+/// node as pending upgrade with a 200 — the fleet did not fail, one node has
+/// simply not been upgraded yet.
+#[test]
+fn web_server_fleet_sync_reports_a_pending_upgrade_node_without_failing() {
+    use crate::application::fleet::node_sync::{
+        FleetNodeDaemonClient, NodeDaemonReply, install_node_daemon_client,
+    };
+
+    struct ContractGateDaemon;
+
+    impl FleetNodeDaemonClient for ContractGateDaemon {
+        fn sync_node(&self, node: &crate::model::node::Node) -> NodeDaemonReply {
+            if node.id == "node-old" {
+                return NodeDaemonReply::Answered {
+                    status: 426,
+                    body: json!({
+                        "error": {
+                            "code": "api_version_mismatch",
+                            "message": "unsupported Refine API contract version"
+                        },
+                        "api_contract_version": "2",
+                        "supported_api_contract_versions": ["2"]
+                    }),
+                };
+            }
+            NodeDaemonReply::Answered {
+                status: 200,
+                body: json!({"operation": {"id": "op-1", "status": "running"}}),
+            }
+        }
+    }
+
+    let temp_root = unique_temp_dir("http-fleet-sync-pending-upgrade");
+    let refine_dir = temp_root.join(".refine");
+    fs::create_dir_all(&refine_dir).unwrap();
+    let mut server = server_with_projection();
+    server.target_root = Some(refine_dir.parent().unwrap().to_path_buf());
+    for id in ["node-old", "node-new"] {
+        let registered = server.handle(ApiRequest {
+            method: "POST".to_string(),
+            path: "/api/fleet/nodes".to_string(),
+            body: Some(json!({"id": id, "ssh_host": "example.com", "refine_port": 8082})),
+        });
+        assert_eq!(registered.status, 200);
+    }
+    let _daemons = install_node_daemon_client(&refine_dir, std::sync::Arc::new(ContractGateDaemon));
+
+    let synced = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/fleet/sync".to_string(),
+        body: None,
+    });
+
+    assert_eq!(synced.status, 200);
+    assert_eq!(synced.body["ok"], true);
+    assert_eq!(synced.body["pending_upgrade"], json!(["node-old"]));
+    let status = |id: &str| {
+        synced.body["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["node_id"] == id)
+            .unwrap_or_else(|| panic!("{id} is missing from the fleet sync report"))
+            .clone()
+    };
+    assert_eq!(status("node-old")["status"], "pending_upgrade");
+    assert_eq!(status("node-old")["api_contract_version"], "2");
+    assert_eq!(
+        status("node-old")["expected_api_contract_version"],
+        crate::application::protocol::API_CONTRACT_VERSION
+    );
+    // The answer is the node's receipt for the request, not a verdict on its
+    // reconciliation: that node runs and reports its own pass.
+    assert_eq!(status("node-new")["status"], "queued");
+
+    remove_temp_dir(&temp_root);
+}
+
+#[test]
 fn web_server_reports_dashboard_diagnostics_target_app_nodes_and_fleet() {
     let temp_root = unique_temp_dir("http-status-surfaces");
     let refine_dir = temp_root.join(".refine");
@@ -414,6 +541,43 @@ fn web_server_reports_dashboard_diagnostics_target_app_nodes_and_fleet() {
     assert_eq!(fleet.status, 200);
     assert_eq!(fleet.body["enabled"], true);
     assert_eq!(fleet.body["nodes"][0]["id"], "default");
+
+    remove_temp_dir(&temp_root);
+}
+
+#[test]
+fn nodes_reports_local_state_sync_health_only_for_the_active_node() {
+    let temp_root = unique_temp_dir("http-node-state-sync-health");
+    let refine_dir = temp_root.join(".refine");
+    let runtime_root = temp_root.join("run/8080");
+    fs::create_dir_all(&refine_dir).unwrap();
+    let mut server = server_with_projection();
+    server.target_root = Some(temp_root.clone());
+    server.runtime_root = Some(runtime_root.clone());
+    server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/nodes".to_string(),
+        body: Some(json!({"id": "node-b"})),
+    });
+    crate::application::persistence_sync::health::FileStateSyncHealthService::new(&runtime_root)
+        .record_success(&temp_root, "default")
+        .unwrap();
+
+    let response = server.handle(ApiRequest {
+        method: "GET".to_string(),
+        path: "/api/nodes".to_string(),
+        body: None,
+    });
+    assert_eq!(response.status, 200, "{:#}", response.body);
+    let nodes = response.body["nodes"].as_array().unwrap();
+    let active = nodes.iter().find(|node| node["id"] == "default").unwrap();
+    let other = nodes.iter().find(|node| node["id"] == "node-b").unwrap();
+    assert_eq!(active["state_sync_health"]["status"], "healthy");
+    assert_eq!(other["state_sync_health"]["status"], "unknown");
+    assert_eq!(
+        other["state_sync_health"]["reason"],
+        "node_local_evidence_unavailable"
+    );
 
     remove_temp_dir(&temp_root);
 }

@@ -5,25 +5,25 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-use crate::process::subprocess::{FileProcessSupervisor, ProcessSupervisor};
-use crate::process::supervisor::config::FileSettingsService;
-use crate::process::supervisor::errors::{RefineError, RefineResult};
-use crate::process::supervisor::operations::{
-    FileOperationRegistry, OperationProjectionRefresher, OperationRegistry, OperationState,
-};
-use crate::tools::host::agent_providers::HostAgentProviderService;
-#[cfg(test)]
-use crate::tools::host::git_sync::FileGitSyncService;
-use crate::tools::host::project_layout::prepare_refine_dir;
-#[cfg(test)]
-use crate::tools::host::project_layout::refine_dir_for_target_root;
-use crate::tools::product::chat::FileChatService;
-use crate::tools::product::nodes::FileNodeRegistryService;
-use crate::tools::product::project_projection::{
+use crate::application::chat::FileChatService;
+use crate::application::fleet::nodes::FileNodeRegistryService;
+use crate::application::persistence_sync::health::{FileStateSyncHealthService, StateSyncHealth};
+use crate::application::persistence_sync::state::FileGitSyncService;
+use crate::application::projects::projection::{
     FileProjectProjectionStore, ProjectionSnapshot, RuntimeProjection,
 };
-use crate::tools::product::project_registry::FileProjectRegistryService;
-use crate::tools::product::work_items::FileWorkItemService;
+use crate::application::projects::registry::FileProjectRegistryService;
+use crate::application::work_items::FileWorkItemService;
+use crate::application::workers::{GIT_SYNC_RUNNER, state_sync_stale_threshold};
+use crate::error::{RefineError, RefineResult};
+use crate::infrastructure::agents::invocation::HostAgentProviderService;
+use crate::infrastructure::process::subprocess::{FileProcessSupervisor, ProcessSupervisor};
+use crate::infrastructure::process::supervisor::config::FileSettingsService;
+use crate::infrastructure::process::supervisor::operations::{
+    FileOperationRegistry, OperationProjectionRefresher, OperationRegistry, OperationState,
+};
+use crate::infrastructure::storage::project_layout::prepare_refine_dir;
+use crate::infrastructure::storage::project_layout::refine_dir_for_target_root;
 
 use super::support::*;
 use super::*;
@@ -55,6 +55,32 @@ impl OperationProjectionRefresher for InProcessWebServer {
 }
 
 impl InProcessWebServer {
+    pub(super) fn current_state_sync_health(&self) -> RefineResult<Option<StateSyncHealth>> {
+        let (Some(runtime_root), Some(target_root)) =
+            (self.runtime_root.as_deref(), self.current_target_root()?)
+        else {
+            return Ok(None);
+        };
+        let refine_dir = prepare_refine_dir(&target_root)?;
+        let node_id = FileNodeRegistryService::with_active_root(&refine_dir, runtime_root)
+            .active_node_id()?;
+        let threshold = state_sync_stale_threshold(runtime_root, &target_root)?;
+        let mut health = FileStateSyncHealthService::new(runtime_root).inspect(
+            &target_root,
+            &node_id,
+            threshold,
+        )?;
+        let pause = FileProcessSupervisor::new(runtime_root).pause_state()?;
+        if health.status != "failed" && pause.workflow_paused {
+            health.status = "paused".to_string();
+        } else if health.status != "failed"
+            && pause.disabled_background_workers.contains(GIT_SYNC_RUNNER)
+        {
+            health.status = "disabled".to_string();
+        }
+        Ok(Some(health))
+    }
+
     pub(super) fn product_paths(&self) -> RefineResult<&RefineCheckoutPaths> {
         self.product_paths.as_ref().ok_or_else(|| {
             RefineError::NotFound(
@@ -71,8 +97,15 @@ impl InProcessWebServer {
             .unwrap_or_default()
     }
 
-    #[cfg(test)]
     pub(super) fn current_git_sync_service(&self) -> RefineResult<Option<FileGitSyncService>> {
+        Ok(self
+            .current_git_sync_service_with_target()?
+            .map(|(service, _)| service))
+    }
+
+    pub(super) fn current_git_sync_service_with_target(
+        &self,
+    ) -> RefineResult<Option<(FileGitSyncService, PathBuf)>> {
         let Some(target_root) = self.current_target_root()? else {
             return Ok(None);
         };
@@ -80,7 +113,10 @@ impl InProcessWebServer {
             .runtime_root
             .clone()
             .unwrap_or(refine_dir_for_target_root(&target_root)?.join("runtime"));
-        Ok(Some(FileGitSyncService::new(target_root, runtime_root)))
+        Ok(Some((
+            FileGitSyncService::new(&target_root, runtime_root),
+            target_root,
+        )))
     }
 
     pub(super) fn app_registry_runtime_root(&self) -> Option<PathBuf> {

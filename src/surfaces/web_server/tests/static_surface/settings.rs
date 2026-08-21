@@ -8,17 +8,33 @@ fn static_runtime_settings_expose_state_sync_controls() {
         fs::read_to_string(static_root.join("js/features/settings_releases.js")).unwrap();
 
     assert!(runtime.contains(r#"data-testid="runtime-state-sync-now""#));
+    assert!(runtime.contains(r#"placeholder="Automatic""#));
+    assert!(runtime.contains(r#"valueLabel: parallelRunCap || "Automatic""#));
+    assert!(runtime.contains(r#"emptyLabel: "Automatic""#));
+    assert!(runtime.contains("Enter a number to override that conservative recommendation"));
+    assert!(!runtime.contains("s.parallel_run_cap || 5"));
+    assert!(runtime.contains(r#"data-testid="runtime-automatic-resource-budget-percent""#));
+    assert!(runtime.contains(r#"min="1" max="100""#));
+    assert!(runtime.contains(r#"s.automatic_agent_resource_budget_percent ?? "70""#));
+    assert!(runtime.contains(
+        r##"automatic_agent_resource_budget_percent: $("#s-automatic-resource-budget-percent").value"##
+    ));
+    assert!(runtime.contains("leaving the remainder for Docker"));
     assert!(runtime.contains(r#"data-testid="runtime-state-sync-debounce""#));
     assert!(runtime.contains(r#"data-testid="runtime-project-update-pulse""#));
     assert!(runtime.contains(r#"data-testid="runtime-worktree-cleanup-delay""#));
-    assert!(runtime.contains(r#"data-testid="runtime-worktree-cleanup-generated-paths""#));
+    assert!(!runtime.contains("worktree_cleanup_generated_paths"));
     assert!(runtime.contains(r#"data-testid="runtime-worktree-cleanup-now""#));
-    assert!(runtime.contains(r#"api("POST", "/api/project/sync", {})"#));
+    assert!(runtime.contains(r#"api("POST", "/api/sync", {})"#));
     assert!(runtime.contains(r#""/api/project/worktrees/cleanup""#));
     assert!(runtime.contains("resolveBackgroundOperationResponse"));
     assert!(
         runtime.contains(r##"state_sync_debounce_seconds: $("#s-state-sync-debounce").value"##)
     );
+    assert!(runtime.contains(
+        r##"state_sync_stale_threshold_seconds: $("#s-state-sync-stale-threshold").value"##
+    ));
+    assert!(runtime.contains("runtime-state-sync-stale-threshold"));
     assert!(runtime.contains(
         r##"project_update_pulse_interval_seconds: $("#s-project-update-pulse").value"##
     ));
@@ -26,12 +42,11 @@ fn static_runtime_settings_expose_state_sync_controls() {
         runtime
             .contains(r##"worktree_cleanup_after_seconds: $("#s-worktree-cleanup-delay").value"##)
     );
-    assert!(runtime.contains(
-        r##"worktree_cleanup_generated_paths: $("#s-worktree-cleanup-generated-paths").value"##
-    ));
     assert!(!runtime.contains(r#"data-testid="source-upgrade-section""#));
     assert!(releases.contains(r#"data-testid="source-upgrade-section""#));
-    assert!(releases.contains("<h3>Upgrade</h3>"));
+    assert!(releases.contains("<h3>Update</h3>"));
+    assert!(!releases.contains("checkout has uncommitted changes"));
+    assert!(releases.contains(r#"data-testid="source-promotion-stash""#));
     assert!(!releases.contains("Dogfood source"));
     assert!(releases.contains(r#"data-testid="source-promotion-check""#));
     assert!(releases.contains(r#"data-testid="source-promotion-promote""#));
@@ -54,7 +69,7 @@ fn static_main_nav_exposes_refine_source_update_affordance() {
     assert!(releases.contains("button.disabled = sourceUpdate.enabled !== true"));
     assert!(releases.contains(r#"fetchRemote ? "/api/system/source/check""#));
     assert!(releases.contains(r#"api("POST", "/api/system/source/promote", {})"#));
-    assert!(releases.contains("Upgrade Refine"));
+    assert!(releases.contains("Update Refine"));
     assert!(releases.contains("source_check"));
     assert!(!releases.contains("window.confirm("));
     assert!(!releases.contains("hasAttachedProject()"));

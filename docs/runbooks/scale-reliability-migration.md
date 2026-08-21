@@ -2,14 +2,22 @@
 
 This runbook is for an agent upgrading an existing Refine node to the current
 node-local scale and reliability layout. The durable product contracts behind
-the procedure live in [Target App](../intent/02-foundation/03-target-app.md) and
-[Process](../intent/03-capabilities/01-process.md).
+the procedure live in [Target App](../intent/02-model/03-target-app.md) and
+[Process](../intent/04-infrastructure/01-process.md).
 
 The changes are deliberately not backwards compatible. Two on-disk locations
 moved and two are now obsolete. Nothing here rewrites durable project state:
 every Goal record, Feature record, and setting stays exactly where it is. What
 moves is node-local evidence, and what is deleted is derived data that rebuilds
 itself.
+
+That incompatibility is **node-local**, and this runbook migrates **one node**.
+Run it on each node as that node is upgraded, in any order, without stopping
+the rest of the fleet: node-local layout is not synchronized, nodes on
+different builds keep converging on `refine/state`, and a node whose turn has
+not come reports `pending_upgrade` to `refine fleet sync` and `refine fleet
+list` until it is upgraded. Do not wait for a window in which every node can be
+upgraded at once — there is no such requirement.
 
 Read the whole runbook before starting. Verify each step rather than assuming
 it worked — several steps are silent when they do nothing.
@@ -244,13 +252,18 @@ upgrade commits their deletion — on the order of dozens of files. This is
 expected, and it is the fix taking effect rather than data loss: the logs remain
 on the node under `runtime/`.
 
-Run `REFINE_DAEMON_PORT="$PORT" ./r project sync`, inspect the resulting
+Run `REFINE_DAEMON_PORT="$PORT" ./r sync`, inspect the resulting
 `refine/state` commit, and verify it removes old Goal log paths without adding
 `runtime/`.
 
 History still carries the volume already committed. Reclaiming that requires
 rewriting `refine/state`, which is a separate decision, is not part of this
 migration, and must not be attempted without the project owner.
+
+A node that has not been migrated yet still publishes its own Goal logs, so
+those paths reappear on the branch until that node's turn comes. That is the
+rollout in progress, not a regression on this node: each node stops publishing
+them as it is migrated, and the branch converges either way.
 
 ## If the node misbehaves after migration
 

@@ -3,11 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use refine::process::supervisor::runtime::{
+use refine::infrastructure::process::supervisor::runtime::{
     DEFAULT_APP_ID, RuntimePathInputs, RuntimePathLayout, current_runtime_os,
 };
 use refine::surfaces::web_server::{API_CONTRACT_VERSION, API_GROUPS};
-use refine::tools::host::release::{FileReleaseService, ReleaseBump};
+use refine::application::system::release::{FileReleaseService, ReleaseBump};
 use serde_json::json;
 
 fn main() {
@@ -127,6 +127,10 @@ fn test_cargo_integrations() -> Result<(), String> {
                 "cli_target_root",
                 "--test",
                 "production_binary_install",
+                "--test",
+                "sync_simulation",
+                "--test",
+                "sync_regressions",
                 "--",
                 "--test-threads=1",
             ])

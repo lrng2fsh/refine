@@ -2,12 +2,12 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::process::supervisor::errors::RefineResult;
-use crate::process::supervisor::lifecycle::DaemonStatus;
-use crate::tools::host::checkout::RefineCheckoutPaths;
-use crate::tools::product::project_projection::ProjectionSnapshot;
+use crate::application::projects::projection::ProjectionSnapshot;
+use crate::error::RefineResult;
+use crate::infrastructure::process::supervisor::lifecycle::DaemonStatus;
+use crate::infrastructure::runtime::checkout::RefineCheckoutPaths;
 
-pub const API_CONTRACT_VERSION: &str = "2";
+pub use crate::application::protocol::API_CONTRACT_VERSION;
 pub const IDEMPOTENCY_DIR: &str = "idempotency";
 pub const API_EVENTS_FILE: &str = "api-events.jsonl";
 
@@ -28,7 +28,11 @@ pub const API_GROUPS: &[ApiRouteGroup] = &[
     },
     ApiRouteGroup {
         prefix: "/project",
-        capability: "active app status, app attach helpers, migration, sync, managed worktree cleanup",
+        capability: "active app status, app attach helpers, migration, managed worktree cleanup",
+    },
+    ApiRouteGroup {
+        prefix: "/sync",
+        capability: "state-branch synchronization, read-only divergence preview, terminal authority decisions",
     },
     ApiRouteGroup {
         prefix: "/target-app",

@@ -243,7 +243,19 @@ impl InProcessWebServer {
         }
     }
 
-    pub(crate) fn handle_project_sync(&self) -> ApiResponse {
+    /// `POST /sync`: without an authority body, queue the ordinary sync
+    /// pipeline as a supervised operation; with `{authority, paths}`, run the
+    /// terminal recovery — sync with a decision attached — synchronously.
+    pub(crate) fn handle_sync(&self, request: ApiRequest) -> ApiResponse {
+        let body = request.body.unwrap_or_else(|| json!({}));
+        if body.get("authority").is_some() {
+            return self.handle_sync_with_authority(&body);
+        }
+        if body.get("paths").is_some() {
+            return error_response(RefineError::InvalidInput(
+                "paths require an authority of live or remote".to_string(),
+            ));
+        }
         let Some(runtime_root) = &self.runtime_root else {
             return runtime_root_unavailable("synchronize Refine state");
         };
@@ -255,6 +267,102 @@ impl InProcessWebServer {
         match FileRunnerWorkerService::new(runtime_root).queue_project_sync(&target_root) {
             Ok(operation) => {
                 ApiResponse::json(202, json!({"operation": operation_response(operation)}))
+            }
+            Err(error) => error_response(error),
+        }
+    }
+
+    pub(crate) fn handle_sync_preview(&self) -> ApiResponse {
+        let service = match self.current_git_sync_service() {
+            Ok(Some(service)) => service,
+            Ok(None) => return target_root_unavailable("preview state synchronization"),
+            Err(error) => return error_response(error),
+        };
+        match service.preview_state_recovery() {
+            Ok(preview) => ApiResponse::json(200, serde_json::to_value(preview).unwrap()),
+            Err(error) => error_response(error),
+        }
+    }
+
+    /// Named `paths` are exceptions settled on the opposite side of the
+    /// chosen authority.
+    fn handle_sync_with_authority(&self, body: &Value) -> ApiResponse {
+        let (service, target_root) = match self.current_git_sync_service_with_target() {
+            Ok(Some(service_and_target)) => service_and_target,
+            Ok(None) => return target_root_unavailable("settle state synchronization"),
+            Err(error) => return error_response(error),
+        };
+        use crate::application::persistence_sync::recovery::{
+            StateRecoveryAuthority, StateRecoveryDecision, StateRecoveryOverride,
+            StateRecoveryRunPolicy,
+        };
+        let default_authority: StateRecoveryAuthority =
+            match serde_json::from_value(body["authority"].clone()) {
+                Ok(authority) => authority,
+                Err(_) => {
+                    return error_response(RefineError::InvalidInput(
+                        "authority must be live or remote".to_string(),
+                    ));
+                }
+            };
+        let exception = match default_authority {
+            StateRecoveryAuthority::Live => StateRecoveryAuthority::Remote,
+            StateRecoveryAuthority::Remote => StateRecoveryAuthority::Live,
+        };
+        let paths: Vec<String> = match body.get("paths") {
+            None => Vec::new(),
+            Some(paths) => match serde_json::from_value(paths.clone()) {
+                Ok(paths) => paths,
+                Err(_) => {
+                    return error_response(RefineError::InvalidInput(
+                        "paths must be an array of contested path strings".to_string(),
+                    ));
+                }
+            },
+        };
+        let policy = StateRecoveryRunPolicy::Decision(StateRecoveryDecision {
+            default_authority,
+            overrides: paths
+                .into_iter()
+                .map(|path| StateRecoveryOverride {
+                    path,
+                    authority: exception,
+                })
+                .collect(),
+        });
+        let recovery_health = self.current_state_sync_health().ok().flatten();
+        match service.run_state_recovery_with_policy(policy) {
+            Ok(result) => {
+                let settlement = result
+                    .recovered
+                    .then_some(())
+                    .and(self.runtime_root.as_deref())
+                    .zip(recovery_health.as_ref())
+                    .and_then(|(runtime_root, expected_health)| {
+                        crate::application::workers::settle_state_recovery_success(
+                            runtime_root,
+                            &target_root,
+                            expected_health,
+                        )
+                        .ok()
+                    });
+                let health_settled = settlement.as_ref().is_some_and(|(settled, _)| *settled);
+                let state_sync_health = settlement.map(|(_, health)| health);
+                let mut value = serde_json::to_value(result).unwrap();
+                if let Value::Object(fields) = &mut value {
+                    fields.insert("health_settled".to_string(), json!(health_settled));
+                    fields.insert(
+                        "state_sync_health".to_string(),
+                        state_sync_health.map_or(Value::Null, |health| json!(health)),
+                    );
+                }
+                // `/sync` is exempt from the blanket post-mutation refresh
+                // (the queued form's worker rebuilds the projection itself),
+                // so the synchronous terminal form refreshes here.
+                if let Err(error) = self.refresh_projection_cache_after_mutation() {
+                    return error_response(error);
+                }
+                ApiResponse::json(200, value)
             }
             Err(error) => error_response(error),
         }

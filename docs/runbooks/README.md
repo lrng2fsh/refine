@@ -23,7 +23,7 @@ Runbooks:
 - [Operate development-request email intake](development-request-email.md) —
   connect the Fastmail `goal@getrefine.dev` mailbox to the active project,
   verify queued intake, automatic approval, and threaded resolution replies.
-- [Upgrade Refine source](upgrade-refine-source.md) — safely build,
+- [Update Refine from source](update-refine-source.md) — safely build,
   fast-forward, and restart a running Refine source checkout from the UI or CLI.
 - [Prepare and publish a release](semantic-release.md) — preview a semantic
   increment, prepare and review the candidate, then explicitly publish it.
@@ -32,6 +32,12 @@ Runbooks:
   identity and work while the agent owns the machines.
 - [Distribute and converge work](distribute-and-converge.md) — move Goals to
   workers and bring reviewable work home.
+- [Accelerate Goal builds](accelerate-goal-builds.md) — share a compile cache
+  across Round worktrees through the node's shell environment so fresh Rounds
+  stop paying cold builds.
+- [Recover a state-sync conflict](state-sync-recovery.md) — read the
+  divergence preview and settle contested paths terminally with default and
+  per-path authority, without editing synchronized state by hand.
 - [Migrate Gap state to Goals](migrate-gap-state.md) — preserve intent through
   the agent-operated schema migration.
 - [Migrate a Refine v2 project to current v4](v2-to-v4-migration-runbook.md) —

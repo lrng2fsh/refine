@@ -2,8 +2,10 @@
 set -euo pipefail
 
 # ./r always runs the production (release) binary at bin/refine — never a
-# debug build. `system start`, `system install`, and `system build` create or
-# refresh that binary; every other command requires it to exist already.
+# debug build. `system start` and `system build` create or refresh that binary;
+# `system service-install` bootstraps it only when it is missing. `system update`
+# owns the stop, Git update, rebuild, and start sequence. Every other command
+# requires the binary to exist already.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 RELEASE_BIN="${REFINE_RELEASE_BIN:-$ROOT/bin/refine}"
@@ -70,6 +72,13 @@ ensure_release_binary() {
   else
     return 0
   fi
+  install_release_binary
+}
+
+bootstrap_release_binary() {
+  local context="$1"
+  [ -x "$RELEASE_BIN" ] && return 0
+  printf 'refine: production binary is missing; building it before %s\n' "$context"
   install_release_binary
 }
 
@@ -163,6 +172,48 @@ run_test_command() {
   esac
 }
 
+run_system_update() {
+  if args_contain_help "$@"; then
+    cat <<'EOF'
+Usage: ./r system update
+
+Stop Refine, stash local changes and pull from Git, rebuild the production
+binary, then start Refine. If the configured upstream has no new commits,
+leave the checkout and running Refine process unchanged.
+EOF
+    return 0
+  fi
+  if [ "$#" -ne 0 ]; then
+    printf 'refine: ./r system update accepts no arguments\n' >&2
+    return 2
+  fi
+  if [ "${REFINE_R_DRY_RUN:-0}" = "1" ]; then
+    printf 'mode=update\n'
+    printf 'command=git fetch --quiet\n'
+    printf "command=git rev-list --count HEAD..@{upstream}\n"
+    printf 'condition=continue only when upstream has new commits\n'
+    printf 'command=./r system stop\n'
+    printf 'command=git stash\n'
+    printf 'command=git pull\n'
+    printf 'command=./r system build\n'
+    printf 'command=./r system start\n'
+    return 0
+  fi
+
+  cd "$ROOT"
+  git fetch --quiet
+  local update_count
+  update_count="$(git rev-list --count HEAD..'@{upstream}')"
+  if [ "$update_count" = "0" ]; then
+    printf 'refine: already up to date; no update required\n'
+    return 0
+  fi
+  ./r system stop
+  git stash && git pull
+  ./r system build
+  ./r system start
+}
+
 print_test_dry_run() {
   local suite
   suite="$(normalize_test_suite "${1:-unit}")"
@@ -245,8 +296,14 @@ if [ "${1:-}" = "test" ]; then
   run_test_command "$@"
 fi
 
-# `system build` and `system clean` are launcher-owned: they manage the
-# production binary itself, so they never delegate to it.
+if [ "${1:-}" = "system" ] && [ "${2:-}" = "update" ]; then
+  shift 2
+  run_system_update "$@"
+  exit $?
+fi
+
+# `system build`, `system clean`, and `system update` are launcher-owned: they
+# manage the production binary itself, so they never delegate to it.
 if [ "${1:-}" = "system" ] && { [ "${2:-}" = "build" ] || [ "${2:-}" = "clean" ]; }; then
   BINARY_ACTION="$2"
   shift 2
@@ -284,8 +341,8 @@ if [ "${1:-}" = "system" ] && { [ "${2:-}" = "build" ] || [ "${2:-}" = "clean" ]
 fi
 
 if [ "${REFINE_R_DRY_RUN:-0}" != "1" ]; then
-  if system_command_requested install "$@"; then
-    ensure_release_binary "system install"
+  if system_command_requested service-install "$@"; then
+    bootstrap_release_binary "system service-install"
   elif system_command_requested start "$@"; then
     ensure_release_binary "system start"
   fi
@@ -304,7 +361,7 @@ fi
 
 if [ ! -x "$RELEASE_BIN" ]; then
   printf 'refine: production binary is missing: %s\n' "$RELEASE_BIN" >&2
-  printf 'refine: build it with ./r system build (system start and system install build it automatically)\n' >&2
+  printf 'refine: build it with ./r system build (system start and system service-install build it automatically)\n' >&2
   exit 127
 fi
 

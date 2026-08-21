@@ -1,10 +1,132 @@
 use super::*;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::model::goal::{
     IMPLEMENTATION_PLAN_SCHEMA_VERSION, ImplementationPlan, ImplementationPlanBinding,
     ImplementationPlanPhase, ImplementationPlanState,
 };
+
+#[test]
+fn daemon_resolve_merged_action_reaches_shared_terminal_capability() {
+    let temp_root = unique_temp_dir("http-resolve-merged");
+    let target_root = temp_root.join("repo");
+    let runtime_root = temp_root.join("run/8082");
+    init_git_app(&target_root);
+    let base = git_stdout(&target_root, &["rev-parse", "HEAD"]);
+    git(
+        &target_root,
+        &["checkout", "-b", "refine/GOAL-MERGED/round-1"],
+    )
+    .unwrap();
+    fs::write(target_root.join("merged.txt"), "merged\n").unwrap();
+    git(&target_root, &["add", "merged.txt"]).unwrap();
+    git(&target_root, &["commit", "-m", "candidate"]).unwrap();
+    let candidate = git_stdout(&target_root, &["rev-parse", "HEAD"]);
+    git(&target_root, &["checkout", "main"]).unwrap();
+    git(&target_root, &["merge", "--no-ff", "--no-edit", &candidate]).unwrap();
+    let integrated = git_stdout(&target_root, &["rev-parse", "HEAD"]);
+    let refine_dir = refine_dir_for_target_root(&target_root).unwrap();
+    let work_items = FileWorkItemService::new(&refine_dir);
+
+    let create_quality_goal = |goal_id: &str, include_integration: bool| {
+        work_items
+            .create_goal_summary(goal_id, Some(goal_id))
+            .unwrap();
+        work_items
+            .append_goal_round_summary(goal_id, "Buddy", "Implement")
+            .unwrap();
+        work_items
+            .transition_goal_status(goal_id, GoalStatus::Todo)
+            .unwrap();
+        work_items
+            .advance_automated_goal_status(goal_id, GoalStatus::Plan)
+            .unwrap();
+        work_items
+            .update_goal_git_refs(
+                goal_id,
+                &format!("refine/{goal_id}/round-1"),
+                "main",
+                &base,
+                Some(&candidate),
+            )
+            .unwrap();
+        work_items
+            .advance_automated_goal_status(goal_id, GoalStatus::Implement)
+            .unwrap();
+        work_items
+            .advance_automated_goal_status(goal_id, GoalStatus::Quality)
+            .unwrap();
+        let mut evidence = json!({
+            "quality_state": "passed",
+            "quality_candidate_commit": candidate,
+            "quality_checked_at": "2026-08-15T00:01:00Z",
+            "quality_details": {
+                "candidate_commit": candidate,
+                "source_candidate_commit": candidate,
+                "evaluation_scope": "isolated_candidate"
+            },
+            "rule_state": "passed",
+            "meta_rule_state": "passed",
+            "product_state": "passed",
+            "constitution_state": "passed",
+            "governance_candidate_commit": candidate,
+            "governance_checked_at": "2026-08-15T00:02:00Z"
+        });
+        if include_integration {
+            evidence["workflow_integration"] = json!({
+                "candidate_commit": candidate,
+                "target_branch": "main",
+                "target_commit": integrated,
+                "remote": "origin",
+                "pushed": false,
+                "integrated_at": "2026-08-15T00:03:00Z",
+                "merge": {"ok": true, "conflicts": [], "message": "integrated"}
+            });
+        }
+        work_items
+            .update_goal_round_evaluation_summary(goal_id, 0, &evidence)
+            .unwrap();
+        let (round_idx, revision, request) = work_items.authored_goal_commitment(goal_id).unwrap();
+        work_items
+            .claim_workflow_attempt(goal_id, GoalStatus::Quality, round_idx, revision, &request)
+            .unwrap();
+    };
+    create_quality_goal("GOAL-MERGED", true);
+    create_quality_goal("GOAL-SIBLING", false);
+
+    let mut server = server_with_projection();
+    server.target_root = Some(target_root);
+    server.runtime_root = Some(runtime_root);
+    let resolved = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/goals/GOAL-MERGED/resolve-merged".to_string(),
+        body: None,
+    });
+    assert_eq!(resolved.status, 200, "{}", resolved.body);
+    assert_eq!(resolved.body["resolution"], "resolved");
+    assert_eq!(resolved.body["goal"]["status"], "review");
+    let repeated = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/goals/GOAL-MERGED/resolve-merged".to_string(),
+        body: None,
+    });
+    assert_eq!(repeated.status, 200, "{}", repeated.body);
+    assert_eq!(repeated.body["resolution"], "already_resolved");
+    let rejected = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/goals/GOAL-SIBLING/resolve-merged".to_string(),
+        body: None,
+    });
+    assert_eq!(rejected.status, 409, "{}", rejected.body);
+    assert!(
+        rejected.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("candidate ancestry alone")
+    );
+    remove_temp_dir(&temp_root);
+}
 
 #[test]
 fn web_server_transitions_goal_and_refine_dir() {
@@ -91,12 +213,14 @@ fn web_server_open_agent_attaches_to_the_workflow_goal_agent() {
         metadata.insert("goal_id".to_string(), json!("GOAL1"));
         run_goal_agent(
             GoalAgentLaunch {
+                provider_session: None,
                 runtime_root: runtime_for_thread,
                 cwd: app_for_thread,
                 provider: "smoke-ai".to_string(),
                 prompt: "Implement Goal GOAL1".to_string(),
                 metadata,
                 completion_timeout: None,
+                idle_timeout: None,
             },
             |_| {},
         )
@@ -114,15 +238,52 @@ fn web_server_open_agent_attaches_to_the_workflow_goal_agent() {
     let mut server = server_with_projection();
     server.target_root = Some(app_root);
     server.runtime_root = Some(runtime_root.clone());
-    let opened = server.handle(ApiRequest {
+    let queue_started = Instant::now();
+    let queued = server.handle(ApiRequest {
         method: "POST".to_string(),
         path: "/api/terminal/session".to_string(),
-        body: Some(json!({"profile": "goal", "goal_id": "GOAL1"})),
+        body: Some(json!({
+            "profile": "goal",
+            "surface": "toolbar",
+            "goal_id": "GOAL1"
+        })),
     });
-    assert_eq!(opened.status, 200, "{}", opened.body);
-    assert_eq!(opened.body["profile"], "goal");
-    assert_eq!(opened.body["goal_id"], "GOAL1");
-    let session_id = opened.body["id"].as_str().unwrap();
+    assert_eq!(queued.status, 202, "{}", queued.body);
+    let queue_elapsed = queue_started.elapsed();
+    assert!(
+        queue_elapsed < Duration::from_millis(50),
+        "Toolbar attachment queue request exceeded the 50ms local API budget: {:?}",
+        queue_elapsed
+    );
+    let operation_id = queued.body["operation"]["id"].as_str().unwrap();
+    let status_started = Instant::now();
+    let pending = server.handle(ApiRequest {
+        method: "GET".to_string(),
+        path: format!("/api/operations/{operation_id}"),
+        body: None,
+    });
+    assert_eq!(pending.status, 200, "{}", pending.body);
+    let status_elapsed = status_started.elapsed();
+    assert!(
+        status_elapsed < Duration::from_millis(50),
+        "Toolbar attachment status request exceeded the 50ms local API budget: {:?}",
+        status_elapsed
+    );
+    eprintln!(
+        "Toolbar attachment local API latency: queue={}us status={}us",
+        queue_elapsed.as_micros(),
+        status_elapsed.as_micros()
+    );
+    let opened = wait_for_operation_status(
+        &FileOperationRegistry::new(&runtime_root),
+        operation_id,
+        OperationState::Succeeded,
+    )
+    .result;
+    assert_eq!(opened["profile"], "goal");
+    assert_eq!(opened["goal_id"], "GOAL1");
+    assert_eq!(opened["toolbar_timeout_protected"], true);
+    let session_id = opened["id"].as_str().unwrap();
     let input = server.handle(ApiRequest {
         method: "POST".to_string(),
         path: format!("/api/terminal/{session_id}/input"),
@@ -139,6 +300,85 @@ fn web_server_open_agent_attaches_to_the_workflow_goal_agent() {
             std::env::remove_var("REFINE_SMOKE_AI_PATH");
         }
     }
+    remove_temp_dir(&temp_root);
+}
+
+#[test]
+fn toolbar_attachment_missing_ack_is_asynchronous_and_fails_closed() {
+    let temp_root = unique_temp_dir("http-toolbar-attachment-missing-ack");
+    let app_root = temp_root.join("app");
+    let runtime_root = temp_root.join("run/8082");
+    let command_path = runtime_root.join("processes/goal.commands.jsonl");
+    fs::create_dir_all(&app_root).unwrap();
+    fs::create_dir_all(command_path.parent().unwrap()).unwrap();
+    fs::write(&command_path, "").unwrap();
+    let session_id = Uuid::new_v4().to_string();
+    let metadata = serde_json::Map::from_iter([
+        ("kind".to_string(), json!("interactive_session")),
+        ("profile".to_string(), json!("goal")),
+        ("goal_id".to_string(), json!("GOAL-MISSING-ACK")),
+        ("session_id".to_string(), json!(&session_id)),
+        (
+            "command_path".to_string(),
+            json!(command_path.display().to_string()),
+        ),
+    ]);
+    FileProcessSupervisor::new(&runtime_root)
+        .register(ManagedProcess {
+            id: "unresponsive-goal-agent".to_string(),
+            owner: ProcessOwner::Agent,
+            pid: Some(std::process::id()),
+            state: "running".to_string(),
+            label: Some("Goal Agent".to_string()),
+            details: Some(serde_json::to_string(&metadata).unwrap()),
+            stdout_path: None,
+            stderr_path: None,
+            stdin_path: Some(command_path.display().to_string()),
+            limits: None,
+            started_at: Utc::now().to_rfc3339(),
+            exit_code: None,
+        })
+        .unwrap();
+
+    let mut server = server_with_projection();
+    server.target_root = Some(app_root);
+    server.runtime_root = Some(runtime_root.clone());
+    let started_at = Instant::now();
+    let queued = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/terminal/session".to_string(),
+        body: Some(json!({
+            "profile": "goal",
+            "surface": "toolbar",
+            "goal_id": "GOAL-MISSING-ACK"
+        })),
+    });
+    assert_eq!(queued.status, 202, "{}", queued.body);
+    let queue_elapsed = started_at.elapsed();
+    assert!(
+        queue_elapsed < Duration::from_millis(50),
+        "missing-ack queue request blocked for {:?}",
+        queue_elapsed
+    );
+    eprintln!(
+        "Missing-ack Toolbar attachment queue latency: {}us",
+        queue_elapsed.as_micros()
+    );
+    let operation_id = queued.body["operation"]["id"].as_str().unwrap();
+    let failed = wait_for_operation_status(
+        &FileOperationRegistry::new(&runtime_root),
+        operation_id,
+        OperationState::Failed,
+    );
+    assert_eq!(
+        failed.error.unwrap()["code"],
+        "toolbar_attachment_unavailable"
+    );
+    assert!(
+        fs::read_to_string(command_path)
+            .unwrap()
+            .contains("toolbar_attach")
+    );
     remove_temp_dir(&temp_root);
 }
 
@@ -307,6 +547,9 @@ fn web_server_reports_between_planning_phases_without_launching_a_diagnostic_age
                 final_plan: None,
                 implementation: None,
                 failure: None,
+                invalid_output_attempts: Vec::new(),
+                provider_session_id: None,
+                governance_precheck: None,
             },
         )
         .unwrap();
@@ -479,6 +722,7 @@ fn browser_terminal_stop_fails_the_goal_after_stopping_its_local_agent() {
     let app_root = temp_root.join("app");
     let refine_dir = app_root.join(".refine");
     let runtime_root = temp_root.join("run/8082");
+    let active_node = "terminal-stop-active-node";
     let provider = temp_root.join("smoke-ai");
     fs::create_dir_all(&app_root).unwrap();
     fs::write(
@@ -498,7 +742,13 @@ fn browser_terminal_stop_fails_the_goal_after_stopping_its_local_agent() {
         std::env::set_var("REFINE_SMOKE_AI_PATH", &provider);
     }
 
-    let work_items = FileWorkItemService::new(&refine_dir);
+    let nodes = crate::application::fleet::nodes::FileNodeRegistryService::with_active_root(
+        &refine_dir,
+        &runtime_root,
+    );
+    nodes.create(active_node).unwrap();
+    nodes.activate(active_node).unwrap();
+    let work_items = FileWorkItemService::for_node(&refine_dir, active_node);
     work_items
         .create_goal_summary("Stop workflow Goal Agent", Some("GOAL-TERMINAL-STOP"))
         .unwrap();
@@ -521,7 +771,7 @@ fn browser_terminal_stop_fails_the_goal_after_stopping_its_local_agent() {
         let mut metadata = serde_json::Map::new();
         metadata.insert("goal_id".to_string(), json!("GOAL-TERMINAL-STOP"));
         metadata.insert("kind".to_string(), json!("workflow"));
-        metadata.insert("node_id".to_string(), json!("default"));
+        metadata.insert("node_id".to_string(), json!(active_node));
         metadata.insert("provider".to_string(), json!("smoke-ai"));
         metadata.insert(
             "target_app_id".to_string(),
@@ -531,12 +781,14 @@ fn browser_terminal_stop_fails_the_goal_after_stopping_its_local_agent() {
         metadata.insert("workflow_state".to_string(), json!("in-progress"));
         run_goal_agent(
             GoalAgentLaunch {
+                provider_session: None,
                 runtime_root: runtime_for_thread,
                 cwd: app_for_thread,
                 provider: "smoke-ai".to_string(),
                 prompt: "Implement Goal GOAL-TERMINAL-STOP".to_string(),
                 metadata,
                 completion_timeout: None,
+                idle_timeout: None,
             },
             |_| {},
         )
@@ -554,17 +806,26 @@ fn browser_terminal_stop_fails_the_goal_after_stopping_its_local_agent() {
     let mut server = server_with_projection();
     server.target_root = Some(app_root);
     server.runtime_root = Some(runtime_root.clone());
-    let opened = server.handle(ApiRequest {
+    let queued = server.handle(ApiRequest {
         method: "POST".to_string(),
         path: "/api/terminal/session".to_string(),
         body: Some(json!({
             "profile": "goal",
+            "surface": "toolbar",
             "goal_id": "GOAL-TERMINAL-STOP"
         })),
     });
-    assert_eq!(opened.status, 200, "{}", opened.body);
-    let session_id = opened.body["id"].as_str().unwrap().to_string();
-    let process_id = opened.body["process_id"].as_str().unwrap().to_string();
+    assert_eq!(queued.status, 202, "{}", queued.body);
+    let operation_id = queued.body["operation"]["id"].as_str().unwrap();
+    let opened = wait_for_operation_status(
+        &FileOperationRegistry::new(&runtime_root),
+        operation_id,
+        OperationState::Succeeded,
+    )
+    .result;
+    assert_eq!(opened["toolbar_timeout_protected"], true);
+    let session_id = opened["id"].as_str().unwrap().to_string();
+    let process_id = opened["process_id"].as_str().unwrap().to_string();
 
     let stopped = server.handle(ApiRequest {
         method: "POST".to_string(),
@@ -577,6 +838,7 @@ fn browser_terminal_stop_fails_the_goal_after_stopping_its_local_agent() {
     assert_eq!(stopped.body["termination"]["confirmed_exit"], true);
     assert_eq!(stopped.body["goal"]["id"], "GOAL-TERMINAL-STOP");
     assert_eq!(stopped.body["goal"]["status"], "failed");
+    assert_eq!(stopped.body["goal"]["node_id"], active_node);
     assert_eq!(stopped.body["worktrees_retained"], true);
     assert!(
         FileProcessSupervisor::new(&runtime_root)
@@ -688,6 +950,106 @@ fn public_goal_cancel_api_reports_goal_without_a_local_process_as_durably_cancel
         GoalStatus::Cancelled
     );
     assert!(!managed_pid_is_alive(process.pid.unwrap()).unwrap());
+    remove_temp_dir(&temp_root);
+}
+
+#[test]
+fn goal_cancel_uses_port_scoped_active_node_and_preserves_foreign_goals() {
+    let temp_root = unique_temp_dir("http-goal-cancel-port-active-node");
+    let app_root = temp_root.join("app");
+    let refine_dir = app_root.join(".refine");
+    let runtime_root = temp_root.join("run/8082");
+    let active_node = "bo2lnxnevo03-buddy";
+    let foreign_node = "bo2lnxnevo02-ethan";
+    let nodes = crate::application::fleet::nodes::FileNodeRegistryService::with_active_root(
+        &refine_dir,
+        &runtime_root,
+    );
+    nodes.create(active_node).unwrap();
+    nodes.create(foreign_node).unwrap();
+    nodes.activate(active_node).unwrap();
+
+    let active_work_items = FileWorkItemService::for_node(&refine_dir, active_node);
+    active_work_items
+        .create_goal_summary("Owned single cancellation", Some("GOAL-OWNED-SINGLE"))
+        .unwrap();
+    active_work_items
+        .create_goal_summary("Owned bulk cancellation", Some("GOAL-OWNED-BULK"))
+        .unwrap();
+    FileWorkItemService::for_node(&refine_dir, foreign_node)
+        .create_goal_summary("Foreign cancellation", Some("GOAL-FOREIGN"))
+        .unwrap();
+
+    let mut server = server_with_projection();
+    server.target_root = Some(app_root);
+    server.runtime_root = Some(runtime_root.clone());
+
+    let noted = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/goals/GOAL-OWNED-SINGLE/notes".to_string(),
+        body: Some(json!({"author": "Refine", "body": "active Node ownership confirmed"})),
+    });
+    assert_eq!(noted.status, 200, "{}", noted.body);
+    assert_eq!(noted.body["goal"]["node_id"], active_node);
+
+    let cancelled = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/goals/GOAL-OWNED-SINGLE/cancel".to_string(),
+        body: None,
+    });
+    assert_eq!(cancelled.status, 200, "{}", cancelled.body);
+    assert_eq!(cancelled.body["cancelled"], true);
+    assert_eq!(cancelled.body["goal"]["node_id"], active_node);
+
+    let rejected = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/goals/GOAL-FOREIGN/cancel".to_string(),
+        body: None,
+    });
+    assert_eq!(rejected.status, 409, "{}", rejected.body);
+    assert_eq!(rejected.body["error"]["code"], "conflict");
+    assert!(
+        rejected.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("not active node {active_node}"))
+    );
+    assert_eq!(
+        active_work_items
+            .show_goal_summary("GOAL-FOREIGN")
+            .unwrap()
+            .goal
+            .status,
+        GoalStatus::Backlog
+    );
+
+    let bulk = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/goals/bulk".to_string(),
+        body: Some(json!({
+            "selected_ids": ["GOAL-OWNED-BULK", "GOAL-FOREIGN"],
+            "update": {"status": "cancelled"}
+        })),
+    });
+    assert_eq!(bulk.status, 200, "{}", bulk.body);
+    assert_eq!(bulk.body["updated"], 1);
+    assert_eq!(bulk.body["ids"], json!(["GOAL-OWNED-BULK"]));
+    assert_eq!(bulk.body["skipped"], 1);
+    assert_eq!(
+        bulk.body["skipped_details"][0],
+        json!({"id": "GOAL-FOREIGN", "reason": format!("node:{foreign_node}")})
+    );
+    assert_eq!(
+        active_work_items
+            .show_goal_summary("GOAL-FOREIGN")
+            .unwrap()
+            .goal
+            .status,
+        GoalStatus::Backlog
+    );
+    assert!(!refine_dir.join("active-node.json").exists());
+    assert!(refine_dir.join("runtime/active-node.json").exists());
+
     remove_temp_dir(&temp_root);
 }
 

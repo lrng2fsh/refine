@@ -1,3 +1,7 @@
+//! Domain types, invariants, status policies, and pure derivations.
+//!
+//! Model code has no runtime, filesystem, process, or surface dependencies.
+
 pub mod feature;
 pub mod fleet;
 pub mod goal;

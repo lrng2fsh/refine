@@ -6,6 +6,7 @@
 const CHAT_TABS_STORAGE_KEY = "refine_chat_tabs";
 const CHAT_TABS_STORAGE_VERSION = 2;
 const INTERACTIVE_TERMINAL_MODES = new Set(["terminal", "agent", "plan", "goal", "standalone"]);
+const AGENT_TERMINAL_MODES = new Set(["agent", "plan", "goal", "standalone"]);
 const SYSTEM_OPERATION_LOG_LIMIT = 250;
 const GOAL_LOG_TAIL_LIMIT = 200;
 const GOAL_LOG_DEFAULT_ORDER = "tail";
@@ -70,6 +71,10 @@ function toolbarStateStorage() {
 
 function toolbarTabUsesTerminal(tab) {
   return !!tab && INTERACTIVE_TERMINAL_MODES.has(tab.mode);
+}
+
+function toolbarTabUsesAgentTerminal(tab) {
+  return !!tab && AGENT_TERMINAL_MODES.has(tab.mode);
 }
 
 function normalizeInteractiveTerminalTab(tab) {
@@ -466,7 +471,9 @@ async function activateToolbarTab(tabId, { toggleIfActive = false } = {}) {
   ensureStandaloneTab();
   const tab = chatState.tabs[tabId];
   if (!tab) return;
-  const wasActive = chatState.activeTabId === tabId;
+  const previousTabId = chatState.activeTabId;
+  const wasActive = previousTabId === tabId;
+  const switchedTabs = !!previousTabId && !wasActive;
   const terminal = toolbarTabUsesTerminal(tab) ? terminalStateFor(tabId) : null;
   let shouldStart = !!terminal && !terminal.loading && !terminal.stopping &&
     (!terminal.sessionId || (terminal.statusChecked && terminal.exited));
@@ -480,6 +487,9 @@ async function activateToolbarTab(tabId, { toggleIfActive = false } = {}) {
   chatState.open = true;
   saveChatStateToStorage();
   drawToolbar();
+  if (switchedTabs && toolbarTabUsesAgentTerminal(tab)) {
+    terminal?.term?.scrollToBottom?.();
+  }
   if (terminal?.sessionId && !terminal.statusChecked) {
     await reattachTerminalSession(tab, terminal);
     shouldStart = !terminal.connected && !terminal.loading && terminal.statusChecked && terminal.exited;
@@ -653,6 +663,7 @@ function drawToolbar() {
         connectTerminalEvents(active);
       }
       focusTerminalSoon(active);
+      if (chatState.open) scheduleActiveTerminalFit();
     }
     if (goalLogsActive && !active.logsLoaded && !active.logsLoading) {
       loadGoalLogTail(active);
@@ -1234,15 +1245,22 @@ async function startTerminalSession(tab = currentToolbarTab()) {
   terminal.error = "";
   drawToolbar();
   try {
-    const size = terminalSize();
-    const result = await api("POST", "/api/terminal/session", {
+    const size = terminalSize(undefined, terminal) || retainedTerminalSize(terminal);
+    const queued = await api("POST", "/api/terminal/session", {
       ...size,
       profile: tab.mode,
+      surface: "toolbar",
       goal_id: tab.goalId || undefined,
       feature_id: tab.featureId || undefined,
       initial_prompt: tab.initialPrompt || undefined,
       worktree: tab.mode === "standalone" ? tab.worktree || undefined : undefined,
     });
+    // Goal attachment is runtime-owned. Keep the tab in its loading state
+    // until the background operation observes the exact live session's
+    // acknowledgment; queuing alone must never present a protected terminal.
+    const result = queued?.operation
+      ? await waitForBackgroundOperation(queued.operation, { timeoutMs: 3000 })
+      : queued;
     terminal.eventSource?.close();
     terminal.term?.dispose();
     terminal.term = null;
@@ -1911,7 +1929,10 @@ function ensureTerminalRenderer(output, tab = currentToolbarTab()) {
     terminal.term.dispose();
     terminal.term = null;
   }
-  const size = terminalSize(output);
+  const size = terminalSize(output, terminal);
+  // Opening xterm against a hidden host bakes transient minimum dimensions
+  // into its renderer. Defer creation until the dock has a real visible area.
+  if (!size) return;
   const term = new window.Terminal({
     cols: size.cols,
     rows: size.rows,
@@ -1955,9 +1976,12 @@ function resizeTerminalRenderer(
 ) {
   if (!terminal?.term || typeof terminal.term.resize !== "function") return;
   const size = terminalSize(output, terminal);
+  if (!size) return;
   try {
     terminal.term.resize(size.cols, size.rows);
-  } catch {}
+  } catch {
+    return;
+  }
   scheduleTerminalResize(terminal, size);
 }
 
@@ -1985,7 +2009,7 @@ function terminalSize(
   output = document.querySelector(".terminal-output"),
   terminal = terminalStateFor(),
 ) {
-  if (!output) return { cols: 100, rows: 30 };
+  if (!output || !chatState.open || output.isConnected === false) return null;
   const styles = window.getComputedStyle(output);
   const fontSize = parseFloat(styles.fontSize) || TERMINAL_FONT_SIZE;
   const horizontalPadding = (parseFloat(styles.paddingLeft) || 0)
@@ -1994,6 +2018,10 @@ function terminalSize(
     + (parseFloat(styles.paddingBottom) || 0);
   const contentWidth = Math.max(0, output.clientWidth - horizontalPadding);
   const contentHeight = Math.max(0, output.clientHeight - verticalPadding);
+  if (contentWidth <= 0 || contentHeight <= 0) return null;
+  if (typeof output.getClientRects === "function" && output.getClientRects().length === 0) {
+    return null;
+  }
   const renderedCell = terminalRenderedCellSize(terminal);
   const cellWidth = renderedCell.width
     || measuredTerminalCellWidth(styles, fontSize)
@@ -2005,6 +2033,13 @@ function terminalSize(
     cols: Math.max(20, Math.floor((contentWidth - scrollbarWidth) / cellWidth)),
     rows: Math.max(8, Math.floor(contentHeight / cellHeight)),
   };
+}
+
+function retainedTerminalSize(terminal = terminalStateFor()) {
+  if (terminal?.lastCols > 0 && terminal?.lastRows > 0) {
+    return { cols: terminal.lastCols, rows: terminal.lastRows };
+  }
+  return { cols: 100, rows: 30 };
 }
 
 function terminalRenderedCellSize(terminal) {
@@ -2041,7 +2076,9 @@ function observeTerminalOutputSize(output, tab = currentToolbarTab()) {
   terminal.outputResizeObserver = new ResizeObserver(() => {
     const schedule = globalThis.requestAnimationFrame || ((callback) => callback());
     schedule(() => {
-      if (terminal.observedOutput === output) resizeTerminalRenderer(output, terminal);
+      if (terminal.observedOutput !== output) return;
+      if (terminal.term) resizeTerminalRenderer(output, terminal);
+      else ensureTerminalRenderer(output, tab);
     });
   });
   terminal.outputResizeObserver.observe(output);
@@ -2049,12 +2086,17 @@ function observeTerminalOutputSize(output, tab = currentToolbarTab()) {
 
 function scheduleActiveTerminalFit() {
   const tab = chatState.tabs[chatState.activeTabId];
-  if (!toolbarTabUsesTerminal(tab)) return;
+  if (!chatState.open || !toolbarTabUsesTerminal(tab)) return;
   const terminal = terminalStateFor(chatState.activeTabId);
   const output = terminal?.observedOutput || document.querySelector(".terminal-output");
-  if (!terminal?.term || !output) return;
+  if (!terminal || !output) return;
   const schedule = globalThis.requestAnimationFrame || ((callback) => callback());
-  schedule(() => resizeTerminalRenderer(output, terminal));
+  schedule(() => {
+    if (chatState.open && terminal.tabId === chatState.activeTabId) {
+      if (terminal.term) resizeTerminalRenderer(output, terminal);
+      else ensureTerminalRenderer(output, tab);
+    }
+  });
 }
 
 function focusTerminalSoon(tab = currentToolbarTab()) {
@@ -2957,6 +2999,7 @@ function finishToolbarResize(event = null) {
   document.removeEventListener("pointercancel", finishToolbarResize);
   gesture.root.classList.remove("resizing");
   saveChatStateToStorage();
+  scheduleActiveTerminalFit();
 }
 
 function wireChatDockResize(root) { wireToolbarResize(root); }

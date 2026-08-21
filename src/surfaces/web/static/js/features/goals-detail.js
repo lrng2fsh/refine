@@ -187,6 +187,35 @@ function renderGoalFeatureAssociation(goal) {
     </div>`;
 }
 
+function goalTransferToActiveNodeTarget(goal) {
+  const activeNodeId = String(nodeContextActiveNodeId() || "").trim();
+  const ownerNodeId = String(goal?.node_id || "default").trim();
+  if (!activeNodeId || activeNodeId.toLowerCase() === ownerNodeId.toLowerCase()) {
+    return "";
+  }
+  return activeNodeId;
+}
+
+function renderGoalTransferToActiveNodeAction(goal) {
+  if (!goalTransferToActiveNodeTarget(goal)) return "";
+  return `<button class="nav-menu-item" type="button" id="btn-transfer-to-active-node" data-testid="goal-action-transfer-to-my-node">Transfer to my node</button>`;
+}
+
+async function transferGoalToActiveNode(goal) {
+  const targetNodeId = goalTransferToActiveNodeTarget(goal);
+  if (!targetNodeId || !goal?.id) return;
+  try {
+    await api("POST", "/api/nodes/transfer-goals", {
+      item_id: goal.id,
+      target_node_id: targetNodeId,
+    });
+    toast("Transferred to my node", "info");
+    await loadGoalDetail(goal.id);
+  } catch (error) {
+    await showActionError(error, "Transfer failed");
+  }
+}
+
 async function openGoalFeatureAssignModal(goal) {
   const data = await api("GET", "/api/features?limit=100&node=current");
   const features = (data.features || []).map((entry) => {
@@ -330,6 +359,7 @@ function drawGoalDetail(goal) {
               <button class="nav-menu-item" type="button" id="btn-priority" data-testid="goal-action-priority">Change Priority</button>
               <button class="nav-menu-item" type="button" id="btn-goal-feature-assign" data-testid="goal-action-assign-feature">Move to Feature</button>
               <button class="nav-menu-item" type="button" id="btn-goal-feature-remove" data-testid="goal-action-remove-feature" ${goal.feature_id ? "" : "disabled"}>Remove from Feature</button>
+              ${renderGoalTransferToActiveNodeAction(goal)}
               <button class="nav-menu-item" type="button" id="btn-cancel" data-testid="goal-action-cancel" ${cancelEnabled ? "" : "disabled"}>Cancel</button>
               <button class="nav-menu-item danger" type="button" id="btn-delete" data-testid="goal-delete">Delete</button>
             </div>
@@ -589,6 +619,13 @@ function bindGoalDetailControls() {
       showActionError(e, "Remove from Feature failed");
     }
   });
+  bindOnce($("#btn-transfer-to-active-node"), "click", async () => {
+    closeGoalActionMenu();
+    const btn = $("#btn-transfer-to-active-node");
+    await withButtonBusy(btn, "Transferring…", async () => {
+      await transferGoalToActiveNode(liveGoal());
+    });
+  });
   bindOnce($("#btn-cancel"), "click", async () => {
     closeGoalActionMenu();
     const btn = $("#btn-cancel");
@@ -775,7 +812,7 @@ function renderImplementationChecklist(items, implementation) {
       const result = results.get(item.id);
       return `<li data-checklist-id="${htmlEscape(item.id)}">
         <div><code>${htmlEscape(item.id)}</code> ${htmlEscape(item.description || "")}
-          ${result ? `<span class="status-pill ${result.outcome === "completed" ? "done" : "failed"}" data-testid="goal-implementation-checklist-outcome">${htmlEscape(result.outcome)}</span>` : ""}
+          ${result ? `<span class="status-pill ${["completed", "no_change_needed"].includes(result.outcome) ? "done" : "failed"}" data-testid="goal-implementation-checklist-outcome">${htmlEscape(result.outcome)}</span>` : ""}
         </div>
         ${item.affected_behavior?.length ? `<div class="muted small">Affected: ${item.affected_behavior.map(htmlEscape).join(", ")}</div>` : ""}
         ${item.governance_rationale ? `<div class="muted small">Governance: ${htmlEscape(item.governance_rationale)}</div>` : ""}

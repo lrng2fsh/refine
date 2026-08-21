@@ -1,7 +1,56 @@
 use super::*;
 
 #[test]
-fn project_sync_rebuilds_projection_from_cli_surface() {
+fn daemon_sync_operation_following_returns_terminal_results_and_structured_errors() {
+    let completed = follow_daemon_operation_with(
+        json!({"operation": {
+            "id": "op-complete",
+            "status": "complete",
+            "result": {"git_sync": {"ok": true}}
+        }}),
+        Duration::from_secs(1),
+        |_| unreachable!("terminal operation must not poll"),
+    )
+    .unwrap();
+    assert_eq!(completed["git_sync"]["ok"], true);
+
+    for terminal in ["failed", "cancelled", "interrupted"] {
+        let error = follow_daemon_operation_with(
+            json!({"operation": {
+                "id": format!("op-{terminal}"),
+                "status": terminal,
+                "result": {},
+                "error": {
+                    "code": "project_sync_failed",
+                    "message": "conflict",
+                    "conflict_report_location": "/run/conflicts/latest.json"
+                }
+            }}),
+            Duration::from_secs(1),
+            |_| unreachable!("terminal operation must not poll"),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(terminal), "{message}");
+        assert!(message.contains("conflict_report_location"), "{message}");
+    }
+
+    let timed_out = follow_daemon_operation_with(
+        json!({"operation": {
+            "id": "op-timeout",
+            "status": "running",
+            "result": {},
+            "error": null
+        }}),
+        Duration::ZERO,
+        |_| unreachable!("zero timeout must not poll"),
+    )
+    .unwrap_err();
+    assert!(timed_out.to_string().contains("operation_timed_out"));
+}
+
+#[test]
+fn sync_rebuilds_projection_from_cli_surface() {
     let temp_root = unique_temp_dir("cli-project-sync");
     let target_root = temp_root.clone();
     let refine_dir = target_root.join(".refine");
@@ -23,7 +72,6 @@ fn project_sync_rebuilds_projection_from_cli_surface() {
 
     let cli = Cli::try_parse_from([
         "refine",
-        "project",
         "sync",
         "--target-root",
         target_root.to_str().unwrap(),
@@ -151,7 +199,7 @@ fn in_process_project_status_suppresses_ambiguous_legacy_default_label() {
     let refine_dir = refine_dir_for_target_root(&app_root).unwrap();
     fs::create_dir_all(&refine_dir).unwrap();
     fs::write(
-        refine_dir.join(crate::tools::product::nodes::NODE_REGISTRY_FILE),
+        refine_dir.join(crate::application::fleet::nodes::NODE_REGISTRY_FILE),
         serde_json::json!({
             "nodes": [{
                 "id": "default",
@@ -163,7 +211,7 @@ fn in_process_project_status_suppresses_ambiguous_legacy_default_label() {
         .to_string(),
     )
     .unwrap();
-    let service = crate::tools::product::project_registry::FileProjectRegistryService::new(
+    let service = crate::application::projects::registry::FileProjectRegistryService::new(
         &runtime_root,
         Some(app_root.clone()),
     );

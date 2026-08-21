@@ -206,7 +206,7 @@ fn web_server_hard_resets_git_worktree() {
 }
 
 #[test]
-fn web_server_project_sync_reports_no_git_repo_and_missing_upstream() {
+fn web_server_sync_reports_no_git_repo_and_missing_upstream() {
     let temp_root = unique_temp_dir("http-project-sync-basic");
     let app_root = temp_root.join("app");
     let refine_dir = app_root.join(".refine");
@@ -218,7 +218,7 @@ fn web_server_project_sync_reports_no_git_repo_and_missing_upstream() {
     server.runtime_root = Some(runtime_root.clone());
     let no_repo = server.handle(ApiRequest {
         method: "POST".to_string(),
-        path: "/api/project/sync".to_string(),
+        path: "/api/sync".to_string(),
         body: Some(json!({})),
     });
     assert_eq!(no_repo.status, 202);
@@ -239,7 +239,7 @@ fn web_server_project_sync_reports_no_git_repo_and_missing_upstream() {
     git(&app_root, &["commit", "-m", "initial"]).unwrap();
     let missing_upstream = server.handle(ApiRequest {
         method: "POST".to_string(),
-        path: "/api/project/sync".to_string(),
+        path: "/api/sync".to_string(),
         body: Some(json!({})),
     });
     let missing_upstream = wait_for_project_sync_operation(
@@ -271,7 +271,263 @@ fn web_server_project_sync_reports_no_git_repo_and_missing_upstream() {
 }
 
 #[test]
-fn web_server_project_sync_returns_while_repository_worker_is_busy() {
+fn web_server_sync_routes_are_thin_and_structured() {
+    let temp_root = unique_temp_dir("http-state-recovery-routes");
+    let app_root = temp_root.join("app");
+    let runtime_root = temp_root.join("run/8080");
+    fs::create_dir_all(&app_root).unwrap();
+    let mut server = server_with_projection();
+    server.target_root = Some(app_root);
+    server.runtime_root = Some(runtime_root);
+
+    let preview = server.handle(ApiRequest {
+        method: "GET".to_string(),
+        path: "/api/sync/preview".to_string(),
+        body: None,
+    });
+    assert_eq!(preview.status, 400, "{:#}", preview.body);
+    assert_eq!(preview.body["error"]["code"], "invalid_input");
+    assert!(preview.body["error"].get("reason").is_none());
+
+    // Paths are exceptions to an explicit authority, never a decision alone.
+    let paths_only = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/sync".to_string(),
+        body: Some(json!({"paths": ["shared.json"]})),
+    });
+    assert_eq!(paths_only.status, 400, "{:#}", paths_only.body);
+    assert_eq!(paths_only.body["error"]["code"], "invalid_input");
+
+    // The old project-scoped sync and state-recovery surface is deleted, not
+    // aliased.
+    for (method, path) in [
+        ("POST", "/api/project/sync"),
+        ("GET", "/api/project/state-recovery/preview"),
+        ("POST", "/api/project/state-recovery/run"),
+        ("POST", "/api/project/state-recovery/apply"),
+    ] {
+        let response = server.handle(ApiRequest {
+            method: method.to_string(),
+            path: path.to_string(),
+            body: (method == "POST").then(|| json!({})),
+        });
+        assert_eq!(response.status, 404, "{method} {path}: {:#}", response.body);
+    }
+
+    remove_temp_dir(&temp_root);
+}
+
+#[test]
+fn web_server_sync_preview_and_terminal_authority_use_the_shared_service() {
+    let temp_root = unique_temp_dir("http-state-recovery-success");
+    let remote = temp_root.join("remote.git");
+    let seed = temp_root.join("seed");
+    let a = temp_root.join("a");
+    let b = temp_root.join("b");
+    fs::create_dir_all(&seed).unwrap();
+    git(&temp_root, &["init", "--bare", remote.to_str().unwrap()]).unwrap();
+    git(&seed, &["init", "-b", "main"]).unwrap();
+    git(&seed, &["config", "user.email", "test@example.com"]).unwrap();
+    git(&seed, &["config", "user.name", "Test User"]).unwrap();
+    fs::write(seed.join("app.txt"), "initial\n").unwrap();
+    git(&seed, &["add", "app.txt"]).unwrap();
+    git(&seed, &["commit", "-m", "initial"]).unwrap();
+    git(
+        &seed,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    )
+    .unwrap();
+    git(&seed, &["push", "-u", "origin", "main"]).unwrap();
+    git(
+        &temp_root,
+        &[
+            "clone",
+            "--branch",
+            "main",
+            remote.to_str().unwrap(),
+            a.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    git(
+        &temp_root,
+        &[
+            "clone",
+            "--branch",
+            "main",
+            remote.to_str().unwrap(),
+            b.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    for root in [&a, &b] {
+        git(root, &["config", "user.email", "test@example.com"]).unwrap();
+        git(root, &["config", "user.name", "Test User"]).unwrap();
+    }
+    let refine_a = refine_dir_for_target_root(&a).unwrap();
+    let refine_b = refine_dir_for_target_root(&b).unwrap();
+    fs::create_dir_all(refine_a.join("goals/REMOTE")).unwrap();
+    fs::write(
+        refine_a.join("goals/REMOTE/goal.json"),
+        "{\"id\":\"REMOTE\"}\n",
+    )
+    .unwrap();
+    fs::write(refine_a.join("shared.json"), "{\"node\":\"a\"}\n").unwrap();
+    crate::application::persistence_sync::state::FileGitSyncService::new(&a, a.join("run"))
+        .sync()
+        .unwrap();
+    fs::create_dir_all(refine_b.join("goals/LIVE")).unwrap();
+    fs::write(refine_b.join("goals/LIVE/goal.json"), "{\"id\":\"LIVE\"}\n").unwrap();
+    fs::write(refine_b.join("shared.json"), "{\"node\":\"b\"}\n").unwrap();
+
+    let mut server = server_with_projection();
+    server.target_root = Some(b.clone());
+    let runtime_root = b.join("run");
+    server.runtime_root = Some(runtime_root.clone());
+    // The merge-base pipeline records conflicts without a typed recovery
+    // kind; a recovered terminal run must settle exactly this record.
+    crate::application::persistence_sync::health::FileStateSyncHealthService::new(&runtime_root)
+        .record_failure(&b, "default", "state changed on multiple nodes")
+        .unwrap();
+    // The preview is a read-only divergence summary, never an apply token,
+    // and writes no artifact files.
+    let preview = server.handle(ApiRequest {
+        method: "GET".to_string(),
+        path: "/api/sync/preview".to_string(),
+        body: None,
+    });
+    assert_eq!(preview.status, 200, "{:#}", preview.body);
+    assert_eq!(preview.body["ancestry"], "join");
+    assert_eq!(preview.body["conflicts"][0]["path"], "shared.json");
+    assert!(!b.join(".git/refine-state-recoveries").exists());
+
+    let run = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/sync".to_string(),
+        body: Some(json!({"authority": "remote"})),
+    });
+    assert_eq!(run.status, 200, "{:#}", run.body);
+    assert_eq!(run.body["ok"], true);
+    assert_eq!(run.body["recovered"], true);
+    assert_eq!(run.body["health_settled"], true);
+    assert_eq!(run.body["state_sync_health"]["status"], "healthy");
+    assert!(run.body["state_sync_health"]["recovery_kind"].is_null());
+    assert_eq!(run.body["recovery"]["settled_paths"][0], "shared.json");
+    assert!(
+        run.body["recovery"]["retained_refs"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("refs/refine/retained/live-"),
+        "{:#}",
+        run.body
+    );
+    assert!(!b.join(".git/refine-state-baseline.json").exists());
+    assert!(refine_b.join("goals/REMOTE/goal.json").exists());
+    // Remote authority settles only the contested path; the uncontested
+    // live-only record stays in live and publishes with the join.
+    assert!(refine_b.join("goals/LIVE/goal.json").exists());
+    assert_eq!(
+        git_stdout(
+            &b,
+            &["show", "origin/refine/state:.refine/goals/LIVE/goal.json"]
+        ),
+        "{\"id\":\"LIVE\"}"
+    );
+    assert_eq!(
+        fs::read_to_string(refine_b.join("shared.json")).unwrap(),
+        "{\"node\":\"a\"}\n"
+    );
+
+    remove_temp_dir(&temp_root);
+}
+
+#[test]
+fn web_server_sync_queues_pipeline_and_terminal_decision_is_idempotent() {
+    let temp_root = unique_temp_dir("http-state-recovery-run");
+    let remote = temp_root.join("remote.git");
+    let seed = temp_root.join("seed");
+    let a = temp_root.join("a");
+    let b = temp_root.join("b");
+    fs::create_dir_all(&seed).unwrap();
+    git(&temp_root, &["init", "--bare", remote.to_str().unwrap()]).unwrap();
+    git(&seed, &["init", "-b", "main"]).unwrap();
+    git(&seed, &["config", "user.email", "test@example.com"]).unwrap();
+    git(&seed, &["config", "user.name", "Test User"]).unwrap();
+    fs::write(seed.join("app.txt"), "initial\n").unwrap();
+    git(&seed, &["add", "app.txt"]).unwrap();
+    git(&seed, &["commit", "-m", "initial"]).unwrap();
+    git(
+        &seed,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    )
+    .unwrap();
+    git(&seed, &["push", "-u", "origin", "main"]).unwrap();
+    for root in [&a, &b] {
+        git(
+            &temp_root,
+            &[
+                "clone",
+                "--branch",
+                "main",
+                remote.to_str().unwrap(),
+                root.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        git(root, &["config", "user.email", "test@example.com"]).unwrap();
+        git(root, &["config", "user.name", "Test User"]).unwrap();
+    }
+    let refine_a = refine_dir_for_target_root(&a).unwrap();
+    let refine_b = refine_dir_for_target_root(&b).unwrap();
+    fs::create_dir_all(refine_a.join("goals/REMOTE")).unwrap();
+    fs::write(
+        refine_a.join("goals/REMOTE/goal.json"),
+        "{\"id\":\"REMOTE\"}\n",
+    )
+    .unwrap();
+    crate::application::persistence_sync::state::FileGitSyncService::new(&a, a.join("run"))
+        .sync()
+        .unwrap();
+    fs::create_dir_all(refine_b.join("goals/LIVE")).unwrap();
+    fs::write(refine_b.join("goals/LIVE/goal.json"), "{\"id\":\"LIVE\"}\n").unwrap();
+
+    let mut server = server_with_projection();
+    server.target_root = Some(b.clone());
+    let runtime_root = b.join("run");
+    server.runtime_root = Some(runtime_root.clone());
+    crate::application::persistence_sync::health::FileStateSyncHealthService::new(&runtime_root)
+        .record_failure(&b, "default", "baseline missing")
+        .unwrap();
+
+    // No body: the queued run is the ordinary sync pipeline. The disjoint
+    // first contact needs no recovery at all — the deterministic ladder
+    // publishes the live-only record and hydrates the remote one.
+    let run = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/sync".to_string(),
+        body: None,
+    });
+    let run = wait_for_project_sync_operation(&runtime_root, &run, OperationState::Succeeded);
+    assert_eq!(run.result["git_sync"]["ok"], true);
+    assert!(refine_b.join("goals/REMOTE/goal.json").exists());
+    assert!(refine_b.join("goals/LIVE/goal.json").exists());
+
+    // Re-running with a terminal decision is idempotent and reports a clean
+    // synchronization with nothing left to settle.
+    let rerun = server.handle(ApiRequest {
+        method: "POST".to_string(),
+        path: "/api/sync".to_string(),
+        body: Some(json!({"authority": "remote"})),
+    });
+    assert_eq!(rerun.status, 200, "{:#}", rerun.body);
+    assert_eq!(rerun.body["recovered"], false);
+    assert_eq!(rerun.body["sync"]["ok"], true);
+
+    remove_temp_dir(&temp_root);
+}
+
+#[test]
+fn web_server_sync_returns_while_repository_worker_is_busy() {
     let temp_root = unique_temp_dir("http-project-sync-nonblocking");
     let app_root = temp_root.join("app");
     let refine_dir = app_root.join(".refine");
@@ -286,7 +542,7 @@ fn web_server_project_sync_returns_while_repository_worker_is_busy() {
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let lock_root = app_root.clone();
     let lock_thread = thread::spawn(move || {
-        crate::tools::host::git_sync::with_repository_git_lock(&lock_root, || {
+        crate::infrastructure::git::with_repository_git_lock(&lock_root, || {
             locked_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             Ok(())
@@ -301,14 +557,14 @@ fn web_server_project_sync_returns_while_repository_worker_is_busy() {
     let started = Instant::now();
     let response = server.handle(ApiRequest {
         method: "POST".to_string(),
-        path: "/api/project/sync".to_string(),
+        path: "/api/sync".to_string(),
         body: Some(json!({})),
     });
 
     assert_eq!(response.status, 202, "{:#}", response.body);
     assert!(
-        started.elapsed() < Duration::from_millis(250),
-        "project sync request waited for the repository lock"
+        started.elapsed() < Duration::from_millis(50),
+        "sync request waited for the repository lock"
     );
     release_tx.send(()).unwrap();
     lock_thread.join().unwrap();
@@ -320,7 +576,7 @@ fn web_server_project_sync_returns_while_repository_worker_is_busy() {
 }
 
 #[test]
-fn web_server_project_sync_ignores_refine_runtime_noise() {
+fn web_server_sync_ignores_refine_runtime_noise() {
     let temp_root = unique_temp_dir("http-project-sync-ff");
     let remote = temp_root.join("remote.git");
     let seed = temp_root.join("seed");
@@ -371,7 +627,7 @@ fn web_server_project_sync_ignores_refine_runtime_noise() {
     server.runtime_root = Some(runtime_root.clone());
     let sync = server.handle(ApiRequest {
         method: "POST".to_string(),
-        path: "/api/project/sync".to_string(),
+        path: "/api/sync".to_string(),
         body: Some(json!({})),
     });
     let sync = wait_for_project_sync_operation(&runtime_root, &sync, OperationState::Succeeded);
@@ -386,7 +642,7 @@ fn web_server_project_sync_ignores_refine_runtime_noise() {
 }
 
 #[test]
-fn web_server_project_sync_ignores_dirty_user_worktree() {
+fn web_server_sync_ignores_dirty_user_worktree() {
     let temp_root = unique_temp_dir("http-project-sync-dirty");
     let (seed, app_root) = seeded_remote_clone(&temp_root);
     fs::write(seed.join("remote.txt"), "remote\n").unwrap();
@@ -401,7 +657,7 @@ fn web_server_project_sync_ignores_dirty_user_worktree() {
     server.runtime_root = Some(runtime_root.clone());
     let sync = server.handle(ApiRequest {
         method: "POST".to_string(),
-        path: "/api/project/sync".to_string(),
+        path: "/api/sync".to_string(),
         body: Some(json!({})),
     });
     let sync = wait_for_project_sync_operation(&runtime_root, &sync, OperationState::Succeeded);
@@ -417,7 +673,7 @@ fn web_server_project_sync_ignores_dirty_user_worktree() {
 }
 
 #[test]
-fn web_server_project_sync_does_not_rebase_or_push_application_branches() {
+fn web_server_sync_does_not_rebase_or_push_application_branches() {
     let temp_root = unique_temp_dir("http-project-sync-diverged");
     let (seed, app_root) = seeded_remote_clone(&temp_root);
     git(&app_root, &["config", "user.email", "test@example.com"]).unwrap();
@@ -436,7 +692,7 @@ fn web_server_project_sync_does_not_rebase_or_push_application_branches() {
     server.runtime_root = Some(runtime_root.clone());
     let sync = server.handle(ApiRequest {
         method: "POST".to_string(),
-        path: "/api/project/sync".to_string(),
+        path: "/api/sync".to_string(),
         body: Some(json!({})),
     });
     let sync = wait_for_project_sync_operation(&runtime_root, &sync, OperationState::Succeeded);

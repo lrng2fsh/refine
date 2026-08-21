@@ -126,16 +126,23 @@ impl InProcessWebServer {
 
     pub(crate) fn handle_node_copy_settings(&self, request: ApiRequest) -> ApiResponse {
         let body = request.body.unwrap_or_else(|| json!({}));
-        ApiResponse::json(
-            200,
-            json!({
-                "ok": true,
-                "source_node_id": body.get("source_node_id").and_then(|value| value.as_str()).unwrap_or(""),
-                "section": body.get("section").and_then(|value| value.as_str()).unwrap_or(""),
-                "copied_count": 0,
-                "message": "node-scoped settings copy has no native per-node settings to copy yet"
-            }),
-        )
+        let refine_dir = match self.current_refine_dir() {
+            Ok(Some(path)) => path,
+            Ok(None) => return ApiResponse::json(404, json!({"error": "no active project"})),
+            Err(error) => return error_response(error),
+        };
+        let source_node_id = body
+            .get("source_node_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let section = body.get("section").and_then(Value::as_str).unwrap_or("");
+        match self
+            .settings_service(refine_dir)
+            .copy_from_node(source_node_id, section)
+        {
+            Ok(result) => ApiResponse::json(200, result),
+            Err(error) => error_response(error),
+        }
     }
 
     pub(crate) fn handle_fleet(&self) -> ApiResponse {
@@ -320,6 +327,31 @@ impl InProcessWebServer {
         }
     }
 
+    /// Ask every other fleet node's daemon to synchronize and report what
+    /// each one answered. This node's own state sync stays `POST /sync`; this
+    /// route is the fan-out around it, and a node still on the previous build
+    /// is reported as that node's pending upgrade rather than failing the
+    /// fleet — nodes upgrade one at a time and the rest keep converging.
+    pub(crate) fn handle_fleet_sync(&self) -> ApiResponse {
+        let refine_dir = require_refine_dir!(self, "sync the fleet");
+        let service = if let Some(runtime_root) = &self.runtime_root {
+            FileFleetService::with_runtime_root(refine_dir, runtime_root)
+        } else {
+            FileFleetService::new(refine_dir)
+        };
+        match service.sync_nodes() {
+            Ok(report) => ApiResponse::json(
+                200,
+                json!({
+                    "ok": true,
+                    "nodes": report.nodes,
+                    "pending_upgrade": report.pending_upgrade
+                }),
+            ),
+            Err(error) => error_response(error),
+        }
+    }
+
     pub(crate) fn handle_fleet_distribute(&self, request: ApiRequest) -> ApiResponse {
         let refine_dir = require_refine_dir!(self, "distribute work");
         let body = request.body.unwrap_or_else(|| json!({}));
@@ -366,7 +398,39 @@ impl InProcessWebServer {
                 .entry(goal.goal.status.as_str().to_string())
                 .or_insert(0) += 1;
         }
-        self.node_registry_service(refine_dir)
-            .list_with_counts_response(counts)
+        let mut response = self
+            .node_registry_service(&refine_dir)
+            .list_with_counts_response(counts)?;
+        let active_node_id = response
+            .get("active_node_id")
+            .and_then(Value::as_str)
+            .unwrap_or("default")
+            .to_string();
+        let local_health = self.current_state_sync_health()?;
+        if let Some(nodes) = response.get_mut("nodes").and_then(Value::as_array_mut) {
+            for node in nodes {
+                let node_id = node.get("id").and_then(Value::as_str).unwrap_or("");
+                let health = if node_id == active_node_id {
+                    local_health
+                        .as_ref()
+                        .map(|health| json!(health))
+                        .unwrap_or_else(|| {
+                            json!({
+                                "status": "unknown",
+                                "reason": "runtime_health_unavailable"
+                            })
+                        })
+                } else {
+                    json!({
+                        "status": "unknown",
+                        "reason": "node_local_evidence_unavailable"
+                    })
+                };
+                if let Some(node) = node.as_object_mut() {
+                    node.insert("state_sync_health".to_string(), health);
+                }
+            }
+        }
+        Ok(response)
     }
 }

@@ -11,10 +11,13 @@ mod goals;
 mod logs;
 mod nodes;
 mod projects;
+mod sync;
 mod system;
 mod todos;
 mod website;
 mod workflow;
+#[cfg(test)]
+pub(super) use daemon_transport::follow_daemon_operation_with;
 use daemon_transport::*;
 use system::{port_status_with_processes, selected_process_ports, stop_system_process};
 
@@ -28,6 +31,8 @@ use features::dispatch_feature_daemon;
 use fleet::dispatch_fleet_daemon;
 #[cfg(not(test))]
 use goals::dispatch_goal_daemon;
+#[cfg(test)]
+pub(super) use goals::resolve_merged_daemon_route;
 #[cfg(not(test))]
 use logs::dispatch_log_daemon;
 #[cfg(not(test))]
@@ -58,55 +63,59 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use serde_json::{Value, json};
 
-use crate::model::workflow::GoalStatus;
-use crate::process::runner::run_worker;
-use crate::process::supervisor::errors::{RefineError, RefineResult};
-use crate::process::supervisor::lifecycle::{
-    BackgroundDaemonConfig, DaemonStatus, FileDaemonLifecycleService, current_launch_executable,
-    current_launch_mode,
+use crate::application::agents::provider_selection::resolve_agent_provider;
+use crate::application::diagnostics::processes::FileProcessStatusService;
+use crate::application::diagnostics::support_bundle::{
+    FileSupportBundleService, SupportBundleService,
 };
-use crate::process::supervisor::runtime::RuntimeRoot;
-use crate::surfaces::web_server::{
-    API_CONTRACT_VERSION, API_GROUPS, InProcessWebServer, LocalHttpDaemon,
+use crate::application::diagnostics::{DiagnosticsService, FileDiagnosticsService};
+use crate::application::exports::jira::FileGoalExportService;
+use crate::application::fleet::node_init::{WorkerInitOptions, initialize_worker};
+use crate::application::fleet::node_sync::fleet_sync_response;
+use crate::application::fleet::nodes::FileNodeRegistryService;
+use crate::application::fleet::service::{
+    FLEET_RUNBOOK_PATH, FileFleetService, FleetService, NodeRemoteUpdate, fleet_manage_prompt,
 };
-use crate::tools::host::agent_providers::{
-    AgentProviderService, HostAgentProviderService, ProviderInvocation,
+use crate::application::guidance::FileNextActionsService;
+use crate::application::imports::FileImportService;
+use crate::application::maintenance::worktrees::{
+    FileWorktreeCleanupService, WorktreeCleanupOptions,
 };
-use crate::tools::host::checkout::RefineCheckoutPaths;
-use crate::tools::host::daemon_lifecycle::{
+use crate::application::operations::process_control::FileProcessControlService;
+use crate::application::persistence_sync::state::FileGitSyncService;
+use crate::application::projects::projection::{
+    FileProjectProjectionStore, ProjectionQuery, ProjectionSnapshot,
+};
+use crate::application::projects::registry::{FileProjectRegistryService, ProjectRegistryService};
+use crate::application::system::daemon_lifecycle::{
     DaemonLifecycleAction, FileHostDaemonLifecycleService, execute_daemon_lifecycle,
     uninstall_daemon_installation,
 };
-use crate::tools::host::deployed_update::{
-    DeployedUpdateOptions, FileDeployedUpdateHost, discover_refine_checkout,
-    resolve_agent_provider, run_deployed_update,
+use crate::application::system::installation::{FileInstallationService, InstallationService};
+use crate::application::system::release::{FileReleaseService, ReleaseBump};
+use crate::application::system::source_promotion::FileSourcePromotionService;
+use crate::application::todos::FileTodoService;
+use crate::application::work_items::FileWorkItemService;
+use crate::application::workers::run_worker;
+use crate::application::workflow::governance::integration::FileGovernanceIntegrationService;
+use crate::error::{RefineError, RefineResult};
+use crate::infrastructure::agents::invocation::{
+    AgentProviderService, HostAgentProviderService, ProviderInvocation,
 };
-use crate::tools::host::fleet::{
-    FLEET_RUNBOOK_PATH, FileFleetService, FleetService, NodeRemoteUpdate, fleet_manage_prompt,
+use crate::infrastructure::observability::activity::{
+    ActivityQuery, ActivityService, FileActivityService,
 };
-use crate::tools::host::git_sync::FileGitSyncService;
-use crate::tools::host::installation::{FileInstallationService, InstallationService};
-use crate::tools::host::node_init::{WorkerInitOptions, initialize_worker};
-use crate::tools::host::project_layout::prepare_refine_dir;
-use crate::tools::host::release::{FileReleaseService, ReleaseBump};
-use crate::tools::host::source_promotion::FileSourcePromotionService;
-use crate::tools::observability::activity::{ActivityQuery, ActivityService, FileActivityService};
-use crate::tools::observability::diagnostics::{DiagnosticsService, FileDiagnosticsService};
-use crate::tools::observability::processes::FileProcessStatusService;
-use crate::tools::observability::support_bundle::{FileSupportBundleService, SupportBundleService};
-use crate::tools::product::goal_exports::FileGoalExportService;
-use crate::tools::product::governance_integration::FileGovernanceIntegrationService;
-use crate::tools::product::imports::FileImportService;
-use crate::tools::product::next_actions::FileNextActionsService;
-use crate::tools::product::nodes::FileNodeRegistryService;
-use crate::tools::product::process_control::FileProcessControlService;
-use crate::tools::product::project_projection::{
-    FileProjectProjectionStore, ProjectionQuery, ProjectionSnapshot,
+use crate::infrastructure::process::supervisor::lifecycle::{
+    BackgroundDaemonConfig, DaemonStatus, FileDaemonLifecycleService, current_launch_executable,
+    current_launch_mode,
 };
-use crate::tools::product::project_registry::{FileProjectRegistryService, ProjectRegistryService};
-use crate::tools::product::todos::FileTodoService;
-use crate::tools::product::work_items::FileWorkItemService;
-use crate::tools::product::worktree_cleanup::{FileWorktreeCleanupService, WorktreeCleanupOptions};
+use crate::infrastructure::process::supervisor::runtime::RuntimeRoot;
+use crate::infrastructure::runtime::checkout::{RefineCheckoutPaths, discover_refine_checkout};
+use crate::infrastructure::storage::project_layout::prepare_refine_dir;
+use crate::model::workflow::GoalStatus;
+use crate::surfaces::web_server::{
+    API_CONTRACT_VERSION, API_GROUPS, InProcessWebServer, LocalHttpDaemon,
+};
 
 use super::actions::*;
 use super::helpers::*;
@@ -133,6 +142,12 @@ pub fn dispatch(cli: Cli) -> RefineResult<()> {
             return Ok(());
         }
         Commands::Project { action } => return dispatch_project_daemon(action),
+        Commands::Sync {
+            preview,
+            authority,
+            paths,
+            ..
+        } => return sync::dispatch_daemon(preview, authority, paths),
         Commands::Goal { action } => return dispatch_goal_daemon(action),
         Commands::Feature { action } => return dispatch_feature_daemon(action),
         Commands::Todo { action } => return dispatch_todo(action),
@@ -181,6 +196,7 @@ pub fn dispatch(cli: Cli) -> RefineResult<()> {
         command @ Commands::Log { .. } => logs::dispatch_command(command),
         command @ Commands::Agent { .. } => agents::dispatch_command(command),
         command @ Commands::Project { .. } => projects::dispatch_command(command),
+        command @ Commands::Sync { .. } => sync::dispatch_command(command),
         command @ Commands::Goal { .. } => goals::dispatch_command(command),
         command @ Commands::Feature { .. } => features::dispatch_command(command),
         command @ Commands::Todo { .. } => todos::dispatch_command(command),
@@ -246,6 +262,14 @@ pub(super) fn run_system_start(
     // without this a slow start is indistinguishable from a hung one.
     lifecycle.record_startup_progress(actual_port, "preparing");
     eprintln!("refine: preparing daemon at http://{addr}");
+    // State synchronization is `git merge-tree`; a node whose Git cannot run it
+    // would serve happily and then fail every sync. Say so once, here, in the
+    // sentence that names the fix — and record it as a start failure so a
+    // service-managed daemon's readiness waiter sees the reason too.
+    if let Err(error) = crate::infrastructure::git::merge::ensure_supported_git() {
+        let _ = lifecycle.mark_start_failed(actual_port, &error);
+        return Err(error);
+    }
     let project_preparation = (|| -> RefineResult<_> {
         lifecycle.record_startup_progress(actual_port, "loading-project-registry");
         eprintln!("refine: loading active project registry");
@@ -550,7 +574,9 @@ fn refine_dir_for_target_root(target_root: &Path) -> RefineResult<PathBuf> {
 fn direct_work_item_service(target_root: &Path) -> RefineResult<FileWorkItemService> {
     let refine_dir = refine_dir_for_target_root(target_root)?;
     let cache_dir = refine_dir.join("runtime/cache");
-    Ok(FileWorkItemService::with_snapshot_cache(refine_dir, cache_dir))
+    Ok(FileWorkItemService::with_snapshot_cache(
+        refine_dir, cache_dir,
+    ))
 }
 
 pub(super) fn explicit_target_root_path(command: &Commands) -> Option<&PathBuf> {
@@ -588,10 +614,10 @@ pub(super) fn explicit_target_root_path(command: &Commands) -> Option<&PathBuf> 
             | ProjectAction::Clone { target_root, .. }
             | ProjectAction::Remove { target_root, .. }
             | ProjectAction::Migrate { target_root, .. }
-            | ProjectAction::Sync { target_root, .. }
             | ProjectAction::CleanupWorktrees { target_root, .. }
             | ProjectAction::Doctor { target_root, .. } => target_root.as_ref(),
         },
+        Commands::Sync { target_root, .. } => target_root.as_ref(),
         Commands::Goal { action } => match action {
             GoalAction::Create { target_root, .. }
             | GoalAction::Draft { target_root, .. }
@@ -606,6 +632,7 @@ pub(super) fn explicit_target_root_path(command: &Commands) -> Option<&PathBuf> 
             | GoalAction::Start { target_root, .. }
             | GoalAction::Cancel { target_root, .. }
             | GoalAction::Retry { target_root, .. }
+            | GoalAction::ResolveMerged { target_root, .. }
             | GoalAction::Approve { target_root, .. }
             | GoalAction::Undo { target_root, .. }
             | GoalAction::Delete { target_root, .. }
@@ -683,10 +710,9 @@ pub(super) fn explicit_target_root_path(command: &Commands) -> Option<&PathBuf> 
         Commands::Commands => None,
         Commands::System { action } => match action {
             SystemAction::Doctor { target_root, .. } => target_root.as_ref(),
-            SystemAction::Install { .. }
+            SystemAction::ServiceInstall { .. }
             | SystemAction::Performance { .. }
             | SystemAction::Repair { .. }
-            | SystemAction::Update { .. }
             | SystemAction::ReleasePlan { .. }
             | SystemAction::ReleasePrepare { .. }
             | SystemAction::ReleasePublish { .. }
@@ -698,7 +724,7 @@ pub(super) fn explicit_target_root_path(command: &Commands) -> Option<&PathBuf> 
             | SystemAction::DaemonLifecycleHelper { .. }
             | SystemAction::RunnerWorker { .. }
             | SystemAction::Rollback { .. }
-            | SystemAction::Uninstall { .. }
+            | SystemAction::ServiceUninstall { .. }
             | SystemAction::Start { .. }
             | SystemAction::Stop { .. }
             | SystemAction::Restart { .. }

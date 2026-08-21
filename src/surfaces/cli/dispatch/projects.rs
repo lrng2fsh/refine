@@ -127,54 +127,6 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
         }
         Commands::Project {
             action:
-                ProjectAction::Sync {
-                    target_root: Some(target_root),
-                    cache_dir,
-                },
-        } => {
-            let refine_dir = refine_dir_for_target_root(&target_root)?;
-            let runtime_root = cache_dir
-                .as_ref()
-                .and_then(|cache_dir| cache_dir.parent())
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| refine_dir.join("runtime"));
-            let git_sync = FileGitSyncService::new(&target_root, &runtime_root).sync()?;
-            let store = cache_dir
-                .as_ref()
-                .and_then(|cache_dir| cache_dir.parent())
-                .map(|runtime_root| {
-                    FileProjectProjectionStore::with_runtime_root(&refine_dir, runtime_root)
-                })
-                .unwrap_or_else(|| FileProjectProjectionStore::new(&refine_dir));
-            let snapshot = store.rebuild_projection()?;
-            if let Some(cache_dir) = &cache_dir {
-                store.persist_projection_snapshot(cache_dir, &snapshot)?;
-            }
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "goals": snapshot.goals.len(),
-                    "features": snapshot.features.len(),
-                    "source_fingerprints": snapshot.source_fingerprints.len(),
-                    "status_counts": snapshot.status_counts(),
-                    "cache_updated": cache_dir.is_some(),
-                    "git_sync": git_sync
-                }))
-                .unwrap()
-            );
-            Ok(())
-        }
-        Commands::Project {
-            action: ProjectAction::Sync {
-                target_root: None, ..
-            },
-        } => {
-            let response = daemon_json("POST", "/project/sync", None)?;
-            print_json(&response);
-            Ok(())
-        }
-        Commands::Project {
-            action:
                 ProjectAction::CleanupWorktrees {
                     apply,
                     older_than_seconds,
@@ -254,7 +206,6 @@ pub(super) fn dispatch_project_daemon(action: ProjectAction) -> RefineResult<()>
             daemon_json("DELETE", "/apps", Some(json!({ "name": name })))?
         }
         ProjectAction::Migrate { .. } => daemon_json("POST", "/project/migrate", None)?,
-        ProjectAction::Sync { .. } => daemon_json("POST", "/project/sync", None)?,
         ProjectAction::CleanupWorktrees {
             apply,
             older_than_seconds,

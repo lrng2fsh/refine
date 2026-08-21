@@ -115,6 +115,7 @@ mod tests {
             .map(|command| command["name"].as_str().unwrap())
             .collect::<Vec<_>>();
         assert!(!goal_names.contains(&"verify"));
+        assert!(goal_names.contains(&"resolve-merged"));
 
         let system = commands
             .iter()
@@ -130,6 +131,18 @@ mod tests {
             system_names.contains(&"performance"),
             "current-main performance command was lost during recovery: {system_names:?}"
         );
+        for expected in ["service-install", "service-uninstall"] {
+            assert!(
+                system_names.contains(&expected),
+                "catalog omitted service command {expected}: {system_names:?}"
+            );
+        }
+        for retired in ["install", "uninstall"] {
+            assert!(
+                !system_names.contains(&retired),
+                "catalog advertised retired system command {retired}: {system_names:?}"
+            );
+        }
         for unadvertised in [
             "build",
             "clean",
@@ -157,6 +170,22 @@ mod tests {
             .unwrap()
             .render_long_help()
             .to_string();
+        for expected in ["service-install", "service-uninstall"] {
+            assert!(
+                system_help
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(expected)),
+                "{system_help}"
+            );
+        }
+        for retired in ["install", "uninstall"] {
+            assert!(
+                !system_help
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(retired)),
+                "{system_help}"
+            );
+        }
         for unadvertised in [
             "build",
             "clean",
@@ -339,7 +368,9 @@ mod tests {
                     !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_')
                 })
             });
-            if group_name == "system" && matches!(documented_subcommand, Some("build" | "clean")) {
+            if group_name == "system"
+                && matches!(documented_subcommand, Some("build" | "clean" | "update"))
+            {
                 assert_eq!(
                     line_tokens[command_index],
                     "./r",
@@ -376,6 +407,22 @@ mod tests {
                     )
                 });
                 argument_start = 2;
+            }
+            while documented_command.has_subcommands() {
+                let Some(candidate) = tokens.get(argument_start).copied() else {
+                    break;
+                };
+                let candidate = candidate.trim_matches(|character: char| {
+                    !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_')
+                });
+                if candidate.starts_with('-') {
+                    break;
+                }
+                let Some(nested) = documented_command.find_subcommand(candidate) else {
+                    break;
+                };
+                documented_command = nested;
+                argument_start += 1;
             }
             for token in &tokens[argument_start..] {
                 let token = token.trim_matches(|character: char| {

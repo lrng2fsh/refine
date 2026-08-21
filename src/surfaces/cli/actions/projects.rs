@@ -98,15 +98,6 @@ pub enum ProjectAction {
         #[arg(long, default_value = "run")]
         runtime_root: PathBuf,
     },
-    /// Publish and pull Refine control state now.
-    Sync {
-        #[cfg_attr(test, arg(long, hide = true))]
-        #[cfg_attr(not(test), arg(skip = None))]
-        target_root: Option<PathBuf>,
-        /// Cache directory to persist the rebuilt projection snapshot into.
-        #[arg(long)]
-        cache_dir: Option<PathBuf>,
-    },
     /// Inspect or hibernate clean inactive Goal worktrees for the attached target app.
     ///
     /// Dry-run is the default. Recoverable branches remain; exact integrated refs may be retired.

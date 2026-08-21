@@ -1,14 +1,15 @@
 use super::{
     ApiRequest, ApiResponse, ConfigService, HostAgentProviderService, InProcessWebServer, PathBuf,
-    RefineError, TerminalLaunchSpec, Value, cleanup_failed_terminal_worktree,
-    create_terminal_standalone_worktree, default_interactive_shell, error_response,
-    files_read_response, files_search_response, files_tree_response, find_goal_agent_session, json,
-    query_param, resume_terminal_standalone_worktree, runtime_root_unavailable,
-    target_root_unavailable, terminal_events_range, terminal_input_response,
-    terminal_profile_prompt, terminal_resize_response, terminal_session_start_response,
-    terminal_status_response, terminal_stop_response,
+    RefineError, TerminalLaunchSpec, TerminalSessionLaunchSurface, Value,
+    cleanup_failed_terminal_worktree, create_terminal_standalone_worktree,
+    default_interactive_shell, error_response, files_read_response, files_search_response,
+    files_tree_response, find_goal_agent_session, json, query_param,
+    resume_terminal_standalone_worktree, runtime_root_unavailable, target_root_unavailable,
+    terminal_events_range, terminal_input_response, terminal_profile_prompt,
+    terminal_resize_response, terminal_session_start_response, terminal_status_response,
+    terminal_stop_response,
 };
-use crate::tools::product::work_items::FileWorkItemService;
+use crate::application::work_items::FileWorkItemService;
 
 impl InProcessWebServer {
     pub(crate) fn handle_files_tree(&self, raw_path: &str) -> ApiResponse {
@@ -98,6 +99,10 @@ impl InProcessWebServer {
                 "unknown terminal profile {profile}"
             )));
         }
+        let surface = match TerminalSessionLaunchSurface::from_request(body.get("surface")) {
+            Ok(surface) => surface,
+            Err(error) => return error_response(error),
+        };
         let goal_id = body
             .get("goal_id")
             .and_then(Value::as_str)
@@ -112,6 +117,13 @@ impl InProcessWebServer {
             };
             match find_goal_agent_session(&runtime_root, goal_id) {
                 Ok(snapshot) => {
+                    if surface == TerminalSessionLaunchSurface::Toolbar {
+                        return self.queue_toolbar_goal_agent_attachment(
+                            runtime_root,
+                            goal_id,
+                            snapshot,
+                        );
+                    }
                     return match serde_json::to_value(snapshot) {
                         Ok(value) => ApiResponse::json(200, value),
                         Err(error) => error_response(RefineError::Serialization(format!(
@@ -172,6 +184,7 @@ impl InProcessWebServer {
         let mut cwd = target_root.clone();
         let mut metadata = serde_json::Map::new();
         metadata.insert("profile".to_string(), json!(&profile));
+        metadata.insert("surface".to_string(), json!(surface.as_str()));
         if let Some(goal_id) = &goal_id {
             let key = if profile == "goal" {
                 // This association is context only. Workflow process control
@@ -236,6 +249,7 @@ impl InProcessWebServer {
             let prompt = match terminal_profile_prompt(
                 self,
                 &profile,
+                surface,
                 goal_id.as_deref(),
                 feature_id.as_deref(),
                 supplemental_prompt,

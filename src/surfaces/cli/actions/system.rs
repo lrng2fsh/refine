@@ -2,18 +2,18 @@ use super::*;
 
 #[derive(Debug, Subcommand)]
 pub enum SystemAction {
-    /// Install Refine: build the release binary, then register and start its daemon service.
-    Install {
-        /// Daemon port to configure for the installation.
+    /// Register and start Refine's port-scoped systemd or launchd service.
+    ServiceInstall {
+        /// Daemon port to configure for the service.
         #[arg(long)]
         port: u16,
-        /// Install target; auto-detects the operating system by default.
+        /// OS service target; auto-detects the operating system by default.
         #[arg(long, value_enum, default_value_t = CliInstallTarget::Auto)]
         target: CliInstallTarget,
         /// Runtime directory where Refine keeps daemon state.
         #[arg(long, default_value = "run")]
         runtime_root: PathBuf,
-        /// Version string to record for the installation.
+        /// Version string to record for the service registration.
         #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
         version: String,
     },
@@ -43,23 +43,6 @@ pub enum SystemAction {
         /// Version string to record for the installation.
         #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
         version: String,
-    },
-    /// Self-update Refine to the latest available version.
-    Update {
-        /// Skip the confirmation prompt.
-        #[arg(long)]
-        yes: bool,
-        /// Agent provider that performs the update. Defaults to the target
-        /// app's configured provider, then the first installed provider CLI
-        /// in alphabetical order.
-        #[arg(long)]
-        provider: Option<String>,
-        /// Port whose checkout-local runtime owns the update Agent artifacts.
-        #[arg(long, default_value_t = 8082)]
-        port: u16,
-        /// Runtime directory where Refine keeps daemon state.
-        #[arg(long, default_value = "run")]
-        runtime_root: PathBuf,
     },
     /// Preview a semantic release without changing files.
     ReleasePlan {
@@ -231,15 +214,15 @@ pub enum SystemAction {
         #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
         version: String,
     },
-    /// Uninstall Refine from this machine.
-    Uninstall {
-        /// Daemon port the installation is configured for.
+    /// Stop and remove Refine's port-scoped systemd or launchd service.
+    ServiceUninstall {
+        /// Daemon port the service is configured for.
         #[arg(long)]
         port: u16,
         /// Runtime directory where Refine keeps daemon state.
         #[arg(long, default_value = "run")]
         runtime_root: PathBuf,
-        /// Version string of the installation to remove.
+        /// Version string of the service registration to remove.
         #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
         version: String,
     },

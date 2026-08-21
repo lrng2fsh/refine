@@ -1,8 +1,10 @@
 use serde_json::json;
 
-use crate::process::supervisor::lifecycle::{current_launch_executable, current_launch_mode};
+use crate::application::system::daemon_lifecycle::DaemonLifecycleAction;
+use crate::infrastructure::process::supervisor::lifecycle::{
+    current_launch_executable, current_launch_mode,
+};
 use crate::surfaces::mcp;
-use crate::tools::host::daemon_lifecycle::DaemonLifecycleAction;
 
 use super::support::*;
 use super::*;
@@ -307,6 +309,10 @@ impl InProcessWebServer {
             return self.handle_fleet_distribute(request);
         }
 
+        if request.method == "POST" && request.path == "/fleet/sync" {
+            return self.handle_fleet_sync();
+        }
+
         if request.method == "POST" && request.path == "/fleet/nodes" {
             return self.handle_remote_node_upsert(request, None);
         }
@@ -507,8 +513,12 @@ impl InProcessWebServer {
             return self.handle_project_detach();
         }
 
-        if request.method == "POST" && request.path == "/project/sync" {
-            return self.handle_project_sync();
+        if request.method == "POST" && request.path == "/sync" {
+            return self.handle_sync(request);
+        }
+
+        if request.method == "GET" && request.path == "/sync/preview" {
+            return self.handle_sync_preview();
         }
 
         if request.method == "POST" && request.path == "/project/worktrees/cleanup" {
@@ -870,6 +880,7 @@ impl InProcessWebServer {
                 || request.path.ends_with("/approve")
                 || request.path.ends_with("/retry-quality")
                 || request.path.ends_with("/retry-governance")
+                || request.path.ends_with("/resolve-merged")
                 || request.path.ends_with("/undo"))
         {
             return self.handle_goal_action(request);
@@ -1006,7 +1017,7 @@ fn should_refresh_projection_after_mutation(path: &str) -> bool {
     // tool actually mutates state, so the outer `/mcp` POST itself is exempt.
     !path.starts_with("/terminal/")
         && path != "/work/goals"
-        && path != "/project/sync"
+        && path != "/sync"
         && path != "/cache/rebuild"
         && !path.starts_with("/system/source/")
         && path != mcp::MCP_ROUTE

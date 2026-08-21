@@ -11,6 +11,7 @@ Use this document when an agent is responsible for installing or updating Refine
 - Determine which dependency sources are available on this host before installing anything: system package managers, existing corporate mirrors, preinstalled toolchains, or manual user setup.
 - Make sure the user can approve dependency installation from the available source or choose to install missing dependencies manually.
 - Install or repair required dependencies before cloning or updating Refine: `curl`, `git`, a C compiler/linker, and Rust Cargo.
+- **Git 2.42 or newer is required**, on every node. Refine's state merge is `git merge-tree`, so a node with an older Git cannot synchronize state at all: the daemon refuses to start and says so, `refine fleet sync` reports that node as `unsupported_git`, and the rest of the fleet keeps converging meanwhile. Check with `git --version` and upgrade before installing.
 - If using a real provider, make sure the user can complete that provider's CLI authentication on this host.
 
 ## Ask If You Cannot Infer
@@ -30,7 +31,7 @@ Ask only when the answer is not clear from the user's environment, prior convers
 
 ```bash
 curl --version
-git --version
+git --version   # must report 2.42 or newer
 cc --version
 cargo --version
 ```
@@ -52,11 +53,17 @@ tar -C "$tmp/refine" --exclude .git -cf - . | tar -C <refine-checkout> -xf -
 rm -rf "$tmp"
 ```
 
-5. Install Refine for the selected port. This command assumes the prerequisites above are available, builds the locked release binary, atomically publishes it as `bin/refine`, marks the checkout as deployed, and only then registers and activates the service:
+5. Register Refine's OS service for the selected port. Copying the release into
+   the product home installs Refine; service registration is a separate host
+   operation. This command assumes the prerequisites above are available,
+   bootstraps the locked release binary when it is missing, atomically publishes it as
+   `bin/refine`, marks the checkout as deployed, and only then registers and
+   activates the port-scoped systemd or launchd service. It does not fetch or
+   update Refine source:
 
 ```bash
 cd <refine-checkout>
-./r system install --port <port>
+./r system service-install --port <port>
 ```
 
 6. Configure the selected provider:
@@ -83,10 +90,12 @@ Do not offer `smoke-ai` during installation. It is reserved for deterministic te
 
 The directory selected above is the product home. `./r` always runs the
 stable production binary `<refine-checkout>/bin/refine` — never a debug
-build. `./r system start`, `./r system install`, and `./r system build`
-create or refresh that binary (rebuilding only when the source has changed
-since the last production build) and say so on stdout; every other command
-requires it to already exist. The base runtime is `<refine-checkout>/run`,
+build. `./r system start` and `./r system build` create or refresh that binary
+(rebuilding only when the source has changed since the last production build)
+and say so on stdout. `./r system service-install` bootstraps the binary only
+when it is missing; it does not rebuild an existing binary as a side effect of
+service registration. Every other command requires it to already exist. The
+base runtime is `<refine-checkout>/run`,
 and port `<port>` owns only `<refine-checkout>/run/<port>`. `./r` anchors the
 invocation to that product home; the directory from which a user launches it
 is not an ownership signal. Do not configure HOME, XDG, platform support
@@ -108,15 +117,29 @@ A published installation is intentionally gitless and is identified by
 provider, and published-update operations. Source status and source promotion
 require an actual Git checkout and will fail closed for a gitless product home.
 
-`./r system install` is the complete fresh-install boundary; callers do not
-prebuild or copy the binary separately. Current service registrations launch the checkout-local binary with the exact
-port and checkout-local runtime and use the checkout as their working
-directory. The current targets are `macos_daemon`, `windows_daemon`, and
-`linux_cli_web`. The historical JSON values `mac_os_app_bundle` and
-`windows_installer` are accepted only when reading migration-era state; new
-state is always written with current names.
+Installing the product files, publishing the production binary, and managing
+the OS service are distinct operations. `./r system build` publishes the
+production binary without changing service registration. `./r system
+service-install` is the registration boundary; it also bootstraps a missing
+binary so first registration does not require a separate build. Current
+service registrations launch the checkout-local binary with the exact port and
+checkout-local runtime and use the checkout as their working directory. The
+current targets are `macos_daemon`, `windows_daemon`, and `linux_cli_web`. The
+historical JSON values `mac_os_app_bundle` and `windows_installer` are accepted
+only when reading migration-era state; new state is always written with current
+names.
 
-Ordinary install/status reports a conflicting legacy external runtime or
+Remove a selected port's OS service registration with:
+
+```bash
+./r system service-uninstall --port <port>
+```
+
+This stops and removes the port-scoped systemd or launchd registration. It is
+not a source update command and does not remove the Refine checkout or its
+published production binary.
+
+Ordinary service registration/status reports a conflicting legacy external runtime or
 registration without changing it. `./r system repair --port <port>` is the
 explicit migration boundary: it leaves external runtime and binary trees
 untouched, stores the exact original registration bytes, SHA-256, parsed
@@ -127,16 +150,40 @@ exact original registration and retains the journal.
 
 ## Update Refine
 
-`./r system update --yes` performs this section automatically: it stops the running daemons, delegates the update to the configured agent provider with this runbook as context, and restarts the daemons afterward. If you are the agent delegated by `./r system update`, the daemons are already stopped: do not run `./r system update` again and do not start, stop, or restart Refine; complete the steps below and report the exact blocker if one fails.
+`./r system update` is the deterministic one-command source update for a Git
+checkout. It is distinct from installing the product files and from registering
+or removing the OS service. It first fetches and checks the configured
+upstream. If there are no
+new upstream commits, it exits without stopping Refine or modifying the
+checkout. When an update is available, it runs these commands in order and
+stops immediately if any command fails:
 
-1. When updating manually (not delegated by `./r system update`), stop the running daemons first:
+```bash
+./r system stop
+git stash && git pull
+./r system build
+./r system start
+```
+
+The stash is not reapplied automatically. Because this path intentionally uses
+plain `git stash`, untracked files are not included. The command uses the
+default daemon port and runtime root and accepts no arguments.
+
+The web UI's Controls > Management > Update Refine control remains a separate,
+restart-safe source-promotion workflow with durable progress and recovery.
+
+The steps below remain for **gitless published installations** (a checkout
+without a usable `.git` directory), where the Git commands in `./r system
+update` cannot succeed.
+
+1. Stop the running daemons first:
 
 ```bash
 cd <refine-checkout>
 ./r system stop --port <port>
 ```
 
-2. Bring the checkout up to the latest published release. If the checkout is a git repository that is ahead of the latest release (a development checkout), leave the working tree alone and skip to the build step. Otherwise fetch the latest release and copy it over the checkout without a `.git` directory:
+2. Fetch the latest release and copy it over the checkout without a `.git` directory:
 
 ```bash
 latest="$(
@@ -158,7 +205,7 @@ cd <refine-checkout>
 ./r system build
 ```
 
-4. When updating manually, restart Refine and verify it is healthy:
+4. Restart Refine and verify it is healthy:
 
 ```bash
 ./r system start --port <port>
@@ -215,7 +262,14 @@ Runtime lifecycle commands:
 ./r system stop --port <port>
 ./r system restart --port <port>
 ./r system repair --port <port>
-./r system update --yes
+./r system update
+```
+
+OS service registration commands:
+
+```bash
+./r system service-install --port <port>
+./r system service-uninstall --port <port>
 ```
 
 Use `--runtime-root run` only as compatibility syntax for this checkout's
@@ -262,11 +316,46 @@ in the primary target-app worktree. Goal logs under
 Target App **Git remote** setting controls both state and Goal-branch
 publication and defaults to `origin`. If that remote is unavailable, Refine
 still initializes and commits local state; it simply cannot publish it. Use
-`project sync` or the Node screen's **Sync state now** action when a state
+`refine sync` or the Node screen's **Sync state now** action when a state
 handoff must happen immediately; `fleet sync` invokes the same shared
-capability for the current node. Manual sync is queued in a supervised runner
-process, and the UI reports its progress and any terminal error without
-blocking the daemon.
+capability for the current node and adds one status per other node. Manual sync
+is queued in a supervised runner process, and the UI reports its progress and
+any terminal error without blocking the daemon.
+
+Upgrading is per node. Install a new build on one node at a time, in any order:
+a node's CLI and daemon are one binary, so nothing on that node is ever half
+upgraded, nodes on different builds keep converging on `refine/state`, and
+until a node is upgraded `fleet sync` reports it as `pending_upgrade` instead
+of failing. [Manage the fleet](manage-fleet.md) carries the rollout procedure.
+
+### Refine-owned durable state
+
+Beyond `refine-live-state/` and `refine-state-worktree/`, Refine keeps these
+artifacts under the target repository's Git common directory and runtime root.
+Each is normal to encounter; only the first is safe to delete by hand.
+
+- `refine-integration/target` (in the Git common directory): a permanent
+  detached worktree where integration porcelain runs, so the shared human
+  checkout never has to be clean for an integration. It is invisible to
+  `git status`, appears in `git worktree list` locked with reason
+  "refine integration workspace", and persists between integrations because
+  recreating a large checkout is expensive. Safe to purge when Refine is not
+  integrating: it self-recreates on the next integration.
+- `refine-checkout-sync-pending.json` (in the Git common directory): records a
+  checkout sync that a working-tree collision (or other sync failure) skipped.
+  While it exists, the target branch ref already points at the integrated
+  commit but the checkout's index and files still hold the pre-integration
+  content, so the checkout shows the integration delta as staged-reverse —
+  this file is the explanation. Do not delete it: it encodes the unapplied ref
+  delta, and Refine retries the sync and clears the record once the colliding
+  files are committed, stashed, or restored.
+- `refine-integrated-target-transaction.json` (in the Git common directory):
+  marks an integrated-target transaction in progress so an interrupted one is
+  recovered on the next pass. Do not delete it: it encodes which Goal owns the
+  interruption. Recovery recreates the Refine-owned integration worktree
+  instead of quarantining its residue, replays any pending checkout sync, and
+  appends what it did to `refine-integrated-target-recoveries.jsonl` alongside
+  it; only legacy shared-checkout markers still quarantine residue to a stash.
 
 Worker machine creation is agent-operated rather than part of the Refine
 binary. Follow `docs/runbooks/manage-fleet.md` when a fleet needs another

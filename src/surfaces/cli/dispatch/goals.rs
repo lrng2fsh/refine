@@ -41,8 +41,7 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
                     target_root: Some(target_root),
                 },
         } => {
-            let goal = direct_work_item_service(&target_root)?
-                .show_goal_detail(&id)?;
+            let goal = direct_work_item_service(&target_root)?.show_goal_detail(&id)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({"goal": goal})).unwrap()
@@ -71,14 +70,13 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
                     priority,
                 },
         } => {
-            let goal = direct_work_item_service(&target_root)?
-                .update_goal_metadata_summary(
-                    &id,
-                    name.as_deref(),
-                    priority.as_deref(),
-                    None,
-                    None,
-                )?;
+            let goal = direct_work_item_service(&target_root)?.update_goal_metadata_summary(
+                &id,
+                name.as_deref(),
+                priority.as_deref(),
+                None,
+                None,
+            )?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({"goal": goal.goal})).unwrap()
@@ -159,18 +157,14 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
                 )?
             } else {
                 let Some(reporter) = reporter.as_deref() else {
-                    return Err(
-                        crate::process::supervisor::errors::RefineError::InvalidInput(
-                            "round reporter is required".to_string(),
-                        ),
-                    );
+                    return Err(crate::error::RefineError::InvalidInput(
+                        "round reporter is required".to_string(),
+                    ));
                 };
                 let Some(prompt) = prompt.as_deref() else {
-                    return Err(
-                        crate::process::supervisor::errors::RefineError::InvalidInput(
-                            "round prompt is required".to_string(),
-                        ),
-                    );
+                    return Err(crate::error::RefineError::InvalidInput(
+                        "round prompt is required".to_string(),
+                    ));
                 };
                 service.append_goal_round_summary(&id, reporter, prompt)?
             };
@@ -187,8 +181,7 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
                     target_root: Some(target_root),
                 },
         } => {
-            direct_work_item_service(&target_root)?
-                .delete_goal_record(&id)?;
+            direct_work_item_service(&target_root)?.delete_goal_record(&id)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({"deleted": true, "id": id})).unwrap()
@@ -202,8 +195,7 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
                     target_root: Some(target_root),
                 },
         } => {
-            let goal = direct_work_item_service(&target_root)?
-                .cancel_goal_summary(&id)?;
+            let goal = direct_work_item_service(&target_root)?.cancel_goal_summary(&id)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({"goal": goal.goal})).unwrap()
@@ -217,8 +209,7 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
                     target_root: Some(target_root),
                 },
         } => {
-            let goal = direct_work_item_service(&target_root)?
-                .start_goal_workflow(&id)?;
+            let goal = direct_work_item_service(&target_root)?.start_goal_workflow(&id)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({"goal": goal.goal})).unwrap()
@@ -238,11 +229,9 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
                 "quality" | "qa" => service.retry_goal_quality_summary(&id)?,
                 "governance" => service.retry_goal_governance_summary(&id)?,
                 _ => {
-                    return Err(
-                        crate::process::supervisor::errors::RefineError::InvalidInput(
-                            "retry stage must be quality or governance".to_string(),
-                        ),
-                    );
+                    return Err(crate::error::RefineError::InvalidInput(
+                        "retry stage must be quality or governance".to_string(),
+                    ));
                 }
             };
             println!(
@@ -273,13 +262,37 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
         }
         Commands::Goal {
             action:
+                GoalAction::ResolveMerged {
+                    id,
+                    target_root: Some(target_root),
+                },
+        } => {
+            let refine_dir = refine_dir_for_target_root(&target_root)?;
+            let resolution = FileGovernanceIntegrationService::with_target_root(
+                refine_dir.join("runtime"),
+                &refine_dir,
+                &target_root,
+            )
+            .resolve_already_merged_goal(&id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "resolution": resolution.disposition.as_str(),
+                    "goal": resolution.goal.goal,
+                    "evidence": resolution.evidence
+                }))
+                .unwrap()
+            );
+            Ok(())
+        }
+        Commands::Goal {
+            action:
                 GoalAction::Undo {
                     id,
                     target_root: Some(target_root),
                 },
         } => {
-            let goal = direct_work_item_service(&target_root)?
-                .undo_goal_summary(&id)?;
+            let goal = direct_work_item_service(&target_root)?.undo_goal_summary(&id)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({"goal": goal.goal})).unwrap()
@@ -294,8 +307,8 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
                     target_root: Some(target_root),
                 },
         } => {
-            let feature = direct_work_item_service(&target_root)?
-                .assign_goal_to_feature(&feature_id, &id)?;
+            let feature =
+                direct_work_item_service(&target_root)?.assign_goal_to_feature(&feature_id, &id)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -317,11 +330,9 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
             let service = direct_work_item_service(&target_root)?;
             let current = service.show_goal_summary(&id)?;
             let Some(feature_id) = current.goal.feature_id.clone() else {
-                return Err(
-                    crate::process::supervisor::errors::RefineError::InvalidInput(format!(
-                        "Goal {id} is not assigned to a Feature"
-                    )),
-                );
+                return Err(crate::error::RefineError::InvalidInput(format!(
+                    "Goal {id} is not assigned to a Feature"
+                )));
             };
             let feature = service.remove_goal_from_feature(&feature_id, &id)?;
             println!(
@@ -499,11 +510,9 @@ pub(super) fn dispatch_goal_daemon(action: GoalAction) -> RefineResult<()> {
                 "quality" => "retry-quality",
                 "governance" => "retry-governance",
                 _ => {
-                    return Err(
-                        crate::process::supervisor::errors::RefineError::InvalidInput(
-                            "retry stage must be quality or governance".to_string(),
-                        ),
-                    );
+                    return Err(crate::error::RefineError::InvalidInput(
+                        "retry stage must be quality or governance".to_string(),
+                    ));
                 }
             };
             daemon_json(
@@ -520,6 +529,10 @@ pub(super) fn dispatch_goal_daemon(action: GoalAction) -> RefineResult<()> {
             &format!("/work/goals/{}/approve", path_segment(&id)),
             None,
         )?,
+        GoalAction::ResolveMerged {
+            id,
+            target_root: None,
+        } => daemon_json("POST", &resolve_merged_daemon_route(&id), None)?,
         GoalAction::Undo {
             id,
             target_root: None,
@@ -579,6 +592,10 @@ pub(super) fn dispatch_goal_daemon(action: GoalAction) -> RefineResult<()> {
     };
     print_json(&response);
     Ok(())
+}
+
+pub(in crate::surfaces::cli) fn resolve_merged_daemon_route(goal_id: &str) -> String {
+    format!("/work/goals/{}/resolve-merged", path_segment(goal_id))
 }
 
 pub(super) fn write_goal_export(

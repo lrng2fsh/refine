@@ -25,6 +25,8 @@ class FakeElement {
     this._innerHTML = "";
     this.clientWidth = 1000;
     this.clientHeight = 400;
+    this.children = [];
+    this.firstElementChild = null;
     this.scrollHeight = 0;
     this.scrollTop = 0;
   }
@@ -35,7 +37,10 @@ class FakeElement {
   contains(element) { return element === this; }
   focus() {}
   remove() {}
-  replaceChildren() {}
+  replaceChildren(...children) {
+    this.children = children;
+    this.firstElementChild = children[0] || null;
+  }
   getBoundingClientRect() {
     return {
       width: this.clientWidth,
@@ -316,6 +321,7 @@ function browserRuntime(storage = new Map(), persistentStorage = new Map()) {
       systemOperations() {
         return systemOperationState.messages.map((item) => ({ ...item }));
       },
+      settleOperation(operation) { dispatchBackgroundOperationUpdate(operation); },
       toasts() { return testToasts.map((item) => [...item]); },
       setApi(nextApi) { api = nextApi; },
       setReporter(name) { setLastReporter(name); },
@@ -333,11 +339,17 @@ function browserRuntime(storage = new Map(), persistentStorage = new Map()) {
       deleteTodoItem(listId, itemId) { return deleteTodoItem(listId, itemId); },
       installTerminalResizer(tabId, resize) {
         ensureTestTab(tabId);
-        terminalStateFor(tabId).term = { resize };
+        terminalStateFor(tabId).term = {
+          element: document.createElement("div"),
+          focus() {},
+          resize,
+        };
       },
       installTerminalResizerWithUnavailableDimensions(tabId, resize) {
         ensureTestTab(tabId);
         terminalStateFor(tabId).term = {
+          element: document.createElement("div"),
+          focus() {},
           resize,
           _core: {
             _renderService: {
@@ -355,6 +367,7 @@ function browserRuntime(storage = new Map(), persistentStorage = new Map()) {
         let forcedScrolls = 0;
         terminal.term = {
           buffer: { active: buffer },
+          focus() {},
           write() {
             const wasAtBottom = buffer.viewportY === buffer.baseY;
             buffer.baseY += 1;
@@ -376,9 +389,6 @@ function browserRuntime(storage = new Map(), persistentStorage = new Map()) {
           scrollUp(lines = 1) {
             buffer.viewportY = Math.max(0, buffer.viewportY - lines);
           },
-          scrollToBottom() {
-            buffer.viewportY = buffer.baseY;
-          },
         };
       },
       receive(tabId, text) {
@@ -391,6 +401,14 @@ function browserRuntime(storage = new Map(), persistentStorage = new Map()) {
         const terminal = terminalStateFor(chatState.activeTabId);
         terminal.outputResizeObserver?.trigger();
       },
+      setOutputSize(width, height) {
+        const output = document.querySelector(".terminal-output");
+        output.clientWidth = width;
+        output.clientHeight = height;
+      },
+      minimizeToolbar,
+      toggleToolbar,
+      toggleToolbarFullscreen,
       beginToolbarResize(clientY, pointerId = 1) {
         const handle = document.querySelector("#toolbar-dock-resize");
         handle?.listeners.get("pointerdown")?.({
@@ -843,12 +861,65 @@ test("Agent, Plan, Goal, and Standalone render the shared terminal surface", asy
   }
 });
 
-test("agent terminals follow at the bottom and preserve user scrollback until returned", async () => {
+test("Goal Agent is not presented until asynchronous Toolbar attachment is acknowledged", async () => {
+  const browser = browserRuntime();
+  const requests = [];
+  const operation = {
+    id: "goal-attachment-operation",
+    status: "running",
+    progress: {},
+    result: {},
+  };
+  browser.runtime.setApi(async (method, requestPath, body) => {
+    requests.push({ method, path: requestPath, body });
+    if (requestPath === "/api/terminal/session") return { operation };
+    if (requestPath === `/api/operations/${operation.id}`) return { operation };
+    throw new Error(`unexpected request: ${requestPath}`);
+  });
+
+  const opening = browser.runtime.openGoal("GOAL-ASYNC");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(browser.runtime.terminal("GOAL-ASYNC").loading, true);
+  assert.equal(browser.runtime.terminal("GOAL-ASYNC").connected, false);
+  assert.equal(browser.runtime.terminal("GOAL-ASYNC").sessionId, "");
+  assert.equal(browser.events().length, 0);
+
+  browser.runtime.settleOperation({
+    ...operation,
+    status: "complete",
+    result: {
+      id: "goal-async-session",
+      process_id: "goal-async-process",
+      cwd: "/repo/worktree",
+      profile: "goal",
+      provider: "codex",
+      goal_id: "GOAL-ASYNC",
+      toolbar_timeout_protected: true,
+    },
+  });
+  await opening;
+
+  assert.equal(browser.runtime.terminal("GOAL-ASYNC").loading, false);
+  assert.equal(browser.runtime.terminal("GOAL-ASYNC").connected, true);
+  assert.equal(browser.runtime.terminal("GOAL-ASYNC").sessionId, "goal-async-session");
+  assert.equal(browser.events().length, 1);
+  assert.deepEqual(
+    requests.map(({ method, path }) => [method, path]),
+    [
+      ["POST", "/api/terminal/session"],
+      ["GET", "/api/operations/goal-attachment-operation"],
+    ],
+  );
+});
+
+test("switching back to each Agent terminal scrolls to bottom without disturbing scrollback earlier", async () => {
   const browser = browserRuntime();
   const planTabId = await browser.runtime.openPlan("Design a retry queue");
   await browser.runtime.openGoal("GOAL1");
 
   for (const tabId of ["agent", planTabId, "GOAL1", "standalone"]) {
+    browser.runtime.show(tabId);
     const scroll = browser.runtime.installTerminalScrollModel(tabId);
 
     browser.runtime.receive(tabId, "first line\n");
@@ -858,9 +929,17 @@ test("agent terminals follow at the bottom and preserve user scrollback until re
     browser.runtime.receive(tabId, "second line\n");
     assert.deepEqual({ ...scroll.position() }, { baseY: 2, viewportY: 0, forcedScrolls: 0 });
 
-    scroll.scrollToBottom();
+    browser.runtime.draw();
+    browser.runtime.resizeOutput(900, 360);
+    await browser.runtime.activate(tabId);
+    assert.deepEqual({ ...scroll.position() }, { baseY: 2, viewportY: 0, forcedScrolls: 0 });
+
+    browser.runtime.show("system");
+    await browser.runtime.activate(tabId);
+    assert.deepEqual({ ...scroll.position() }, { baseY: 2, viewportY: 2, forcedScrolls: 1 });
+
     browser.runtime.receive(tabId, "third line\n");
-    assert.deepEqual({ ...scroll.position() }, { baseY: 3, viewportY: 3, forcedScrolls: 0 });
+    assert.deepEqual({ ...scroll.position() }, { baseY: 3, viewportY: 3, forcedScrolls: 1 });
   }
 });
 
@@ -895,6 +974,10 @@ test("each terminal profile sends its launch context and keeps an independent ma
   assert.deepEqual(starts.map((request) => request.body.profile), [
     "plan", "goal", "terminal", "agent", "standalone",
   ]);
+  assert.deepEqual(
+    starts.map((request) => request.body.surface),
+    ["toolbar", "toolbar", "toolbar", "toolbar", "toolbar"],
+  );
   assert.equal(starts.find((request) => request.body.profile === "goal").body.goal_id, "GOAL1");
   assert.equal(starts.find((request) => request.body.profile === "plan").body.initial_prompt, "Design a retry queue");
   assert.equal(browser.runtime.tab("standalone").worktree.path, "/tmp/worktree-5");
@@ -1247,6 +1330,69 @@ test("terminal columns refit when its rendered width changes", async () => {
   const backendResize = requests.filter((request) => request.path.endsWith("/resize")).at(-1);
   assert.equal(backendResize.body.cols, sizes[1].cols);
   assert.equal(backendResize.body.rows, sizes[1].rows);
+});
+
+test("terminal retains valid geometry while hidden and refits after layout transitions", async () => {
+  const browser = browserRuntime();
+  const requests = [];
+  const sizes = [];
+  browser.runtime.setApi(async (method, requestPath, body) => {
+    requests.push({ method, path: requestPath, body });
+    if (requestPath !== "/api/terminal/session") return { ok: true };
+    return {
+      id: "responsive-agent",
+      process_id: "interactive-responsive-agent",
+      cwd: "/repo",
+      profile: "agent",
+      provider: "codex",
+    };
+  });
+  await browser.runtime.click("agent");
+  browser.runtime.installTerminalResizer("agent", (cols, rows) => sizes.push({ cols, rows }));
+
+  browser.runtime.resizeOutput(800, 300);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const visibleSize = sizes.at(-1);
+  const visibleBackend = requests.filter((request) => request.path.endsWith("/resize")).at(-1);
+  assert.equal(visibleBackend.body.cols, visibleSize.cols);
+  assert.equal(visibleBackend.body.rows, visibleSize.rows);
+
+  browser.runtime.resizeOutput(0, 0);
+  browser.runtime.minimizeToolbar();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(sizes.length, 1);
+  assert.equal(sizes[0], visibleSize);
+  assert.equal(requests.filter((request) => request.path.endsWith("/resize")).length, 1);
+
+  browser.runtime.setOutputSize(1200, 360);
+  browser.runtime.toggleToolbar();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const restoredSize = sizes.at(-1);
+  const restoredBackend = requests.filter((request) => request.path.endsWith("/resize")).at(-1);
+  assert.ok(restoredSize.cols > visibleSize.cols);
+  assert.ok(restoredSize.rows > visibleSize.rows);
+  assert.equal(restoredBackend.body.cols, restoredSize.cols);
+  assert.equal(restoredBackend.body.rows, restoredSize.rows);
+
+  browser.runtime.setOutputSize(1400, 600);
+  browser.runtime.toggleToolbarFullscreen();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const fullscreenSize = sizes.at(-1);
+  const fullscreenBackend = requests.filter((request) => request.path.endsWith("/resize")).at(-1);
+  assert.ok(fullscreenSize.cols > restoredSize.cols);
+  assert.ok(fullscreenSize.rows > restoredSize.rows);
+  assert.equal(fullscreenBackend.body.cols, fullscreenSize.cols);
+  assert.equal(fullscreenBackend.body.rows, fullscreenSize.rows);
+
+  browser.runtime.setOutputSize(900, 340);
+  browser.runtime.toggleToolbarFullscreen();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const exitedFullscreenSize = sizes.at(-1);
+  const exitedFullscreenBackend = requests.filter((request) => request.path.endsWith("/resize")).at(-1);
+  assert.ok(exitedFullscreenSize.cols < fullscreenSize.cols);
+  assert.ok(exitedFullscreenSize.rows < fullscreenSize.rows);
+  assert.equal(exitedFullscreenBackend.body.cols, exitedFullscreenSize.cols);
+  assert.equal(exitedFullscreenBackend.body.rows, exitedFullscreenSize.rows);
 });
 
 test("terminal resize falls back when xterm renderer dimensions are unavailable", async () => {

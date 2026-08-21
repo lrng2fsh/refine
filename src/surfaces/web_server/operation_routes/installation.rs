@@ -117,7 +117,7 @@ impl InProcessWebServer {
             return error_response(error);
         }
         error_response(RefineError::NotImplemented(
-            "HTTP system update is disabled; run `./r system update` from the Refine checkout so it can stop daemons, delegate the update to the configured agent, and restart ports.".to_string(),
+            "HTTP system update is disabled; use the restart-safe Update control in the web UI, or run `./r system update` from the Refine checkout for the local stop, stash/pull, build, and start sequence.".to_string(),
         ))
     }
 
@@ -154,7 +154,7 @@ impl InProcessWebServer {
     pub(in crate::surfaces::web_server) fn handle_daemon_lifecycle_with(
         &self,
         action: DaemonLifecycleAction,
-        lifecycle: &impl crate::tools::host::daemon_lifecycle::HostDaemonLifecycleService,
+        lifecycle: &impl crate::application::system::daemon_lifecycle::HostDaemonLifecycleService,
     ) -> ApiResponse {
         match execute_daemon_lifecycle(
             lifecycle,
@@ -175,7 +175,7 @@ impl InProcessWebServer {
         action: DaemonLifecycleAction,
         executable: &std::path::Path,
         service_manager: Option<&str>,
-        launcher: &dyn crate::tools::host::daemon_lifecycle::RestartSafeHandoffLauncher,
+        launcher: &dyn crate::application::system::daemon_lifecycle::RestartSafeHandoffLauncher,
     ) -> ApiResponse {
         let operations = match self.system_lifecycle_operations() {
             Ok(operations) => operations,
@@ -300,7 +300,7 @@ impl InProcessWebServer {
 
     pub(in crate::surfaces::web_server) fn source_status_body(
         &self,
-        status: crate::tools::host::source_promotion::CachedSourcePromotionStatus,
+        status: crate::application::system::source_promotion::CachedSourcePromotionStatus,
     ) -> serde_json::Value {
         let source = status.source;
         let check = status.check;
@@ -325,8 +325,7 @@ impl InProcessWebServer {
                 .as_ref()
                 .filter(|operation| matches!(operation.status.as_str(), "failed" | "interrupted"))
             {
-                source_update.enabled =
-                    source.clean && source.fast_forward && source.update_available;
+                source_update.enabled = source.fast_forward && source.update_available;
                 source_update.state = operation.status.clone();
                 source_update.title = match operation.error.as_deref() {
                     Some(error) => format!("{}: {error}", operation.message),

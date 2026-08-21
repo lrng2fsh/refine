@@ -64,6 +64,7 @@ pub struct ImplementationChecklistItem {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CriticismResolution {
     pub criticism_id: String,
     pub resolution: String,
@@ -116,6 +117,7 @@ pub struct ImplementationCriticismArtifact {
 #[serde(rename_all = "snake_case")]
 pub enum ImplementationChecklistOutcome {
     Completed,
+    NoChangeNeeded,
     Deviated,
     Rejected,
     Blocked,
@@ -156,6 +158,19 @@ pub struct ImplementationPlanningFailure {
     pub git_after: Option<PlanningGitObservation>,
 }
 
+/// One invalid structured response retained before a bounded diagnostic repair invocation.
+///
+/// Keeping this evidence on the Round makes provider/output-contract failures inspectable even
+/// when a later repair succeeds. `attempt` is one-based within the current planning phase.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ImplementationPlanningOutputAttempt {
+    pub phase: ImplementationPlanPhase,
+    pub attempt: usize,
+    pub raw_output: String,
+    pub diagnostics: String,
+    pub recorded_at: Timestamp,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ImplementationPlan {
     pub schema_version: u32,
@@ -177,4 +192,29 @@ pub struct ImplementationPlan {
     pub implementation: Option<ImplementationAgentEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<ImplementationPlanningFailure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invalid_output_attempts: Vec<ImplementationPlanningOutputAttempt>,
+    /// Provider-native session pinned by the plan phase so revise and
+    /// implement can resume it on providers whose CLI supports continuity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    /// Advisory governance verdict on the finalized plan, recorded before any
+    /// implementation spend. The post-implementation gate stays authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance_precheck: Option<PlanGovernancePrecheck>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanGovernancePrecheck {
+    /// `passed`, `inconclusive` (unreadable verdict — advisory, so the Round
+    /// proceeds), `failed`, or `revised` (violations were folded back into one
+    /// extra revise pass whose verdict is still pending).
+    pub status: String,
+    /// 1 for the originally finalized plan, 2 for the re-revised plan.
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub violations: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub checked_at: Timestamp,
 }

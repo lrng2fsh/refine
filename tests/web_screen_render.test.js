@@ -828,6 +828,102 @@ test("Agent terminal renders transported ANSI control sequences through xterm", 
   }
 });
 
+test("Agent terminal refits from visible geometry after minimize and fullscreen", { skip: SKIP }, async () => {
+  const backendSizes = [];
+  const app = await openApp({
+    fixture(pathname) {
+      if (pathname === "/api/terminal/browser-responsive-agent/resize") return { ok: true };
+      return apiFixture(pathname);
+    },
+    onRequest(pathname, request) {
+      if (pathname === "/api/terminal/browser-responsive-agent/resize") {
+        backendSizes.push(request.postDataJSON());
+      }
+    },
+  });
+  const terminalGeometry = async (action = null) => app.page.evaluate(async (nextAction) => {
+    if (nextAction === "minimize") minimizeToolbar();
+    if (nextAction === "restore") toggleToolbar();
+    if (nextAction === "fullscreen") toggleToolbarFullscreen();
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const terminal = terminalStateFor("responsive-agent");
+    return {
+      cols: terminal.term.cols,
+      rows: terminal.term.rows,
+      backendCols: terminal.lastCols,
+      backendRows: terminal.lastRows,
+    };
+  }, action);
+
+  try {
+    await app.page.setViewportSize({ width: 760, height: 600 });
+    await assertScreenRenders(app, { route: "#/", marker: "#dash" });
+    await app.page.evaluate(() => {
+      window.EventSource = class {
+        addEventListener() {}
+        close() {}
+      };
+      chatState.tabs = {
+        "responsive-agent": normalizeInteractiveTerminalTab({
+          goalId: null,
+          label: "Agent",
+          mode: "agent",
+          sessionId: "browser-responsive-agent",
+          processId: "browser-responsive-agent-process",
+        }),
+      };
+      chatState.activeTabId = "responsive-agent";
+      chatState.open = true;
+      chatState.bodyHeight = 320;
+      const terminal = terminalStateFor("responsive-agent");
+      terminal.sessionId = "browser-responsive-agent";
+      terminal.processId = "browser-responsive-agent-process";
+      terminal.connected = true;
+      terminal.statusChecked = true;
+      terminal.reattaching = false;
+      drawToolbar();
+    });
+
+    const initial = await terminalGeometry();
+    const visibleResizeCount = backendSizes.length;
+    assert.ok(initial.cols > 20);
+    assert.equal(initial.backendCols, initial.cols);
+    assert.equal(initial.backendRows, initial.rows);
+
+    const hidden = await terminalGeometry("minimize");
+    assert.deepEqual(hidden, initial);
+    assert.equal(backendSizes.length, visibleResizeCount);
+
+    await app.page.setViewportSize({ width: 1400, height: 900 });
+    const restored = await terminalGeometry("restore");
+    assert.ok(restored.cols > initial.cols);
+    assert.equal(restored.backendCols, restored.cols);
+    assert.equal(restored.backendRows, restored.rows);
+
+    const fullscreen = await terminalGeometry("fullscreen");
+    assert.ok(fullscreen.rows > restored.rows);
+    assert.equal(fullscreen.backendCols, fullscreen.cols);
+    assert.equal(fullscreen.backendRows, fullscreen.rows);
+    assert.deepEqual(backendSizes.at(-1), {
+      cols: fullscreen.cols,
+      rows: fullscreen.rows,
+    });
+
+    const exitedFullscreen = await terminalGeometry("fullscreen");
+    assert.ok(exitedFullscreen.rows < fullscreen.rows);
+    assert.equal(exitedFullscreen.backendCols, exitedFullscreen.cols);
+    assert.equal(exitedFullscreen.backendRows, exitedFullscreen.rows);
+    assert.deepEqual(backendSizes.at(-1), {
+      cols: exitedFullscreen.cols,
+      rows: exitedFullscreen.rows,
+    });
+    assert.deepEqual(app.pageErrors, []);
+  } finally {
+    await app.close();
+  }
+});
+
 test("Todo List renders an item-first workspace with responsive list navigation", { skip: SKIP }, async () => {
   const app = await openApp();
   try {
@@ -913,13 +1009,13 @@ test("Todo List renders an item-first workspace with responsive list navigation"
   }
 });
 
-test("terminal tabs swap one mounted xterm and retain inactive scrollback", { skip: SKIP }, async () => {
+test("Agent tab round trip retains xterm and scrollback while returning to latest output", { skip: SKIP }, async () => {
   const app = await openApp();
   try {
     await assertScreenRenders(app, { route: "#/", marker: "#dash" });
     const result = await app.page.evaluate(async () => {
       const firstId = "renderer-agent";
-      const secondId = "renderer-plan";
+      const secondId = "renderer-agent-2";
       const makeTab = (label, mode) => normalizeInteractiveTerminalTab({
         goalId: null,
         label,
@@ -939,8 +1035,20 @@ test("terminal tabs swap one mounted xterm and retain inactive scrollback", { sk
 
       chatState.tabs = {
         [firstId]: makeTab("Agent", "agent"),
-        [secondId]: makeTab("Planing Agent", "plan"),
+        [secondId]: makeTab("Agent 2", "agent"),
       };
+      for (const tabId of [firstId, secondId]) {
+        const tab = chatState.tabs[tabId];
+        tab.sessionId = `${tabId}-session`;
+        tab.processId = `${tabId}-process`;
+        const terminal = terminalStateFor(tabId);
+        terminal.sessionId = tab.sessionId;
+        terminal.processId = tab.processId;
+        terminal.connected = true;
+        terminal.statusChecked = true;
+        terminal.reattaching = false;
+        terminal.eventSource = { close() {} };
+      }
       chatState.activeTabId = firstId;
       chatState.open = true;
       chatState.bodyHeight = 420;
@@ -959,8 +1067,7 @@ test("terminal tabs swap one mounted xterm and retain inactive scrollback", { sk
       const firstViewport = firstTerm.buffer.active.viewportY;
       const firstBase = firstTerm.buffer.active.baseY;
 
-      chatState.activeTabId = secondId;
-      drawToolbar();
+      await activateToolbarTab(secondId);
       await nextFrame();
       const second = terminalStateFor(secondId);
       const secondTerm = second.term;
@@ -976,8 +1083,12 @@ test("terminal tabs swap one mounted xterm and retain inactive scrollback", { sk
         secondMounted: secondTerm.element.parentElement === secondHost,
       };
 
-      chatState.activeTabId = firstId;
-      drawToolbar();
+      terminalReceiveOutput("\r\nFIRST-LATEST-MARKER", first);
+      await flushWrites(firstTerm);
+      const firstBaseAfterLatest = firstTerm.buffer.active.baseY;
+      const firstViewportBeforeReturn = firstTerm.buffer.active.viewportY;
+
+      await activateToolbarTab(firstId);
       await nextFrame();
       const firstHost = document.querySelector(".terminal-output");
       const firstBuffer = bufferText(firstTerm);
@@ -990,12 +1101,16 @@ test("terminal tabs swap one mounted xterm and retain inactive scrollback", { sk
         secondInstanceRetained: terminalStateFor(secondId).term === secondTerm,
         firstScrollbackRetained:
           firstBase > 0
-          && firstTerm.buffer.active.baseY === firstBase
-          && firstTerm.buffer.active.viewportY === firstViewport
+          && firstBaseAfterLatest >= firstBase
+          && firstViewportBeforeReturn === firstViewport
           && firstBuffer.includes("FIRST-SCROLLBACK-00")
-          && firstBuffer.includes("FIRST-SCROLLBACK-END"),
-        firstVisible:
-          firstHost.querySelector(".xterm-rows")?.textContent.includes("FIRST-SCROLLBACK-00")
+          && firstBuffer.includes("FIRST-SCROLLBACK-END")
+          && firstBuffer.includes("FIRST-LATEST-MARKER"),
+        firstBaseUnchanged: firstTerm.buffer.active.baseY === firstBaseAfterLatest,
+        firstViewportAtBottom:
+          firstTerm.buffer.active.viewportY === firstTerm.buffer.active.baseY,
+        latestMarkerVisible:
+          firstHost.querySelector(".xterm-rows")?.textContent.includes("FIRST-LATEST-MARKER")
           || false,
         firstExcludesSecond:
           !firstHost.querySelector(".xterm-rows")?.textContent.includes("SECOND-ACTIVE-ONLY"),
@@ -1015,7 +1130,9 @@ test("terminal tabs swap one mounted xterm and retain inactive scrollback", { sk
       firstInstanceRetained: true,
       secondInstanceRetained: true,
       firstScrollbackRetained: true,
-      firstVisible: true,
+      firstBaseUnchanged: true,
+      firstViewportAtBottom: true,
+      latestMarkerVisible: true,
       firstExcludesSecond: true,
     });
     assert.deepEqual(app.pageErrors, []);
@@ -1390,10 +1507,10 @@ test("settings refresh never clears the Upgrade banner while its read is pending
     if (pathname.startsWith("/api/upgrade")) {
       return {
         upgrade: {
+          runtime_kind: "published_release",
           current_version: "4.0.0",
           latest_version: "4.1.0",
           upgrade_available: true,
-          local_development: false,
         },
       };
     }
@@ -1441,10 +1558,10 @@ test("settings refresh never clears the Upgrade banner while its read is pending
         };
         releaseUpgrade({
           upgrade: {
+            runtime_kind: "published_release",
             current_version: "4.0.0",
             latest_version: "4.2.0",
             upgrade_available: true,
-            local_development: false,
           },
         });
         await pendingUpgradeRead;
@@ -1463,6 +1580,55 @@ test("settings refresh never clears the Upgrade banner while its read is pending
     assert.match(result.whilePending.text, /Upgrade available 4\.1\.0/);
     assert.equal(result.whilePending.mutations, 0);
     assert.match(result.afterRead, /Upgrade available 4\.2\.0/);
+    assert.deepEqual(app.pageErrors, []);
+  } finally {
+    await app.close();
+  }
+});
+
+test("runtime banner distinguishes trusted source relationships from unknown evidence", { skip: SKIP }, async () => {
+  const app = await openApp();
+  try {
+    const messages = await app.page.evaluate(() => {
+      const text = (upgrade) => {
+        const root = document.createElement("div");
+        root.innerHTML = renderRuntimeUpgradeBanner(upgrade);
+        return root.textContent.replace(/\s+/g, " ").trim();
+      };
+      return {
+        current: text({
+          runtime_kind: "source",
+          source: {
+            running_from_head: true,
+            relationship: "current",
+            upstream: { remote: "origin", branch: "main" },
+          },
+        }),
+        diverged: text({
+          runtime_kind: "source",
+          source: {
+            running_from_head: true,
+            relationship: "diverged",
+            upstream: { remote: "origin", branch: "main" },
+          },
+        }),
+        unknown: text({
+          runtime_kind: "source",
+          source: {
+            running_from_head: null,
+            relationship: "unknown",
+            unknown_reason: "executable_checkout_mismatch",
+            upstream: { freshness: "fresh" },
+          },
+        }),
+      };
+    });
+    assert.equal(messages.current, "Running from HEAD · Up to date with origin/main");
+    assert.equal(messages.diverged, "Running from HEAD · Diverged from origin/main");
+    assert.equal(
+      messages.unknown,
+      "Source runtime status unknown · the running executable does not match checkout HEAD",
+    );
     assert.deepEqual(app.pageErrors, []);
   } finally {
     await app.close();

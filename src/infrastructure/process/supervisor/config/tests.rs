@@ -1,0 +1,666 @@
+use super::*;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[test]
+fn file_settings_service_lists_defaults_and_persists_updates() {
+    let temp_root = unique_temp_dir("settings");
+    let refine_dir = temp_root.join(".refine");
+    let service = FileSettingsService::new(&refine_dir);
+
+    assert_eq!(service.load().unwrap()["agent_cli"], "claude");
+    assert_eq!(
+        service.load().unwrap()["automatic_agent_resource_budget_percent"],
+        "70"
+    );
+    assert_eq!(
+        service.load().unwrap()["state_sync_stale_threshold_seconds"],
+        "900"
+    );
+    assert!(
+        !service
+            .load()
+            .unwrap()
+            .contains_key("development_request_email_enabled")
+    );
+    assert!(
+        service
+            .update(&serde_json::json!({"development_request_email_enabled": true}))
+            .is_err()
+    );
+    let updated = service
+        .update(&serde_json::json!({
+            "agent_cli": "smoke-ai",
+            "parallel_run_cap": 4,
+            "target_app_env_json": {"PORT": 3000}
+        }))
+        .unwrap();
+    assert_eq!(updated["settings"]["agent_cli"], "smoke-ai");
+    assert_eq!(updated["settings"]["parallel_run_cap"], "4");
+    assert!(updated["settings"].get("paused").is_none());
+    assert!(service.path().exists());
+    assert!(!refine_dir.join(SETTINGS_FILE).exists());
+    let generic = service
+        .update(&serde_json::json!({"agent_cli": "/opt/refine/custom-agent"}))
+        .unwrap();
+    assert_eq!(generic["settings"]["agent_cli"], "/opt/refine/custom-agent");
+    assert!(
+        service
+            .update(&serde_json::json!({"state_sync_stale_threshold_seconds": 0}))
+            .is_err()
+    );
+    let threshold = service
+        .update(&serde_json::json!({"state_sync_stale_threshold_seconds": 1800}))
+        .unwrap();
+    assert_eq!(
+        threshold["settings"]["state_sync_stale_threshold_seconds"],
+        "1800"
+    );
+    let resource_budget = service
+        .update(&serde_json::json!({"automatic_agent_resource_budget_percent": 55}))
+        .unwrap();
+    assert_eq!(
+        resource_budget["settings"]["automatic_agent_resource_budget_percent"],
+        "55"
+    );
+    for invalid in [json!(0), json!(101), json!("70.5"), json!("seventy")] {
+        assert!(
+            service
+                .update(&json!({"automatic_agent_resource_budget_percent": invalid}))
+                .is_err()
+        );
+    }
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn file_settings_service_removes_retired_global_email_settings() {
+    let temp_root = unique_temp_dir("settings-retired-email");
+    let refine_dir = temp_root.join(".refine");
+    fs::create_dir_all(&refine_dir).unwrap();
+    fs::write(
+        refine_dir.join("nodes.json"),
+        serde_json::to_vec_pretty(&json!({
+            "nodes": [{
+                "id": "default",
+                "display_name": "Default",
+                "created_at": "2026-08-06T00:00:00Z",
+                "updated_at": "2026-08-06T00:00:00Z",
+                "settings": {
+                    "agent_cli": "codex",
+                    "development_request_email_enabled": "1",
+                    "development_request_allowed_senders": "private@example.com"
+                }
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let settings = FileSettingsService::new(&refine_dir).load().unwrap();
+    assert_eq!(settings["agent_cli"], "codex");
+    assert!(!settings.contains_key("development_request_email_enabled"));
+    let stored = fs::read_to_string(refine_dir.join("nodes.json")).unwrap();
+    assert!(!stored.contains("development_request_email_enabled"));
+    assert!(!stored.contains("development_request_allowed_senders"));
+    assert!(!stored.contains("private@example.com"));
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn file_settings_service_rejects_the_retired_generated_worktree_cleanup_paths_key() {
+    let temp_root = unique_temp_dir("settings-worktree-cleanup-paths");
+    fs::create_dir_all(&temp_root).unwrap();
+    let service = FileSettingsService::new(temp_root.join("state"));
+
+    assert!(
+        service
+            .update(&json!({"worktree_cleanup_generated_paths": "build"}))
+            .is_err()
+    );
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn file_settings_service_can_hold_one_resolved_non_default_node_identity() {
+    let temp_root = unique_temp_dir("settings-fixed-node");
+    let refine_dir = temp_root.join(".refine");
+    fs::create_dir_all(&refine_dir).unwrap();
+    fs::write(
+        refine_dir.join("nodes.json"),
+        serde_json::to_vec_pretty(&json!({
+            "nodes": [
+                {
+                    "id": "default",
+                    "display_name": "Default",
+                    "created_at": "2026-07-22T00:00:00Z",
+                    "updated_at": "2026-07-22T00:00:00Z",
+                    "settings": {"agent_cli": "claude", "parallel_run_cap": "2"}
+                },
+                {
+                    "id": "node-b",
+                    "display_name": "Node B",
+                    "created_at": "2026-07-22T00:00:00Z",
+                    "updated_at": "2026-07-22T00:00:00Z",
+                    "settings": {
+                        "agent_cli": "smoke-ai",
+                        "parallel_run_cap": "1",
+                        "paused": "1",
+                        "supervisor_agent_stall_seconds": "900",
+                        "worktree_cleanup_generated_paths": "build"
+                    }
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let settings = FileSettingsService::for_node(&refine_dir, "node-b")
+        .load()
+        .unwrap();
+    assert_eq!(settings["agent_cli"], "smoke-ai");
+    assert_eq!(settings["parallel_run_cap"], "1");
+    assert!(settings.get("paused").is_none());
+    assert!(settings.get(RETIRED_SUPERVISOR_STALL_KEY).is_none());
+    assert!(settings.get(RETIRED_WORKTREE_GENERATED_PATHS_KEY).is_none());
+    let written = fs::read_to_string(refine_dir.join("nodes.json")).unwrap();
+    assert!(!written.contains("\"paused\""));
+    assert!(!written.contains(RETIRED_SUPERVISOR_STALL_KEY));
+    assert!(!written.contains(RETIRED_WORKTREE_GENERATED_PATHS_KEY));
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn file_settings_service_normalizes_node_stored_build_settings() {
+    let temp_root = unique_temp_dir("settings-build-migration");
+    let refine_dir = temp_root.join(".refine");
+    fs::create_dir_all(&refine_dir).unwrap();
+    fs::write(
+        refine_dir.join("nodes.json"),
+        serde_json::to_string_pretty(&json!({
+            "nodes": [{
+                "id": "default",
+                "display_name": "Default",
+                "created_at": "2026-06-16T00:00:00Z",
+                "updated_at": "2026-06-16T00:00:00Z",
+                "settings": {
+                    "target_app_rebuild_command": "npm run build",
+                    "target_app_rebuild_instructions": "Build and repair setup issues",
+                    "target_app_rebuild_timeout_seconds": "45",
+                    "target_app_auto_rebuild": "daily",
+                    "target_app_auto_rebuild_hour_utc": "4",
+                    "quality_timing": "post_rebuild"
+                }
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let service = FileSettingsService::new(&refine_dir);
+    let settings = service.load().unwrap();
+    assert_eq!(settings["target_app_build_command"], "npm run build");
+    assert_eq!(
+        settings["target_app_build_instructions"],
+        "Build and repair setup issues"
+    );
+    assert_eq!(settings["target_app_build_timeout_seconds"], "45");
+    assert!(!settings.contains_key("target_app_auto_build"));
+    assert!(!settings.contains_key("target_app_auto_build_hour_utc"));
+    assert!(!settings.contains_key("quality_timing"));
+    let written = fs::read_to_string(service.path()).unwrap();
+    assert!(written.contains("target_app_build_command"));
+    assert!(written.contains("target_app_build_instructions"));
+    assert!(!written.contains("target_app_rebuild_command"));
+    assert!(!written.contains("target_app_rebuild_instructions"));
+    assert!(!written.contains("target_app_auto_rebuild"));
+    assert!(!written.contains("target_app_auto_build"));
+    assert!(!written.contains("quality_timing"));
+    assert!(!refine_dir.join(SETTINGS_FILE).exists());
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn file_settings_service_syncs_target_app_test_command_list() {
+    let temp_root = unique_temp_dir("settings-test-commands");
+    let refine_dir = temp_root.join(".refine");
+    let service = FileSettingsService::new(&refine_dir);
+
+    let legacy = service
+        .update(&json!({
+            "target_app_test_command": "npm test"
+        }))
+        .unwrap();
+    assert_eq!(legacy["settings"]["target_app_test_command"], "npm test");
+    assert_eq!(
+        legacy["settings"]["target_app_test_commands"],
+        r#"[{"command":"npm test","enabled":true}]"#
+    );
+
+    let updated = service
+        .update(&json!({
+            "target_app_test_commands": [
+                {"command": "npm run lint", "enabled": false},
+                {"command": "npm test", "enabled": true},
+                {"command": "npm run e2e", "enabled": true}
+            ]
+        }))
+        .unwrap();
+    assert_eq!(updated["settings"]["target_app_test_command"], "npm test");
+    assert_eq!(
+        updated["settings"]["target_app_test_commands"],
+        r#"[{"command":"npm run lint","enabled":false},{"command":"npm test","enabled":true},{"command":"npm run e2e","enabled":true}]"#
+    );
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn file_project_config_services_persist_governance_guidance_and_reporters() {
+    let temp_root = unique_temp_dir("project-config");
+    let refine_dir = temp_root.join(".refine");
+
+    let governance = FileGovernanceService::new(&refine_dir);
+    assert_eq!(governance.load().unwrap()["max_automatic_round_retries"], 5);
+    let saved = governance
+        .save(&json!({
+            "product": "Refine",
+            "constitution": "Be useful",
+            "rules": [{"text": "No regressions"}],
+            "max_automatic_round_retries": 3
+        }))
+        .unwrap();
+    assert_eq!(saved["configured"], true);
+    assert_eq!(saved["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(saved["max_automatic_round_retries"], 3);
+    assert_eq!(
+        governance
+            .generate_rules(&json!({"product": "Refine", "constitution": "Be useful"}))
+            .unwrap()["ok"],
+        true
+    );
+
+    let guidance = FileGuidanceService::new(&refine_dir);
+    let guidance_payload = guidance
+        .update(&json!({"guidance": [{
+            "name": "Accessibility",
+            "rule": "When UI changes",
+            "instructions": "Check keyboard behavior",
+            "enabled": true
+        }]}))
+        .unwrap();
+    assert_eq!(guidance_payload["guidance"].as_array().unwrap().len(), 1);
+
+    let goal_dir = refine_dir.join("goals/GO/AL1");
+    let feature_dir = refine_dir.join("features/FE/A1");
+    fs::create_dir_all(&goal_dir).unwrap();
+    fs::create_dir_all(&feature_dir).unwrap();
+    fs::write(
+        goal_dir.join("goal.json"),
+        serde_json::to_string_pretty(&json!({
+            "id": "GOAL1",
+            "reporter": "Buddy",
+            "rounds": [
+                {"reporter": "Alex", "assignee": "Buddy", "prompt": "B"}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        feature_dir.join("feature.json"),
+        serde_json::to_string_pretty(&json!({
+            "id": "FEA1",
+            "reporter": "Buddy",
+            "assignee": "Buddy"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let reporters = FileReporterService::new(&refine_dir);
+    let buddy = reporters.create("Buddy").unwrap()["reporter"].clone();
+    let alex = reporters.create("Alex").unwrap()["reporter"].clone();
+    reporters
+        .rename(buddy["id"].as_u64().unwrap(), "Buddy Williams")
+        .unwrap();
+    let merged = reporters
+        .merge(buddy["id"].as_u64().unwrap(), alex["id"].as_u64().unwrap())
+        .unwrap();
+    assert_eq!(merged["ok"], true);
+    assert_eq!(
+        reporters.list().unwrap()["reporters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let goal: Value =
+        serde_json::from_str(&fs::read_to_string(goal_dir.join("goal.json")).unwrap()).unwrap();
+    assert_eq!(goal["reporter"], "Alex");
+    assert_eq!(goal["rounds"][0]["reporter"], "Alex");
+    assert_eq!(goal["rounds"][0]["assignee"], "Alex");
+    let feature: Value =
+        serde_json::from_str(&fs::read_to_string(feature_dir.join("feature.json")).unwrap())
+            .unwrap();
+    assert_eq!(feature["reporter"], "Alex");
+    assert_eq!(feature["assignee"], "Alex");
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn guidance_migrates_stable_ids_and_rejects_stale_item_mutations() {
+    let temp_root = unique_temp_dir("guidance-revisions");
+    let refine_dir = temp_root.join(".refine");
+    fs::create_dir_all(&refine_dir).unwrap();
+    fs::write(
+        refine_dir.join(GUIDANCE_FILE),
+        serde_json::to_vec_pretty(&json!([{
+            "name": "Existing",
+            "rule": "Always",
+            "instructions": "Keep this entry",
+            "enabled": true
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let service = FileGuidanceService::new(&refine_dir);
+
+    let migrated = service.list().unwrap();
+    assert_eq!(migrated["revision"], 0);
+    assert_eq!(migrated["guidance"][0]["id"], "guidance-1");
+    assert!(
+        serde_json::from_str::<Value>(&fs::read_to_string(refine_dir.join(GUIDANCE_FILE)).unwrap())
+            .unwrap()
+            .is_object()
+    );
+
+    let added = service
+        .add(&json!({
+            "revision": 0,
+            "name": "Second",
+            "rule": "When needed",
+            "instructions": "Preserve the first entry",
+            "enabled": false
+        }))
+        .unwrap();
+    assert_eq!(added["revision"], 1);
+    assert_eq!(added["guidance"].as_array().unwrap().len(), 2);
+    let second_id = added["guidance"][1]["id"].as_str().unwrap();
+    assert!(
+        service
+            .edit(second_id, &json!({"revision": 0, "enabled": true}))
+            .is_err()
+    );
+    let edited = service
+        .edit(second_id, &json!({"revision": 1, "enabled": true}))
+        .unwrap();
+    assert_eq!(edited["revision"], 2);
+    assert_eq!(edited["guidance"][0]["name"], "Existing");
+    assert_eq!(edited["guidance"][1]["enabled"], true);
+    assert!(matches!(
+        service.remove("missing", &json!({"revision": 2})),
+        Err(RefineError::NotFound(_))
+    ));
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn guidance_migrates_unaddressable_ids_and_rejects_invalid_revisions() {
+    let temp_root = unique_temp_dir("guidance-addressable-ids");
+    let refine_dir = temp_root.join(".refine");
+    fs::create_dir_all(&refine_dir).unwrap();
+    fs::write(
+        refine_dir.join(GUIDANCE_FILE),
+        serde_json::to_vec_pretty(&json!([{
+            "id": "not/addressable",
+            "name": "Existing",
+            "rule": "Always",
+            "instructions": "Keep this entry",
+            "enabled": true
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let service = FileGuidanceService::new(&refine_dir);
+
+    let migrated = service.list().unwrap();
+    assert_eq!(migrated["guidance"][0]["id"], "guidance-1");
+    assert!(matches!(
+        service.edit("guidance-1", &json!({"revision": "0", "enabled": false})),
+        Err(RefineError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        service.update(&json!({
+            "revision": 0,
+            "guidance": migrated["guidance"],
+            "unknown": true
+        })),
+        Err(RefineError::InvalidInput(_))
+    ));
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn governance_rule_revisions_preserve_unrelated_fields_and_fence_stale_writers() {
+    let temp_root = unique_temp_dir("governance-revisions");
+    let refine_dir = temp_root.join(".refine");
+    let service = FileGovernanceService::new(&refine_dir);
+    let saved = service
+        .save(&json!({
+            "product": "Refine",
+            "constitution": "Local first",
+            "rules": [{"text": "One"}],
+            "rules_revision": 0
+        }))
+        .unwrap();
+    assert_eq!(saved["rules_revision"], 1);
+
+    let scalar = service
+        .save(&json!({"max_automatic_round_retries": 2}))
+        .unwrap();
+    assert_eq!(scalar["rules_revision"], 1);
+    assert_eq!(scalar["rules"][0]["text"], "One");
+    assert_eq!(scalar["product"], "Refine");
+
+    assert!(matches!(
+        service.save(&json!({"rules": [{"text": "Stale"}], "rules_revision": 0})),
+        Err(RefineError::Conflict(_))
+    ));
+    let replaced = service
+        .save(&json!({"rules": [{"text": "Two"}], "rules_revision": 1}))
+        .unwrap();
+    assert_eq!(replaced["rules_revision"], 2);
+    assert_eq!(replaced["rules"][0]["text"], "Two");
+    assert_eq!(replaced["constitution"], "Local first");
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn governance_rejects_invalid_revision_shapes() {
+    let temp_root = unique_temp_dir("governance-invalid-revision");
+    fs::create_dir_all(&temp_root).unwrap();
+    let service = FileGovernanceService::new(temp_root.join(".refine"));
+
+    assert!(matches!(
+        service.save(&json!({"rules": [], "rules_revision": "0"})),
+        Err(RefineError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        service.save(&json!({"rules_revision": 0})),
+        Err(RefineError::InvalidInput(_))
+    ));
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("refine-{prefix}-{}-{nanos}", std::process::id()))
+}
+
+// Seeding a concurrency cap meant the scheduler never saw the key as unset, so
+// the host-capacity governor it falls back to could not be reached through any
+// supported configuration: a fixed 2 applied to a two-core node and a
+// thirty-two-core one alike.
+#[test]
+fn concurrency_caps_are_unset_until_an_operator_chooses_one() {
+    let temp_root = unique_temp_dir("settings-caps-unset");
+    let refine_dir = temp_root.join(".refine");
+    let service = FileSettingsService::new(&refine_dir);
+
+    let defaults = service.load().unwrap();
+    for key in [
+        "parallel_run_cap",
+        "parallel_per_node_cap",
+        "parallel_per_provider_cap",
+        "parallel_per_target_app_cap",
+    ] {
+        assert!(
+            defaults.get(key).is_none(),
+            "{key} must be absent so the host decides"
+        );
+    }
+
+    // An explicit choice is still stored and still wins.
+    let updated = service
+        .update(&serde_json::json!({"parallel_run_cap": 4}))
+        .unwrap();
+    assert_eq!(updated["settings"]["parallel_run_cap"], "4");
+    assert_eq!(service.load().unwrap()["parallel_run_cap"], "4");
+
+    // And clearing it hands the decision back, which previously required
+    // hand-editing the node registry because the range rejects every value the
+    // scheduler reads as unset.
+    let cleared = service
+        .update(&serde_json::json!({"parallel_run_cap": ""}))
+        .unwrap();
+    assert_eq!(cleared["settings"]["parallel_run_cap"], "");
+    assert!(
+        service.load().unwrap()["parallel_run_cap"]
+            .as_str()
+            .is_none_or(str::is_empty)
+    );
+
+    // Out-of-range values are still rejected rather than silently accepted.
+    assert!(
+        service
+            .update(&serde_json::json!({"parallel_run_cap": 0}))
+            .is_err()
+    );
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn legacy_missing_resource_budget_defaults_but_malformed_stored_values_fail() {
+    let temp_root = unique_temp_dir("settings-resource-budget-legacy");
+    let refine_dir = temp_root.join(".refine");
+    let service = FileSettingsService::new(&refine_dir);
+
+    assert_eq!(
+        service.load().unwrap()["automatic_agent_resource_budget_percent"],
+        AUTOMATIC_AGENT_RESOURCE_BUDGET_PERCENT_DEFAULT.to_string()
+    );
+    service
+        .update(&json!({"automatic_agent_resource_budget_percent": 65}))
+        .unwrap();
+    let mut registry = FileNodeRegistryService::new(&refine_dir)
+        .load_registry()
+        .unwrap();
+    registry.nodes[0].settings.insert(
+        "automatic_agent_resource_budget_percent".to_string(),
+        Value::String("invalid".to_string()),
+    );
+    FileNodeRegistryService::new(&refine_dir)
+        .save_registry(&registry)
+        .unwrap();
+    assert!(matches!(service.load(), Err(RefineError::InvalidInput(_))));
+
+    fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn runtime_settings_copy_is_real_validated_and_serialized_with_other_writers() {
+    use std::sync::{Arc, Barrier};
+
+    let temp_root = unique_temp_dir("settings-copy-runtime");
+    let refine_dir = temp_root.join(".refine");
+    let nodes = FileNodeRegistryService::new(&refine_dir);
+    nodes.create("node-b").unwrap();
+    FileSettingsService::for_node(&refine_dir, "node-b")
+        .update(&json!({
+            "automatic_agent_resource_budget_percent": 45,
+            "parallel_run_cap": 3,
+            "target_app_url": "https://source.invalid"
+        }))
+        .unwrap();
+    FileSettingsService::new(&refine_dir)
+        .update(&json!({"target_app_url": "https://destination.invalid"}))
+        .unwrap();
+
+    let start = Arc::new(Barrier::new(4));
+    let copy_root = refine_dir.clone();
+    let copy_start = Arc::clone(&start);
+    let copy = std::thread::spawn(move || {
+        copy_start.wait();
+        FileSettingsService::new(copy_root).copy_from_node("node-b", "runtime")
+    });
+    let update_root = refine_dir.clone();
+    let update_start = Arc::clone(&start);
+    let update = std::thread::spawn(move || {
+        update_start.wait();
+        FileSettingsService::new(update_root)
+            .update(&json!({"target_app_url": "https://concurrent.invalid"}))
+    });
+    let node_root = refine_dir.clone();
+    let node_start = Arc::clone(&start);
+    let node_update = std::thread::spawn(move || {
+        node_start.wait();
+        FileNodeRegistryService::new(node_root).update(
+            "default",
+            crate::application::fleet::nodes::NodeUpdate {
+                display_name: Some("Concurrent destination".to_string()),
+                archived: None,
+            },
+        )
+    });
+    start.wait();
+    let copied = copy.join().unwrap().unwrap();
+    update.join().unwrap().unwrap();
+    node_update.join().unwrap().unwrap();
+
+    assert!(copied["copied_count"].as_u64().unwrap() >= 2);
+    let destination = FileSettingsService::new(&refine_dir).load().unwrap();
+    assert_eq!(destination["automatic_agent_resource_budget_percent"], "45");
+    assert_eq!(destination["parallel_run_cap"], "3");
+    assert_eq!(destination["target_app_url"], "https://concurrent.invalid");
+    assert_eq!(
+        FileNodeRegistryService::new(&refine_dir)
+            .show("default")
+            .unwrap()["node"]["display_name"],
+        "Concurrent destination"
+    );
+    assert!(
+        FileSettingsService::new(&refine_dir)
+            .copy_from_node("node-b", "unknown")
+            .is_err()
+    );
+    assert!(
+        FileSettingsService::new(&refine_dir)
+            .copy_from_node("default", "runtime")
+            .is_err()
+    );
+
+    fs::remove_dir_all(temp_root).unwrap();
+}

@@ -14,7 +14,7 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
         }
         Commands::System {
             action:
-                SystemAction::Install {
+                SystemAction::ServiceInstall {
                     port,
                     target,
                     runtime_root,
@@ -62,36 +62,6 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
             let runtime_root = resolve_system_runtime_root(runtime_root)?;
             let status = FileInstallationService::for_port(runtime_root, version, port).repair()?;
             println!("{}", serde_json::to_string_pretty(&status).unwrap());
-            Ok(())
-        }
-        Commands::System {
-            action:
-                SystemAction::Update {
-                    yes,
-                    provider,
-                    port,
-                    runtime_root,
-                },
-        } => {
-            let paths = RefineCheckoutPaths::discover()?;
-            let runtime_root = resolve_system_runtime_root_for_paths(runtime_root, &paths)?;
-            let checkout_path = paths.checkout;
-            let provider = resolve_agent_provider(&runtime_root, provider)?;
-            let mut host =
-                FileDeployedUpdateHost::with_controlling_port(runtime_root.clone(), port);
-            let summary = run_deployed_update(
-                &mut host,
-                DeployedUpdateOptions::new(checkout_path, runtime_root)
-                    .with_assume_yes(yes)
-                    .with_provider(provider)
-                    .with_controlling_port(port),
-            );
-            print_json(&serde_json::to_value(&summary).unwrap());
-            if !summary.ok {
-                return Err(RefineError::Degraded(
-                    "system update failed; see JSON summary above".to_string(),
-                ));
-            }
             Ok(())
         }
         Commands::System {
@@ -254,7 +224,7 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
                 }
             };
             let runtime_root = resolve_system_runtime_root(runtime_root)?;
-            crate::tools::host::daemon_lifecycle::FileDaemonLifecycleOperationService::new(
+            crate::application::system::daemon_lifecycle::FileDaemonLifecycleOperationService::new(
                 RuntimeRoot { root: runtime_root },
                 env!("CARGO_PKG_VERSION"),
             )
@@ -333,7 +303,7 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
         }
         Commands::System {
             action:
-                SystemAction::Uninstall {
+                SystemAction::ServiceUninstall {
                     port,
                     runtime_root,
                     version,
@@ -619,8 +589,15 @@ fn print_performance_report(report: &Value) {
         .cloned()
         .unwrap_or_default();
     recent.sort_by(|a, b| {
-        let elapsed = |event: &Value| event.get("elapsed_ms").and_then(Value::as_f64).unwrap_or(0.0);
-        elapsed(b).partial_cmp(&elapsed(a)).unwrap_or(std::cmp::Ordering::Equal)
+        let elapsed = |event: &Value| {
+            event
+                .get("elapsed_ms")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+        };
+        elapsed(b)
+            .partial_cmp(&elapsed(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     if !recent.is_empty() {
         println!();
@@ -640,13 +617,23 @@ fn print_performance_report(report: &Value) {
                 });
             println!(
                 "{:>9.1}ms  {}  {}  {}",
-                event.get("elapsed_ms").and_then(Value::as_f64).unwrap_or(0.0),
-                if event.get("success").and_then(Value::as_bool).unwrap_or(true) {
+                event
+                    .get("elapsed_ms")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+                if event
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+                {
                     "ok "
                 } else {
                     "ERR"
                 },
-                event.get("occurred_at").and_then(Value::as_str).unwrap_or(""),
+                event
+                    .get("occurred_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
                 target,
             );
         }
