@@ -1946,6 +1946,13 @@ function ensureTerminalRenderer(output, tab = currentToolbarTab()) {
     lineHeight: TERMINAL_LINE_HEIGHT,
     scrollback: 2000,
     theme: terminalColorTheme(),
+    // Agent TUIs enable mouse tracking, which makes xterm hand mouse drags to
+    // the app and disable its own selection — breaking copy. These give users
+    // an escape hatch to still select text: Shift-drag (all platforms) already
+    // works; macOptionClickForcesSelection lets Mac users Option-drag, and
+    // rightClickSelectsWord adds right-click word select.
+    macOptionClickForcesSelection: true,
+    rightClickSelectsWord: true,
   });
   // The output host survives toolbar morphs, but each tab owns its own xterm.
   // Detach the inactive renderer before opening a new one so the preserved host
