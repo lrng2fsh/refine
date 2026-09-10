@@ -1565,15 +1565,43 @@ function handleTerminalKeydown(e, terminal = terminalStateFor()) {
 function handleTerminalClipboardKeydown(e, terminal = terminalStateFor()) {
   if (!terminal?.sessionId || terminal.exited || e.altKey) return false;
   if (e.type && e.type !== "keydown") return false;
-  if (!e.ctrlKey && !e.metaKey) return false;
+  if (!e.ctrlKey && !e.metaKey) {
+    // A plain typed character (not a modifier or mouse report) ends the copy
+    // intent, so the next Ctrl/Cmd+C interrupts the agent rather than re-copying
+    // stale highlighted text. Mouse-tracking reports never reach this handler.
+    if (typeof e.key === "string" && (e.key.length === 1 || e.key === "Enter")) {
+      terminal.lastSelection = "";
+    }
+    return false;
+  }
   const key = String(e.key || "").toLowerCase();
   if (key === "c") {
     const selection = terminalSelection(terminal);
     if (!selection) return false;
-    if (writeTerminalClipboard(selection, terminal)) e.preventDefault();
+    if (writeTerminalClipboard(selection, terminal)) {
+      // Drop the cached selection so a subsequent Ctrl/Cmd+C with nothing
+      // highlighted falls through to the PTY as SIGINT instead of re-copying.
+      terminal.lastSelection = "";
+      // Mouse-tracking agent TUIs clear the visible highlight on mouse-up, so
+      // confirm the copy explicitly — otherwise the user can't tell it worked.
+      if (typeof toast === "function") toast("Copied to clipboard", "info");
+      e.preventDefault();
+    }
     return true;
   }
   if (key !== "v") return false;
+  const readText = typeof navigator !== "undefined"
+    ? navigator.clipboard?.readText
+    : null;
+  if (typeof readText !== "function") {
+    // Non-secure contexts (plain http over a hostname/IP) don't expose the
+    // async Clipboard API. Consume the key so xterm sends nothing to the PTY,
+    // but don't preventDefault or surface an error: that lets the browser
+    // deliver its native paste event to xterm's textarea, where
+    // handleTerminalPaste reads clipboardData — which is allowed over http on a
+    // real paste gesture.
+    return true;
+  }
   if (readTerminalClipboard(terminal)) e.preventDefault();
   return true;
 }
@@ -1616,8 +1644,12 @@ function handleAgentTerminalSuspendKeydown(
 }
 
 function terminalSelection(terminal) {
-  if (!terminal?.term?.hasSelection?.()) return "";
-  return terminal.term.getSelection?.() || "";
+  const live = terminal?.term?.hasSelection?.()
+    ? (terminal.term.getSelection?.() || "")
+    : "";
+  // Fall back to the last highlighted text captured by onSelectionChange, since
+  // mouse-tracking agent TUIs drop the live selection before Ctrl/Cmd+C fires.
+  return live || terminal?.lastSelection || "";
 }
 
 function handleTerminalCopy(e, terminal = terminalStateFor()) {
@@ -1695,22 +1727,56 @@ function writeTerminalClipboard(text, terminal) {
   const writeText = typeof navigator !== "undefined"
     ? navigator.clipboard?.writeText
     : null;
-  if (typeof writeText !== "function") {
-    showTerminalClipboardError(
-      "copy",
-      new Error("Browser clipboard write access is unavailable."),
-      terminal,
-    );
-    return false;
+  if (typeof writeText === "function") {
+    try {
+      Promise.resolve(writeText.call(navigator.clipboard, text))
+        .catch((error) => showTerminalClipboardError("copy", error, terminal));
+      return true;
+    } catch (_error) {
+      // Fall through to the synchronous execCommand path below.
+    }
   }
+  // Non-secure contexts (plain http over a hostname/IP) don't expose the async
+  // Clipboard API. Fall back to a synchronous execCommand copy, which still
+  // works because this runs inside the Ctrl/Cmd+C keydown user gesture.
+  if (copyTextWithExecCommand(text)) return true;
+  showTerminalClipboardError(
+    "copy",
+    new Error(
+      "Browser clipboard write access is unavailable (open Refine over https or http://localhost to enable copy/paste).",
+    ),
+    terminal,
+  );
+  return false;
+}
+
+function copyTextWithExecCommand(text) {
+  if (
+    typeof document === "undefined"
+    || typeof document.execCommand !== "function"
+    || typeof text !== "string"
+    || !text
+  ) return false;
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "-1000px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  const active = document.activeElement;
+  let copied = false;
   try {
-    Promise.resolve(writeText.call(navigator.clipboard, text))
-      .catch((error) => showTerminalClipboardError("copy", error, terminal));
-  } catch (error) {
-    showTerminalClipboardError("copy", error, terminal);
-    return false;
+    textarea.focus();
+    textarea.select();
+    copied = document.execCommand("copy");
+  } catch (_error) {
+    copied = false;
   }
-  return true;
+  textarea.remove();
+  // Restore focus to the terminal so keystrokes keep flowing to the PTY.
+  if (active && typeof active.focus === "function") active.focus();
+  return copied;
 }
 
 function readTerminalClipboard(terminal) {
@@ -1961,6 +2027,14 @@ function ensureTerminalRenderer(output, tab = currentToolbarTab()) {
   term.open(output);
   if (terminal.display) term.write(terminal.display);
   term.onData((data) => queueTerminalInput(data, terminal));
+  // Agent TUIs run xterm in mouse-tracking mode, which disables the live
+  // selection and clears it on mouse-up — so term.getSelection() is empty by the
+  // time Ctrl/Cmd+C fires. Capture each non-empty selection as it is made so the
+  // copy path can still read the last text the user highlighted.
+  term.onSelectionChange?.(() => {
+    const selected = term.getSelection?.() || "";
+    if (selected) terminal.lastSelection = selected;
+  });
   term.attachCustomKeyEventHandler?.(
     (event) => !handleTerminalClipboardKeydown(event, terminal)
       && !handleTerminalNewlineKeydown(event, terminal)
