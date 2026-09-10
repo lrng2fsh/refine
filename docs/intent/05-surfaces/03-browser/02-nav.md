@@ -25,7 +25,9 @@ Reporter selection remains local to the browser and can always be changed or cre
 
 The current browser shell uses Dashboard, Features, Goals, Changes, and Logs as the main nav items. Management actions live in context menus so the main nav stays focused on work. The bright primary create action is `+ New Goal`, with related creation flows available nearby.
 
-The `Controls > Node` management entry uses Processes (`/#/node/processes`) as its stable destination so local runtime work is immediately visible. This entry does not change the adjacent active Node selector or its context-switching behavior.
+The `Controls > Settings` management entry consolidates Node and Governance configuration and uses Processes (`/#/settings/processes`) as its stable destination so local runtime work is immediately visible. This entry does not change the adjacent active Node selector or its context-switching behavior.
+
+A separate Controls Skills section and command palette group list enabled Custom Skills applicable to the active project and node. Launch forms use the shared parameter preflight and open only when inputs are needed. Definition changes and node switches refresh this list.
 
 Dashboard and Goals navigation carries their shared current/all Node scope in the URL. The URL remains the filter source of truth so reload, sharing, and browser history preserve that scope; a specific named-Node Goals filter is not projected onto Dashboard.
 
@@ -37,6 +39,8 @@ attached target app. It reads authoritative cached state and moves through
 current, stale, checking, available, Agent progress, reconnecting, success,
 failure, and retry states. Update is one-click authorization with no second
 confirmation; concurrent clients converge on the same operation and attempt.
+
+The Controls Skills section uses the same section labels and menu rows as the rest of Controls. Enabled Custom Skills are followed by **Add skill...**, which opens the New Skill modal without leaving the current screen. Running a Skill opens an agent tab after any required inputs are collected.
 
 ## Future Direction
 

@@ -18,6 +18,7 @@ pub(super) fn default_settings() -> JsonObject {
         ("agent_idle_timeout_seconds", "900"),
         ("agent_hard_cap_seconds", "7200"),
         ("agent_limit_pause_seconds", "60"),
+        ("max_automatic_round_retries", "5"),
         ("worker_memory_limit_mb", ""),
         ("ui_memory_limit_mb", ""),
         ("worker_cpu_priority", "normal"),
@@ -78,6 +79,7 @@ pub(super) fn allowed_settings() -> BTreeSet<&'static str> {
         "agent_idle_timeout_seconds",
         "agent_hard_cap_seconds",
         "agent_limit_pause_seconds",
+        "max_automatic_round_retries",
         "worker_memory_limit_mb",
         "ui_memory_limit_mb",
         "worker_cpu_priority",
@@ -159,7 +161,8 @@ pub(super) fn legacy_setting_key(key: &str) -> Option<&'static str> {
 pub(super) fn is_retired_development_request_setting(key: &str) -> bool {
     matches!(
         key,
-        "development_request_email_enabled"
+        "auto_approve"
+            | "development_request_email_enabled"
             | "development_request_address"
             | "development_request_mailbox"
             | "development_request_allowed_senders"
@@ -238,6 +241,7 @@ pub(super) fn normalize_setting(key: &str, value: &Value) -> RefineResult<String
                 normalize_range(key, value, 1, 100)
             }
         }
+        "max_automatic_round_retries" => normalize_range(key, value, 0, 100),
         "automatic_agent_resource_budget_percent" => normalize_range(key, value, 1, 100),
         "target_app_tcp_check_port" => {
             let text = as_string(value);
@@ -447,3 +451,6 @@ pub(super) fn value_is_truthy(value: &Value) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests;

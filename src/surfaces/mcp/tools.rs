@@ -34,6 +34,7 @@ enum ToolBinding {
     /// Escape hatch: method, path, and body are taken from the arguments so an
     /// agent can reach any daemon route, including writes.
     Passthrough,
+    SkillTrigger,
 }
 
 /// A capability the MCP surface exposes to clients.
@@ -117,6 +118,23 @@ impl McpTool {
                     body: Some(Value::Object(body)),
                 })
             }
+            ToolBinding::SkillTrigger => {
+                let id = arguments
+                    .get("skill_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| crate::model::automation::valid_id(id))
+                    .ok_or_else(|| "a valid skill_id is required".to_string())?;
+                let mut body = arguments
+                    .as_object()
+                    .cloned()
+                    .ok_or_else(|| "arguments must be an object".to_string())?;
+                body.remove("skill_id");
+                Ok(RequestParts {
+                    method: "POST".into(),
+                    path: format!("/skills/{id}/trigger"),
+                    body: Some(Value::Object(body)),
+                })
+            }
             ToolBinding::Passthrough => {
                 let path = arguments
                     .get("path")
@@ -148,6 +166,32 @@ impl McpTool {
 /// `refine_request` escape hatch covers everything else, including writes.
 pub fn tool_catalog() -> Vec<McpTool> {
     vec![
+        McpTool {
+            name: "refine_list_skills",
+            description: "Read reusable Skill instructions, parameters and configuration revisions.",
+            input_schema: empty_schema,
+            binding: ToolBinding::Api {
+                method: "GET",
+                path: "/skills",
+                path_params: &[],
+            },
+        },
+        McpTool {
+            name: "refine_skill_triggers",
+            description: "List the automatic and Custom trigger types available to Skills.",
+            input_schema: empty_schema,
+            binding: ToolBinding::Api {
+                method: "GET",
+                path: "/skills/catalog",
+                path_params: &[],
+            },
+        },
+        McpTool {
+            name: "refine_trigger_skill",
+            description: "Run one Skill with a Custom trigger on the active node, independently of Goals. Discover required inputs at /skills/{skill_id}/inputs. Reuse request_id to retry transport without duplicating work.",
+            input_schema: || json!({"type":"object","properties":{"skill_id":{"type":"string"},"node_id":{"type":"string"},"request_id":{"type":"string"},"parameters":{"type":"object"}},"required":["skill_id"],"additionalProperties":false}),
+            binding: ToolBinding::SkillTrigger,
+        },
         McpTool {
             name: "refine_system_status",
             description: "Read the local Refine daemon status: health, worker state, active operations, and target app state.",
@@ -246,7 +290,7 @@ pub fn tool_catalog() -> Vec<McpTool> {
             input_schema: empty_schema,
             binding: ToolBinding::Api {
                 method: "GET",
-                path: "/guidance/next",
+                path: "/next",
                 path_params: &[],
             },
         },

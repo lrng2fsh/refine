@@ -26,6 +26,8 @@ When a Goal is in review:
 - Ordered Feature work may be allowed to proceed once review represents enough completion for the next Goal to start.
 - Review decisions should be preserved as evidence, not treated as transient UI state.
 
+Email intake creates ordinary backlog Goals. Fetching does not approve Review, add follow-up Rounds, or send resolution replies. Normal manual acceptance and recovery remain available.
+
 ## Future Direction
 
 Future review should support agent reviewers, structured review evidence, risk summaries, dependency impact, approval policies, and generated follow-up Goals. It should remain the state where judgment is explicit.

@@ -1,9 +1,8 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(test)]
@@ -13,10 +12,8 @@ use sha2::{Digest, Sha256};
 use crate::application::work_items::{
     FeatureGoalPlacement, FileWorkItemService, GoalAuthoringRequest,
 };
-use crate::application::workflow::governance::integration::FileGovernanceIntegrationService;
 use crate::error::{RefineError, RefineResult};
 use crate::infrastructure::process::supervisor::security::{NativeSecretStore, SecretStore};
-use crate::model::workflow::GoalStatus;
 
 const JMAP_SESSION_URL: &str = "https://api.fastmail.com/jmap/session";
 const TOKEN_SCOPE: &str = "email";
@@ -34,13 +31,8 @@ use records::{read_record, write_record};
 
 const REQUEST_SCHEMA_VERSION: u64 = 2;
 const CONFIG_SCHEMA_VERSION: u64 = 1;
-const DEFAULT_POLL_SECONDS: u64 = 60;
 const DEVELOPMENT_REQUEST_GOAL_PRIORITY: &str = "low";
 pub const SELF_DEVELOPMENT_EMAIL_CONFIG_FILE: &str = "self-development-email.json";
-
-fn default_poll_seconds() -> u64 {
-    DEFAULT_POLL_SECONDS
-}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SelfDevelopmentEmailConfig {
@@ -48,10 +40,6 @@ pub struct SelfDevelopmentEmailConfig {
     pub target_root: PathBuf,
     pub address: String,
     pub allowed_senders: BTreeSet<String>,
-    #[serde(default = "default_poll_seconds")]
-    pub poll_seconds: u64,
-    #[serde(default)]
-    pub auto_approve_after_seconds: u64,
 }
 
 pub fn self_development_email_config_path(runtime_root: &Path) -> PathBuf {
@@ -109,7 +97,6 @@ pub fn load_self_development_email_config(
             path.display()
         )));
     }
-    config.poll_seconds = config.poll_seconds.max(1);
     Ok(Some(config))
 }
 
@@ -126,11 +113,26 @@ pub fn self_development_email_target_is_active(
     Ok(active_target_root == config.target_root)
 }
 
+/// Supported one-shot capability for a Skill. The local connection contract
+/// still pins its mailbox to a target before secrets or historical records are read.
+pub fn fetch_email_goals(runtime_root: &Path, target_root: &Path) -> RefineResult<Value> {
+    let config = load_self_development_email_config(runtime_root)?
+        .ok_or_else(|| RefineError::NotFound("No local email connection is configured".into()))?;
+    if !self_development_email_target_is_active(&config, target_root)? {
+        return Err(RefineError::Conflict(
+            "Email connection belongs to a different target app".into(),
+        ));
+    }
+    let refine_dir =
+        crate::infrastructure::storage::project_layout::refine_dir_for_target_root(target_root)?;
+    FileDevelopmentRequestService::new(runtime_root, refine_dir, target_root)
+        .process_once(&DevelopmentRequestSettings::from_local_config(&config))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DevelopmentRequestSettings {
     pub address: String,
     pub allowed_senders: BTreeSet<String>,
-    pub auto_approve_after: Duration,
 }
 
 impl DevelopmentRequestSettings {
@@ -138,7 +140,6 @@ impl DevelopmentRequestSettings {
         Self {
             address: config.address.clone(),
             allowed_senders: config.allowed_senders.clone(),
-            auto_approve_after: Duration::from_secs(config.auto_approve_after_seconds),
         }
     }
 }
@@ -178,18 +179,12 @@ trait MailSource {
     fn pending_email_ids(&self, address: &str) -> RefineResult<Vec<String>>;
     fn raw_email(&self, email_id: &str) -> RefineResult<Vec<u8>>;
     fn mark_processed(&self, email_id: &str) -> RefineResult<()>;
-    fn send_resolution(
-        &self,
-        settings: &DevelopmentRequestSettings,
-        record: &DevelopmentRequestRecord,
-    ) -> RefineResult<()>;
 }
 
 #[derive(Clone, Debug)]
 pub struct FileDevelopmentRequestService {
     runtime_root: PathBuf,
     refine_dir: PathBuf,
-    target_root: PathBuf,
     #[cfg(test)]
     fail_next_record_write: std::cell::Cell<bool>,
 }
@@ -198,38 +193,45 @@ impl FileDevelopmentRequestService {
     pub fn new(
         runtime_root: impl Into<PathBuf>,
         refine_dir: impl Into<PathBuf>,
-        target_root: impl Into<PathBuf>,
+        _target_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
             runtime_root: runtime_root.into(),
             refine_dir: refine_dir.into(),
-            target_root: target_root.into(),
             #[cfg(test)]
             fail_next_record_write: std::cell::Cell::new(false),
         }
     }
 
-    pub fn process_once(&self, settings: &DevelopmentRequestSettings) -> RefineResult<()> {
+    /// One bounded mailbox batch. Skills own invocation and scheduling.
+    pub fn process_once(&self, settings: &DevelopmentRequestSettings) -> RefineResult<Value> {
+        use crate::infrastructure::process::supervisor::coordination::with_record_lock;
         if settings.allowed_senders.is_empty() {
             return Err(RefineError::InvalidInput(
-                "self-development email allowed_senders must contain at least one address"
-                    .to_string(),
+                "email allowed_senders must contain at least one address".into(),
             ));
         }
-        let token = NativeSecretStore::new(&self.runtime_root)
-            .get_secret(TOKEN_SCOPE, TOKEN_NAME)?
-            .value;
-        let fastmail = FastmailClient::connect(token)?;
-        self.ingest(&fastmail, settings)?;
-        self.process_local_records(&fastmail, settings)
+        // Serialize manual and startup runs before remote acknowledgement or Goal authoring.
+        with_record_lock(&self.runtime_root, "email-goal-fetch", || {
+            let token = NativeSecretStore::new(&self.runtime_root)
+                .get_secret(TOKEN_SCOPE, TOKEN_NAME)?
+                .value;
+            let fastmail = FastmailClient::connect(token)?;
+            let fetched_count = self.ingest(&fastmail, settings)?;
+            let mut result = self.process_local_records(&fastmail, settings)?;
+            result["fetched_count"] = serde_json::json!(fetched_count);
+            Ok(result)
+        })
     }
 
     fn ingest(
         &self,
         fastmail: &dyn MailSource,
         settings: &DevelopmentRequestSettings,
-    ) -> RefineResult<()> {
-        for email_id in fastmail.pending_email_ids(&settings.address)? {
+    ) -> RefineResult<usize> {
+        let email_ids = fastmail.pending_email_ids(&settings.address)?;
+        let count = email_ids.len();
+        for email_id in email_ids {
             let raw = fastmail.raw_email(&email_id)?;
             let parsed = parse_email(&raw)?;
             if !settings.allowed_senders.contains(&parsed.sender) {
@@ -244,7 +246,7 @@ impl FileDevelopmentRequestService {
             // A remote message is acknowledged only after its local retry record is durable.
             fastmail.mark_processed(&email_id)?;
         }
-        Ok(())
+        Ok(count)
     }
 
     fn record_from_email(
@@ -283,15 +285,14 @@ impl FileDevelopmentRequestService {
         &self,
         fastmail: &dyn MailSource,
         settings: &DevelopmentRequestSettings,
-    ) -> RefineResult<()> {
+    ) -> RefineResult<Value> {
+        let mut goals = Vec::new();
+        let mut errors = Vec::new();
         for path in self.record_paths()? {
             let mut record = match self.read_record(&path) {
                 Ok(record) => record,
                 Err(error) => {
-                    eprintln!(
-                        "refine development request record {} was isolated: {error}",
-                        path.display()
-                    );
+                    errors.push(format!("{}: {error}", path.display()));
                     continue;
                 }
             };
@@ -299,20 +300,21 @@ impl FileDevelopmentRequestService {
                 DevelopmentRequestStatus::Received => {
                     self.recover_or_create_goal(&mut record, fastmail, settings)
                 }
-                DevelopmentRequestStatus::GoalCreated | DevelopmentRequestStatus::Resolved => {
-                    self.advance_goal_and_notify(&mut record, fastmail, settings)
-                }
-                DevelopmentRequestStatus::Ignored | DevelopmentRequestStatus::Notified => Ok(()),
+                // Linked and terminal records are historical evidence. Fetching never
+                // accepts Goals or sends mail on their behalf.
+                _ => continue,
             };
             if let Err(error) = result {
                 record.attempts = record.attempts.saturating_add(1);
                 record.last_error = Some(error.to_string());
                 record.updated_at = Utc::now().to_rfc3339();
                 self.write_record(&record)?;
-                eprintln!("refine development request {}: {error}", record.id);
+                errors.push(format!("{}: {error}", record.id));
+            } else if let Some(id) = record.goal_id {
+                goals.push(id);
             }
         }
-        Ok(())
+        Ok(serde_json::json!({"goal_ids": goals, "errors": errors, "batch_limit": 25}))
     }
 
     fn recover_or_create_goal(
@@ -406,59 +408,6 @@ impl FileDevelopmentRequestService {
             )));
         }
         Ok(())
-    }
-
-    fn advance_goal_and_notify(
-        &self,
-        record: &mut DevelopmentRequestRecord,
-        fastmail: &dyn MailSource,
-        settings: &DevelopmentRequestSettings,
-    ) -> RefineResult<()> {
-        let goal_id = record.goal_id.as_deref().ok_or_else(|| {
-            RefineError::Serialization(format!("request {} has no linked Goal", record.id))
-        })?;
-        let work_items = FileWorkItemService::with_projection_cache(
-            &self.refine_dir,
-            &self.runtime_root,
-            self.runtime_root.join("cache"),
-        );
-        let mut goal = work_items.show_goal_summary(goal_id)?;
-        if goal.goal.status == GoalStatus::Review {
-            let now = Utc::now();
-            let first_seen = match &record.review_seen_at {
-                Some(value) => DateTime::parse_from_rfc3339(value)
-                    .map(|value| value.with_timezone(&Utc))
-                    .unwrap_or(now),
-                None => {
-                    record.review_seen_at = Some(now.to_rfc3339());
-                    self.write_record(record)?;
-                    now
-                }
-            };
-            if now.signed_duration_since(first_seen).num_seconds()
-                >= settings.auto_approve_after.as_secs() as i64
-            {
-                FileGovernanceIntegrationService::with_target_root(
-                    &self.runtime_root,
-                    &self.refine_dir,
-                    &self.target_root,
-                )
-                .approve_reviewed_goal(goal_id)?;
-                goal = work_items.show_goal_summary(goal_id)?;
-            }
-        }
-        if goal.goal.status != GoalStatus::Done {
-            return Ok(());
-        }
-        record.status = DevelopmentRequestStatus::Resolved;
-        record.last_error = None;
-        record.updated_at = Utc::now().to_rfc3339();
-        self.write_record(record)?;
-        fastmail.send_resolution(settings, record)?;
-        record.status = DevelopmentRequestStatus::Notified;
-        record.notified_at = Some(Utc::now().to_rfc3339());
-        record.updated_at = record.notified_at.clone().unwrap_or_default();
-        self.write_record(record)
     }
 
     fn records_dir(&self) -> PathBuf {

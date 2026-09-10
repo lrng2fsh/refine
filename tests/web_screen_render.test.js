@@ -1,234 +1,6 @@
-// Render-time smoke coverage for the screens the vm-based suites cannot reach.
-//
-// Those suites load one file into a `vm` with hand-written stubs, which is fine
-// for logic but has no DOM: `document.querySelector` is never really called, so an
-// invalid selector never throws and a screen can be completely broken while every
-// test passes. That is exactly how a corrupted selector in goal detail shipped.
-//
-// This boots the real `index.html` in a browser against the real static tree, with
-// the daemon API intercepted, and asserts each screen actually paints. It runs the
-// genuine bootstrap path — init, routing, render, bind — rather than a stand-in.
-//
-// Served over http rather than `setContent`, because `common.js` reads
-// `localStorage` at load and an opaque-origin document denies access, so the app
-// would fail before defining any state.
-//
-// Skipped when no browser is available, so a machine without one still runs the
-// rest of the suite.
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const http = require("node:http");
-const path = require("node:path");
 const test = require("node:test");
-
-const STATIC = path.join(__dirname, "../src/surfaces/web/static");
-
-const CONTENT_TYPES = {
-  ".html": "text/html",
-  ".js": "text/javascript",
-  ".css": "text/css",
-  ".svg": "image/svg+xml",
-  ".png": "image/png",
-  ".json": "application/json",
-};
-
-function loadChromium() {
-  let chromium;
-  try {
-    ({ chromium } = require("playwright"));
-  } catch {
-    return null;
-  }
-  const candidates = [];
-  try {
-    candidates.push(chromium.executablePath());
-  } catch {}
-  // Playwright pins one browser build; a cache holding a different one is still
-  // perfectly good for rendering a page, so fall back to whatever is installed.
-  const cache = path.join(
-    process.env.HOME || "",
-    process.platform === "darwin" ? "Library/Caches/ms-playwright" : ".cache/ms-playwright",
-  );
-  if (fs.existsSync(cache)) {
-    for (const entry of fs.readdirSync(cache)) {
-      if (!entry.startsWith("chromium-")) continue;
-      for (const rel of [
-        "chrome-linux64/chrome",
-        "chrome-linux/chrome",
-        "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
-        "chrome-win/chrome.exe",
-      ]) {
-        candidates.push(path.join(cache, entry, rel));
-      }
-    }
-  }
-  const executablePath = candidates.find((candidate) => candidate && fs.existsSync(candidate));
-  return executablePath ? { chromium, executablePath } : null;
-}
-
-const BROWSER = loadChromium();
-const SKIP = BROWSER ? false : "no Playwright chromium build is available";
-
-const GOAL = {
-  id: "GOAL1",
-  name: "Smoke goal",
-  status: "review",
-  priority: "high",
-  reporter: "Reporter",
-  assignee: "Reporter",
-  node_id: "node-a",
-  node_display_name: "A very long remote node name that must stay inside its column",
-  created: "2026-07-01T00:00:00Z",
-  updated: "2026-07-02T00:00:00Z",
-  notes: [{ id: "NOTE1", author: "Reviewer", body: "A note." }],
-  rounds: [
-    {
-      prompt: "Do the thing",
-      reporter: "Reporter",
-      assignee: "Reporter",
-      created: "2026-07-01T00:00:00Z",
-      logs: [{ message: "started" }],
-    },
-  ],
-};
-
-const FEATURE = {
-  id: "FEAT1",
-  name: "Smoke feature",
-  status: "todo",
-  priority: "medium",
-  reporter: "Reporter",
-  assignee: "Reporter",
-  node_id: "node-a",
-  created: "2026-07-01T00:00:00Z",
-  updated: "2026-07-02T00:00:00Z",
-  goals: [GOAL],
-};
-
-// Enough shape for each screen to render. A screen that needs a field this omits
-// should fail loudly here rather than only in a browser.
-function apiFixture(pathname) {
-  if (pathname.startsWith("/api/goals/")) return { goal: GOAL };
-  if (pathname.startsWith("/api/goals")) {
-    return { goals: [GOAL], facets: { status_counts: {} }, page: { page: 1, total: 1 } };
-  }
-  if (pathname.startsWith("/api/features/")) return { feature: FEATURE };
-  if (pathname.startsWith("/api/features")) {
-    return { features: [FEATURE], page: { page: 1, total: 1 } };
-  }
-  if (pathname.startsWith("/api/project/status")) {
-    return {
-      attached: true,
-      target_root: "/tmp/app",
-      registry_enabled: true,
-      apps: [],
-      nodes: [{ id: "node-a", display_name: "Node A" }],
-      active_node_id: "node-a",
-    };
-  }
-  if (pathname.startsWith("/api/reporters")) return { reporters: [{ name: "Reporter" }] };
-  if (pathname.startsWith("/api/dashboard")) return { counts: {}, needs_attention: [] };
-  if (pathname.startsWith("/api/nodes")) {
-    return { nodes: [{ id: "node-a", display_name: "Node A" }], active_node_id: "node-a" };
-  }
-  if (pathname.startsWith("/api/settings")) return { settings: {} };
-  if (pathname.startsWith("/api/activity")) {
-    return { entries: [], facets: { categories: [], actors: [] }, page: { page: 1, total: 0 } };
-  }
-  if (pathname.startsWith("/api/changes")) {
-    return { branch: "main", changes: [], page: { page: 1, total: 0 } };
-  }
-  if (pathname.startsWith("/api/diagnostics")) return {};
-  if (pathname.startsWith("/api/quality")) return {};
-  if (pathname.startsWith("/api/governance")) return {};
-  if (pathname.startsWith("/api/guidance")) return { guidance: [] };
-  if (pathname.startsWith("/api/processes")) return {};
-  if (pathname.startsWith("/api/performance")) {
-    return { events: [], summary: {}, backend: { store: "jsonl" } };
-  }
-  if (pathname.startsWith("/api/system/releases")) {
-    return { releases: { operations: [] } };
-  }
-  if (pathname.startsWith("/api/system/source")) {
-    return {
-      source: {
-        clean: true,
-        fast_forward: true,
-        update_available: false,
-        active_work: [],
-        checkout_path: "/tmp/refine",
-        current_commit: "1111111111111111111111111111111111111111",
-        available_commit: "1111111111111111111111111111111111111111",
-        remote: "origin",
-        branch: "main",
-      },
-      source_update: { visible: true, enabled: false, state: "current" },
-    };
-  }
-  if (pathname.startsWith("/api/target-app/status")) return { state: "stopped" };
-  if (pathname.startsWith("/api/upgrade")) return { upgrade: {} };
-  return {};
-}
-
-function serveStaticTree() {
-  const server = http.createServer((request, response) => {
-    const requested = request.url.split("?")[0];
-    const relative =
-      requested === "/" ? "index.html" : requested.replace(/^\/static\//, "").replace(/^\//, "");
-    const file = path.join(STATIC, relative);
-    if (!file.startsWith(STATIC) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
-      response.writeHead(404).end("not found");
-      return;
-    }
-    response.writeHead(200, {
-      "content-type": CONTENT_TYPES[path.extname(file)] || "application/octet-stream",
-    });
-    response.end(fs.readFileSync(file));
-  });
-  return new Promise((resolve) => {
-    server.listen(0, "127.0.0.1", () => resolve(server));
-  });
-}
-
-async function openApp({
-  fixture = apiFixture,
-  onRequest = null,
-  selectedReporter = "Reporter",
-} = {}) {
-  const server = await serveStaticTree();
-  const browser = await BROWSER.chromium.launch({ executablePath: BROWSER.executablePath });
-  const page = await browser.newPage();
-  if (selectedReporter !== null) {
-    await page.addInitScript((reporter) => {
-      localStorage.setItem("refine_last_reporter", reporter);
-    }, selectedReporter);
-  }
-  const pageErrors = [];
-  page.on("pageerror", (error) => pageErrors.push(String(error.message).split("\n")[0]));
-  await page.route("**/api/**", async (route) => {
-    const { pathname } = new URL(route.request().url());
-    if (pathname === "/api/sse") {
-      route.fulfill({ status: 200, contentType: "text/event-stream", body: "" });
-      return;
-    }
-    if (onRequest) await onRequest(pathname, route.request());
-    const body = await fixture(pathname, route.request());
-    route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(body),
-    });
-  });
-  return {
-    page,
-    pageErrors,
-    origin: `http://127.0.0.1:${server.address().port}`,
-    async close() {
-      await browser.close();
-      server.close();
-    },
-  };
-}
+const { openApp, apiFixture, GOAL, FEATURE, SKIP } = require("./support/web_app");
 
 test("Reporter onboarding selects an existing Reporter before routed modal navigation", { skip: SKIP }, async () => {
   const app = await openApp({ selectedReporter: null });
@@ -535,6 +307,7 @@ test("Controls Node selector switches by ID and refreshes the visible Node conte
   const app = await openApp({ fixture });
   try {
     await assertScreenRenders(app, { route: "#/", marker: "#dash" });
+    await app.page.locator('[data-testid="context-menu-toggle"]').click();
     const selector = app.page.locator('[data-testid="global-node"]');
     assert.deepEqual(await selector.locator("option").allTextContents(), ["Alpha", "Beta"]);
     assert.equal(await selector.inputValue(), "node-a");
@@ -796,7 +569,7 @@ test("Agent terminal renders transported ANSI control sequences through xterm", 
   const app = await openApp();
   try {
     await assertScreenRenders(app, { route: "#/", marker: "#dash" });
-    const rendered = await app.page.evaluate(async () => {
+    await app.page.evaluate(async () => {
       chatState.tabs = {
         agent: normalizeInteractiveTerminalTab({
           goalId: null,
@@ -812,16 +585,23 @@ test("Agent terminal renders transported ANSI control sequences through xterm", 
       const terminal = terminalStateFor("agent");
       terminalReceiveOutput("\\u001b[31mANSI-RED\\u001b[0m plain", terminal);
       await new Promise((resolve) => terminal.term.write("", resolve));
-      const rows = document.querySelector(".terminal-output .xterm-rows");
-      return {
-        text: rows?.textContent || "",
-        html: rows?.innerHTML || "",
-      };
     });
+    // The write callback confirms parsing; xterm paints the DOM on a later frame.
+    await app.page.waitForFunction(() =>
+      document.querySelector(".terminal-output .xterm-rows")?.textContent.includes("ANSI-RED plain"),
+    );
+    const rendered = await app.page.locator(".terminal-output .xterm-rows").evaluate((rows) => ({
+      text: rows.textContent,
+      colors: [...rows.querySelectorAll("span")].map((span) => ({
+        text: span.textContent,
+        color: getComputedStyle(span).color,
+      })),
+    }));
 
     assert.match(rendered.text, /ANSI-RED plain/);
     assert.doesNotMatch(rendered.text, /(?:\\u001b|\[31m|\[0m)/);
-    assert.match(rendered.html, /color:\s*#b91c1c|color:\s*rgb\(185,\s*28,\s*28\)/i);
+    assert.equal(rendered.colors.find((span) => span.text === "ANSI-RED")?.color, "rgb(185, 28, 28)");
+    assert.equal(rendered.colors.find((span) => span.text === " plain")?.color, "rgb(17, 24, 39)");
     assert.deepEqual(app.pageErrors, []);
   } finally {
     await app.close();
@@ -1400,13 +1180,12 @@ test("every Node, Project, and legacy Settings tab renders and refreshes", { ski
       ["#/node/application", '[data-testid="project-app-select"]'],
       ["#/node/reporters", '[data-testid="reporters-table"]'],
       ["#/node/processes", '[data-testid="settings-pane-processes"].active'],
-      ["#/node/performance", '[data-testid="performance-refresh"]'],
       ["#/node/target-app", '[data-testid="target-app-copy-node"]'],
       ["#/node/runtime", '[data-testid="runtime-recheck-auth"]'],
-      ["#/node/releases", '[data-testid="source-promotion-section"]'],
-      ["#/project/governance", '[data-testid="governance-explanation"]'],
-      ["#/project/quality", '[data-testid="quality-explanation"]'],
-      ["#/project/guidance", '[data-testid="guidance-list"]'],
+      ["#/node/releases", '[data-testid="settings-skills"]'],
+      ["#/project/governance", '[data-testid="settings-skills"]'],
+      ["#/settings/events", '[data-testid="settings-skills"]'],
+      ["#/settings/skills", '[data-testid="settings-skills"]'],
       ["#/settings", '[data-testid="settings-pane-processes"].active'],
     ]) {
       await assertScreenRenders(app, { route, marker });
@@ -1423,84 +1202,6 @@ test("every Node, Project, and legacy Settings tab renders and refreshes", { ski
   }
 });
 
-test("Refine dev source refreshes morph identical and changed status without replacement", { skip: SKIP }, async () => {
-  const app = await openApp();
-  try {
-    await assertScreenRenders(app, {
-      route: "#/node/releases",
-      marker: '[data-testid="source-promotion-readiness"]',
-    });
-    const result = await app.page.evaluate(async () => {
-      const source = {
-        clean: true,
-        fast_forward: true,
-        update_available: false,
-        active_work: [],
-        checkout_path: "/tmp/refine",
-        current_commit: "1111111111111111111111111111111111111111",
-        available_commit: "1111111111111111111111111111111111111111",
-        remote: "origin",
-        branch: "main",
-      };
-      applySourcePromotionStatus(source);
-      const root = document.getElementById("source-promotion-status");
-      const facts = root.querySelector(".source-promotion-facts");
-      const readiness = root.querySelector('[data-testid="source-promotion-readiness"]');
-      let identicalMutations = 0;
-      const observer = new MutationObserver((records) => {
-        identicalMutations += records.length;
-      });
-      observer.observe(root, {
-        childList: true,
-        characterData: true,
-        subtree: true,
-      });
-      applySourcePromotionStatus(source);
-      await Promise.resolve();
-      observer.disconnect();
-      const identicalFacts = facts === root.querySelector(".source-promotion-facts");
-      const identicalReadiness =
-        readiness === root.querySelector('[data-testid="source-promotion-readiness"]');
-
-      applySourcePromotionStatus({
-        ...source,
-        update_available: true,
-        available_commit: "2222222222222222222222222222222222222222",
-      });
-      return {
-        identicalFacts,
-        identicalReadiness,
-        identicalMutations,
-        changedFacts: facts === root.querySelector(".source-promotion-facts"),
-        changedReadiness:
-          readiness === root.querySelector('[data-testid="source-promotion-readiness"]'),
-        changedText: root.textContent,
-      };
-    });
-
-    assert.deepEqual(
-      {
-        identicalFacts: result.identicalFacts,
-        identicalReadiness: result.identicalReadiness,
-        identicalMutations: result.identicalMutations,
-        changedFacts: result.changedFacts,
-        changedReadiness: result.changedReadiness,
-      },
-      {
-        identicalFacts: true,
-        identicalReadiness: true,
-        identicalMutations: 0,
-        changedFacts: true,
-        changedReadiness: true,
-      },
-    );
-    assert.match(result.changedText, /222222222222/);
-    assert.match(result.changedText, /Ready to build, promote, and restart/);
-    assert.deepEqual(app.pageErrors, []);
-  } finally {
-    await app.close();
-  }
-});
 
 test("settings refresh never clears the Upgrade banner while its read is pending", { skip: SKIP }, async () => {
   const fixture = (pathname, request) => {
@@ -1589,6 +1290,10 @@ test("settings refresh never clears the Upgrade banner while its read is pending
 test("runtime banner distinguishes trusted source relationships from unknown evidence", { skip: SKIP }, async () => {
   const app = await openApp();
   try {
+    await assertScreenRenders(app, {
+      route: "#/settings/runtime",
+      marker: '[data-testid="runtime-recheck-auth"]',
+    });
     const messages = await app.page.evaluate(() => {
       const text = (upgrade) => {
         const root = document.createElement("div");
@@ -1733,4 +1438,248 @@ test("changed settings refresh preserves focus, dirty controls, scroll, and one 
   } finally {
     await app.close();
   }
+});
+
+test("Goal Skill runs open scoped invocation evidence during workflow execution", {skip: SKIP}, async () => {
+  const goal = {...GOAL,status:"implement",rounds:[{...GOAL.rounds[0],event_configuration:{revision:1}}]};
+  let historyGoal = null;
+  const app = await openApp({fixture: (pathname, request) => {
+    if (pathname === "/api/goals/GOAL1") return {goal};
+    if (pathname === "/api/event-invocations") { historyGoal = new URL(request.url()).searchParams.get("goal_id"); return {items:[],offset:0,total:0}; }
+    return apiFixture(pathname);
+  }});
+  try {
+    await app.page.goto(`${app.origin}/#/goals/GOAL1`);
+    await app.page.locator('[data-testid="goal-open-agent"]').click();
+    await app.page.locator('[data-testid="automation-modal"]').waitFor();
+    assert.equal(historyGoal,"GOAL1");
+    assert.match(await app.page.locator('[data-testid="automation-modal"]').textContent(),/Skill runs · GOAL1/);
+    assert.deepEqual(app.pageErrors,[]);
+  } finally { await app.close(); }
+});
+
+function skillFixture() {
+  let revision = 7;
+  const records = [{item:{id:"inspect",name:"Inspect release",prompt:"Inspect the release.",enabled:true,scope:{node_id:null},parameters:[{name:"count",kind:"number",required:true,default:3}]},trigger:{id:"inspect-trigger",source:"custom",enabled:true,mode:"blocking",order:0,scope:{node_id:null},inputs:{}}}];
+  const writes = [], launches = [];
+  const fixture = (pathname, request) => {
+    if (pathname === "/api/skills") return {revision, items:records.map(r => ({...r.item,trigger_source:r.trigger.source})), manual_skill_ids:records.filter(r => r.item.enabled && r.trigger.source === "custom").map(r => r.item.id)};
+    if (pathname.startsWith("/api/skills/") && pathname !== "/api/skills/catalog") {
+      const id = pathname.split("/")[3]; const record = records.find(r => r.item.id === id);
+      if (pathname.endsWith("/inputs")) { assert.equal(new URL(request.url()).searchParams.has("goal_id"),false); return {revision,parameters:record.item.parameters}; }
+      if (request.method() === "PUT") {
+        const body = request.postDataJSON(); assert.equal(body.revision,revision); writes.push(body);
+        const saved = record || {}; saved.item = body.item;
+        if (body.trigger) saved.trigger = {...body.trigger,id:body.trigger.id || "new-trigger"};
+        if (!record) records.push(saved);
+        return {revision:++revision,item:saved.item};
+      }
+      return {revision,...record};
+    }
+    if (pathname === "/api/terminal/session") {
+      launches.push(request.postDataJSON());
+      return {id:"skill-session",process_id:"skill-process",profile:"skill",provider:"codex",cwd:"/tmp/app"};
+    }
+    if (pathname === "/api/terminal/skill-session") return {id:"skill-session",process_id:"skill-process",state:"running",profile:"skill",provider:"codex",cwd:"/tmp/app"};
+    return apiFixture(pathname);
+  };
+  return {fixture,records,writes,launches};
+}
+
+test("Custom Skills open a selected agent tab with typed inputs and no Goal context", {skip:SKIP}, async () => {
+  const data = skillFixture();
+  data.records.push({item:{...data.records[0].item,id:"automatic",name:"Quality check"},trigger:{...data.records[0].trigger,source:"workflow.quality.enter"}});
+  const app = await openApp({fixture:data.fixture});
+  try {
+    const page = app.page;
+    await page.goto(`${app.origin}/#/settings/skills`);
+    await page.evaluate(() => { state.currentGoal = "GOAL1"; });
+    await page.locator('#nav-context-menu > summary').click();
+    const nav = page.locator('#nav-manual-skills');
+    await nav.locator('[data-manual-skill="inspect"]').waitFor();
+    assert.equal(await nav.locator('.nav-menu-label.nav-context-section-label').textContent(),"Skills");
+    assert.equal(await nav.locator('[data-manual-skill]').count(),1);
+    assert.equal(await nav.locator('button').last().textContent(),"Add skill...");
+    await nav.locator('[data-manual-skill="inspect"]').click();
+    const modal = page.locator('[data-testid="automation-modal"]');
+    assert.equal(await modal.locator('[data-parameter-index="0"]').inputValue(),"3");
+    await modal.locator('[data-parameter-index="0"]').fill("5");
+    await modal.locator('[data-save]').click();
+    await modal.waitFor({state:"detached"});
+    await page.locator('[data-testid="terminal-profile"]').filter({hasText:"Inspect release"}).waitFor();
+    assert.equal(data.launches.length,1);
+    assert.equal(data.launches[0].profile,"skill");
+    assert.equal(data.launches[0].surface,"toolbar");
+    assert.equal(data.launches[0].skill_id,"inspect");
+    assert.deepEqual(data.launches[0].parameters,{count:5});
+    assert.equal(data.launches[0].goal_id,undefined);
+    assert.equal(data.launches[0].feature_id,undefined);
+    assert.equal(await page.evaluate(() => commandRegistry.has('skill.manual.inspect')),true);
+    const saved = await page.evaluate(() => JSON.parse(sessionStorage.getItem('refine_chat_tabs')));
+    assert.equal(Object.values(saved.tabs).find(tab => tab.mode === 'skill').sessionId,"skill-session");
+    assert.deepEqual(app.pageErrors,[]);
+  } finally { await app.close(); }
+});
+
+test("Skills use one trigger, shared modal controls and clickable rows with cloning", {skip:SKIP}, async () => {
+  const data = skillFixture();
+  const app = await openApp({fixture:data.fixture});
+  try {
+    const page = app.page;
+    await page.goto(`${app.origin}/#/settings/events`);
+    await page.locator('[data-testid="settings-skills"]').waitFor();
+    assert.equal(new URL(page.url()).hash,"#/settings/skills");
+    assert.deepEqual(await page.locator('.settings-tab').allTextContents().then(labels=>labels.map(s=>s.trim())),["Processes","Application","Reporters","Skills","Target App","Runtime"]);
+    assert.equal(await page.locator('[data-testid="automation-table"] td:first-child button').count(),0);
+    await page.locator('[data-automation-row]').focus(); await page.keyboard.press('Enter');
+    const modal = page.locator('[data-testid="automation-modal"]');
+    await modal.waitFor();
+    assert.equal(await modal.locator('.modal-title').textContent(), 'Inspect release — Edit Skill');
+    assert.equal(await modal.locator('#automation-name').isVisible(), false);
+    assert.equal(await modal.locator('[data-prompt]').isVisible(), false);
+    assert.equal(await modal.locator('[data-settings-markdown-preview]').textContent().then(s => s.trim()), 'Inspect the release.');
+    await modal.locator('[data-settings-markdown-edit]').click();
+    await modal.locator('[data-prompt]').fill('## Release instructions\n\nVerify **all changes**.');
+    await modal.locator('[data-settings-markdown-edit]').click();
+    assert.equal(await modal.locator('[data-settings-markdown-preview] h2').textContent(), 'Release instructions');
+    assert.equal(await modal.locator('[data-settings-markdown-preview] strong').textContent(), 'all changes');
+    await modal.locator('[data-skill-settings] > summary').click();
+    await modal.locator('#automation-name').waitFor();
+    assert.equal(await modal.locator('[data-trigger-source]').count(),1);
+    assert.equal(await modal.locator('[data-role], [data-add-binding], [data-overrides]').count(),0);
+    assert.doesNotMatch(await modal.textContent(),/Result role|Override project assignment/);
+    assert.equal(await modal.locator('[data-automatic-options]').isVisible(),false);
+    await modal.locator('[data-trigger-source]').selectOption('workflow.quality.enter');
+    assert.equal(await modal.locator('[data-automatic-options]').isVisible(),true);
+    await modal.locator('[data-mode] [data-choice="background"]').click();
+    await modal.locator('[data-order]').fill('3');
+    await modal.locator('[data-scope] [data-choice="node"]').click();
+    assert.equal(await modal.locator('[data-scope-node]').inputValue(),'node-a');
+    const parameter = modal.locator('[data-parameter]');
+    await parameter.locator('[data-name]').fill('channel'); await parameter.locator('[data-name]').press('Tab');
+    await parameter.locator('[data-kind]').selectOption('choice');
+    await parameter.locator('[data-choices]').fill('stable, beta'); await parameter.locator('[data-choices]').press('Tab');
+    await parameter.locator('[data-default]').selectOption('beta');
+    await modal.locator('[data-input-name="channel"]').fill('system.node_id');
+    await modal.locator('#automation-name').focus();
+    const style = await modal.locator('#automation-name').evaluate(input => {const s=getComputedStyle(input); return {height:s.height,weight:s.fontWeight,border:s.borderColor,outline:s.outlineColor};});
+    assert.deepEqual(style,{height:'34px',weight:'400',border:style.border,outline:style.border});
+    await modal.locator('[data-save]').click(); await modal.waitFor({state:'detached'});
+    assert.match(data.writes[0].item.prompt, /## Release instructions/);
+    assert.equal(data.writes[0].trigger.source,'workflow.quality.enter');
+    assert.equal(data.writes[0].trigger.mode,'background');
+    assert.equal(data.writes[0].trigger.order,3);
+    assert.equal(data.writes[0].item.scope.node_id,'node-a');
+    assert.equal(data.writes[0].item.role,undefined);
+    assert.equal(data.records[0].item.parameters[0].default,'beta');
+    await page.locator('[data-automation-row]').click();
+    await modal.locator('[data-clone-skill]').click();
+    await modal.locator('[data-skill-settings] > summary').click();
+    await modal.locator('#automation-name').waitFor();
+    assert.equal(await modal.locator('#automation-name').inputValue(),'Inspect release copy');
+    assert.equal(await modal.locator('[data-delete]').isVisible(),false);
+    assert.equal(await modal.locator('[data-kind]').inputValue(),'choice');
+    await modal.locator('[data-trigger-source]').selectOption('custom');
+    await modal.locator('[data-save]').click(); await modal.waitFor({state:'detached'});
+    assert.equal(data.records.length,2);
+    assert.notEqual(data.records[0].item.id,data.records[1].item.id);
+    assert.equal(data.records[1].trigger.source,'custom');
+    assert.equal(data.records[0].trigger.source,'workflow.quality.enter');
+    assert.deepEqual(app.pageErrors,[]);
+  } finally { await app.close(); }
+});
+
+test("Skill status toggles preserve the trigger, fence duplicate saves and refresh conflicts", {skip:SKIP}, async () => {
+  const data = skillFixture(); let releaseWrite;
+  const pending = new Promise(resolve=>{releaseWrite=resolve;});
+  let held = false;
+  const app = await openApp({fixture:async (pathname,request)=>{
+    if (request.method()==='PUT' && !held) {held=true;await pending;}
+    return data.fixture(pathname,request);
+  }});
+  try {
+    const page = app.page; await page.goto(`${app.origin}/#/settings/skills`);
+    const status = page.locator('[data-automation-status="inspect"]');
+    await status.locator('[data-choice="false"]').click();
+    assert.equal(await status.locator('[data-choice="true"]').isDisabled(),true);
+    await status.locator('[data-choice="false"]').evaluate(button=>button.click());
+    releaseWrite();
+    await status.locator('[data-choice="false"][aria-pressed="true"]').waitFor();
+    assert.equal(data.writes.length,1); assert.equal(data.writes[0].trigger,undefined);
+    assert.equal(data.records[0].trigger.source,'custom');
+    await page.waitForFunction(()=>!commandRegistry.has('skill.manual.inspect'));
+    assert.equal(await page.locator('[data-testid="automation-modal"]').count(),0);
+    await page.reload(); await status.locator('[data-choice="false"][aria-pressed="true"]').waitFor();
+    await status.locator('[data-choice="true"]').focus(); await page.keyboard.press('Enter');
+    await page.waitForFunction(()=>commandRegistry.has('skill.manual.inspect'));
+    await page.route('**/api/skills/inspect',route=>{
+      if(route.request().method()!=='PUT') return route.fallback();
+      data.records[0].item.name='Renamed concurrently';
+      return route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:{code:'conflict',message:'Configuration changed. Refresh before saving.'}})});
+    });
+    await status.locator('[data-choice="false"]').click();
+    await page.locator('[data-automation-row]').filter({hasText:'Renamed concurrently'}).waitFor();
+    assert.equal(await status.locator('[data-choice="true"]').getAttribute('aria-pressed'),'true');
+    assert.equal(data.writes.length,2);
+    assert.deepEqual(app.pageErrors,[]);
+  } finally {releaseWrite();await app.close();}
+});
+
+
+test("New Skill starts with instructions and reveals required settings before saving", {skip:SKIP}, async () => {
+  const data = skillFixture();
+  const app = await openApp({fixture:data.fixture});
+  try {
+    await app.page.goto(`${app.origin}/#/settings/skills`);
+    await app.page.locator('[data-automation-new]').click();
+    const modal = app.page.locator('[data-testid="automation-modal"]');
+    await modal.locator('[data-prompt]').waitFor();
+    assert.equal(await modal.locator('[data-prompt]').isVisible(), true);
+    assert.equal(await modal.locator('#automation-name').isVisible(), false);
+    await modal.locator('[data-prompt]').fill('## Check the release\n\nSummarize changes.');
+    await modal.locator('[data-save]').click();
+    assert.equal(data.writes.length, 0);
+    assert.equal(await modal.locator('#automation-name').isVisible(), true);
+    await modal.locator('#automation-name').fill('New release check');
+    await modal.locator('[data-save]').click();
+    await modal.waitFor({state:'detached'});
+    assert.equal(data.writes[0].item.name, 'New release check');
+    assert.match(data.writes[0].item.prompt, /## Check the release/);
+    assert.deepEqual(app.pageErrors, []);
+  } finally { await app.close(); }
+});
+
+
+test("Skill History opens once after refreshes and repeated clicks with spaced pagination", {skip:SKIP}, async () => {
+  const data = skillFixture(); let historyReads = 0;
+  const app = await openApp({fixture:async (pathname,request) => {
+    if (pathname === '/api/event-invocations') {
+      historyReads++;
+      await new Promise(resolve=>setTimeout(resolve,100));
+      return {items:[],offset:0,total:0};
+    }
+    return data.fixture(pathname,request);
+  }});
+  try {
+    const page = app.page;
+    await page.goto(`${app.origin}/#/settings/skills`);
+    await page.locator('[data-event-history]').waitFor();
+    assert.deepEqual(await page.locator('[data-testid="settings-skills"] > .actions > button').allTextContents(), ['History','New Skill']);
+    await page.evaluate(async () => {
+      await refreshSettings({force:true}); await refreshSettings({force:true});
+      const button=document.querySelector('[data-event-history]'); button.click(); button.click(); button.click();
+    });
+    const modal=page.locator('[data-testid="automation-modal"]');
+    await modal.waitFor();
+    assert.equal(historyReads,1); assert.equal(await modal.count(),1);
+    const bounds=await modal.evaluate(el=>({table:el.querySelector('table').getBoundingClientRect().bottom,previous:el.querySelector('[data-previous]').getBoundingClientRect().toJSON(),next:el.querySelector('[data-next]').getBoundingClientRect().toJSON()}));
+    assert.ok(bounds.previous.top-bounds.table>=12);
+    assert.ok(bounds.next.left-bounds.previous.right>=8);
+    await modal.locator('[data-save]').click();
+    await page.waitForFunction(()=>document.querySelectorAll('[data-testid="automation-modal"]').length===1);
+    assert.equal(historyReads,2);
+    await modal.locator('[data-close]').click();
+    assert.equal(await modal.count(),0);
+    assert.deepEqual(app.pageErrors,[]);
+  } finally { await app.close(); }
 });

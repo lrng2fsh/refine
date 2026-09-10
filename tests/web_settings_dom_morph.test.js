@@ -38,9 +38,8 @@ const DOCUMENTED_LOCAL_INNER_HTML = new Set([
   "settings.js:updateSettingsEditablePreview",
   "settings.js:setSettingsMarkdownButtonState",
   "settings.js:commitSettingsMarkdownField",
-  "settings_governance.js:bindGovernanceRuleButtons",
-  "settings_governance.js:addGovernanceRuleRow",
-  "settings_guidance.js:openGuidanceModal",
+  "settings_skills.js:automationModal",
+  "settings_skills.js:openSkillEditor",
   "settings_nodes.js:openNodeConnectionModal",
   "settings_target_app_tests.js:bindTargetAppTestCommandList",
 ]);
@@ -67,13 +66,10 @@ test("every recurring settings redraw names the shared morph contract", () => {
     ["settings.js", "drawSettingsSurface"],
     ["settings.js", "drawRuntimeRecovery"],
     ["settings.js", "drawSqliteCacheProgress"],
-    ["settings_releases.js", "applySourcePromotionStatus"],
-    ["settings_releases.js", "refreshSourcePromotionStatus"],
-    ["settings_releases.js", "previewRelease"],
     ["settings_runtime.js", "refreshRuntimeUpgradeBanner"],
     ["settings_processes.js", "refreshTargetAppStatus"],
     ["settings_processes.js", "drawTargetAppStatusBlock"],
-    ["settings_governance.js", "bindSettingsGovernanceTab"],
+    ["settings_skills.js", "refreshManualSkills"],
   ];
 
   for (const [file, functionName] of expected) {

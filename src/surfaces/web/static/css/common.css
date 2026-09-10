@@ -133,26 +133,6 @@
 .status-pill.quality { background: var(--color-success-soft); color: #0f766e; }
 .status-pill.governance { background: #ede9fe; color: #6d28d9; }
 
-.source-promotion-facts {
-  display: grid;
-  gap: 6px;
-  margin: 12px 0;
-}
-.source-promotion-facts > div {
-  display: grid;
-  grid-template-columns: minmax(110px, 0.35fr) minmax(0, 1fr);
-  gap: 10px;
-}
-.source-promotion-facts dt {
-  color: var(--color-text-muted);
-  font-size: 12px;
-}
-.source-promotion-facts dd {
-  margin: 0;
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
 /* System screen tab strip. Mirrors the Toolbar dock tabs so Settings
    sections read as tabs instead of plain text links. */
 .settings-tabs-row {
@@ -1118,6 +1098,7 @@ select {
   border-bottom: 1px solid var(--color-border-subtle);
   background: linear-gradient(to bottom, #ffffff, #fbfcfe);
 }
+:where(.segmented-control),
 .changes-period-control,
 .logs-period-control {
   display: inline-flex;
@@ -1128,6 +1109,7 @@ select {
   border-radius: var(--radius-md);
   background: var(--color-surface-muted);
 }
+:where(.segmented-control) button,
 .changes-period-control button,
 .logs-period-control button {
   height: 28px;
@@ -1140,6 +1122,7 @@ select {
   font-size: 12px;
   font-weight: 650;
 }
+:where(.segmented-control) button[aria-pressed="true"],
 .changes-period-control button.active,
 .changes-period-control button[aria-pressed="true"],
 .logs-period-control button.active,
@@ -1148,6 +1131,7 @@ select {
   color: var(--color-text);
   box-shadow: var(--shadow-sm);
 }
+:where(.segmented-control) button:hover:not(:disabled),
 .changes-period-control button:hover:not(:disabled),
 .logs-period-control button:hover:not(:disabled) {
   background: var(--color-surface);

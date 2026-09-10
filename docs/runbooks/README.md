@@ -18,11 +18,15 @@ source code:
 
 Runbooks:
 
+- [Configure Skills](configure-skills.md) — bind reusable
+  agent instructions to workflow activity and custom actions, with scoped settings,
+  parameters, migration, and execution evidence.
+
 - [Install Refine](install.md) — install or update Refine, configure an agent
   provider, start the daemon, and verify the result.
 - [Operate development-request email intake](development-request-email.md) —
   connect the Fastmail `goal@getrefine.dev` mailbox to the active project,
-  verify queued intake, automatic approval, and threaded resolution replies.
+  fetch requests through a Custom Skill, optionally launched by a startup Skill.
 - [Update Refine from source](update-refine-source.md) — safely build,
   fast-forward, and restart a running Refine source checkout from the UI or CLI.
 - [Prepare and publish a release](semantic-release.md) — preview a semantic

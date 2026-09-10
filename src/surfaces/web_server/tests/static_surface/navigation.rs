@@ -18,8 +18,9 @@ fn web_server_route_groups_cover_static_web_surface() {
         "/diagnostics",
         "/events",
         "/files",
-        "/governance",
-        "/guidance",
+        "/event-definitions",
+        "/event-invocations",
+        "/skills",
         "/import",
         "/operations",
         "/nodes",
@@ -69,7 +70,7 @@ fn web_server_route_groups_cover_static_web_surface() {
         .into_iter()
         .filter(|hash| {
             hash.starts_with("#/system")
-                || hash.starts_with("#/settings")
+                || hash.starts_with("#/node/")
                 || hash.starts_with("#/project/application")
                 || hash.starts_with("#/node/nodes")
                 || hash.contains("application-config")
@@ -90,8 +91,7 @@ fn static_main_nav_consolidates_context_and_controls() {
     let theme_css = fs::read_to_string(static_root.join("css/theme.css")).unwrap();
     let target_app = fs::read_to_string(static_root.join("js/target-app.js")).unwrap();
     let node_context = fs::read_to_string(static_root.join("js/node-context.js")).unwrap();
-    let releases =
-        fs::read_to_string(static_root.join("js/features/settings_releases.js")).unwrap();
+    let releases = fs::read_to_string(static_root.join("js/features/source_update.js")).unwrap();
 
     let menu_start = index
         .find(r#"<details class="nav-menu nav-context-menu" id="nav-context-menu">"#)
@@ -157,7 +157,7 @@ fn static_main_nav_consolidates_context_and_controls() {
     assert!(menu.contains("<span>Report a bug to Refine Devs</span>"));
     assert!(!menu.contains("<span>Report a bug</span>"));
     assert!(menu.contains(
-        r##"<a class="nav-menu-item nav-management-item" href="#/node/processes" data-route="node">"##
+        r##"<a class="nav-menu-item nav-management-item" href="#/settings/processes" data-route="settings">"##
     ));
     assert!(menu.contains(r#"aria-pressed="false""#));
     assert!(theme.contains(r#"const STORAGE_KEY = "refine_color_theme""#));

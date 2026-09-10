@@ -14,22 +14,21 @@ mod goals;
 mod logs;
 mod nodes;
 mod projects;
+mod skills;
 mod sync;
 mod system;
 mod todos;
 mod workflow;
 
 pub use agents::{AgentAction, CliAgentProfile};
-pub use config::{
-    ConfigAction, ConfigDomain, ConfigGovernanceAction, ConfigGuidanceAction, ConfigPayload,
-    ConfigQualityAction, ConfigSettingsAction,
-};
+pub use config::{ConfigAction, ConfigDomain, ConfigPayload, ConfigSettingsAction};
 pub use features::FeatureAction;
 pub use fleet::FleetAction;
 pub use goals::GoalAction;
 pub use logs::LogAction;
 pub use nodes::NodeAction;
 pub use projects::ProjectAction;
+pub use skills::SkillAction;
 pub use sync::CliSyncAuthority;
 pub use system::{CliInstallTarget, SystemAction};
 pub use todos::TodoAction;
@@ -46,7 +45,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Inspect and configure Settings, Quality, Governance, and Guidance for the active app.
+    /// Configure reusable Skills and their triggers, or run a Skill manually.
+    Skills {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
+    /// Inspect Settings and Skills for the active app.
     /// Project selection, workflow control, nodes, fleet, Reporters, Todos, and agent authentication remain in their named command groups.
     Config {
         #[command(subcommand)]

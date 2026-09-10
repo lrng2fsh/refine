@@ -8,6 +8,7 @@ fn file_settings_service_lists_defaults_and_persists_updates() {
     let service = FileSettingsService::new(&refine_dir);
 
     assert_eq!(service.load().unwrap()["agent_cli"], "claude");
+    assert!(!service.load().unwrap().contains_key("auto_approve"));
     assert_eq!(
         service.load().unwrap()["automatic_agent_resource_budget_percent"],
         "70"
