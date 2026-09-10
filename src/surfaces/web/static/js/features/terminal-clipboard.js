@@ -1,8 +1,14 @@
 // Clipboard interactions belong to the originating renderer, including retained
 // output. Only paste depends on a live managed session.
 function terminalSelection(terminal) {
-  if (!terminal?.term?.hasSelection?.()) return "";
-  return terminal.term.getSelection?.() || "";
+  const live = terminal?.term?.hasSelection?.()
+    ? (terminal.term.getSelection?.() || "")
+    : "";
+  // Mouse-tracking agent TUIs disable xterm's selection service and clear the
+  // selection on mouse-up, so the live selection is usually gone by the time the
+  // user copies. Fall back to the last non-empty text captured by
+  // onSelectionChange (see bindTerminalClipboardEvents) so copy still has text.
+  return live || terminal?.lastSelection || "";
 }
 
 function terminalPreservesCopy(terminal) {
@@ -29,7 +35,17 @@ function handleTerminalClipboardKeydown(e, terminal = terminalStateFor()) {
     || (e.ctrlKey && !e.shiftKey && key === "insert");
   const paste = ((e.ctrlKey || e.metaKey) && key === "v")
     || (e.shiftKey && !e.ctrlKey && key === "insert");
-  if ((!copy && !paste) || (copy && !terminalSelection(terminal))) return false;
+  if (!copy && !paste) {
+    // A plain typed character ends the copy intent, so the next Ctrl/Cmd+C
+    // reaches the PTY as SIGINT instead of re-copying stale cached text.
+    // Mouse-tracking reports arrive as PTY data, never as keydowns, so they
+    // never land here and cannot wipe a fresh selection.
+    if (typeof e.key === "string" && (e.key.length === 1 || e.key === "Enter")) {
+      terminal.lastSelection = "";
+    }
+    return false;
+  }
+  if (copy && !terminalSelection(terminal)) return false;
   if (paste && (!terminal.sessionId || terminal.exited)) {
     // Retained output remains copyable, but xterm must not interpret a paste
     // shortcut as control input after its managed session has ended.
@@ -64,7 +80,12 @@ function bindTerminalClipboardEvents(terminal) {
     if (terminal.term === term) handleTerminalPaste(e, terminal);
   }, true);
   term.onSelectionChange?.(() => {
-    if (terminal.term === term) updateTerminalClipboardControls(terminal);
+    if (terminal.term !== term) return;
+    // Capture each non-empty selection as it is made, before mouse-tracking mode
+    // clears it on mouse-up, so terminalSelection() can still return it later.
+    const selected = term.getSelection?.() || "";
+    if (selected) terminal.lastSelection = selected;
+    updateTerminalClipboardControls(terminal);
   });
 }
 
@@ -181,6 +202,9 @@ function finishTerminalCopy(terminal, copy) {
   copy.message = "Selection copied.";
   copy.recovery = false;
   copy.pending = false;
+  // The copy consumed the cached selection; drop it so a subsequent bare
+  // Ctrl/Cmd+C with nothing highlighted falls through to the PTY as SIGINT.
+  terminal.lastSelection = "";
   updateTerminalClipboardControls(terminal);
 }
 
