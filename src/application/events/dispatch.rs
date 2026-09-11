@@ -1,3 +1,5 @@
+mod actions;
+mod context;
 use super::{EventInvocation, FileEventService, InvocationContext, InvocationState};
 use crate::application::fleet::nodes::FileNodeRegistryService;
 use crate::application::work_items::FileWorkItemService;
@@ -14,28 +16,13 @@ use crate::model::workflow::GoalStatus;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+static SCAN_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Clone)]
-pub(crate) struct EventReservation {
-    pub runtime: std::path::PathBuf,
-    pub invocation_id: String,
-    pub node: String,
-    pub provider: String,
-    pub target: String,
-}
-static ACTIVE: OnceLock<Mutex<BTreeMap<String, EventReservation>>> = OnceLock::new();
+use super::waiting::WaitReason;
+use crate::application::workflow::engine::admission::{ExecutionReservation, reserve};
 static DISPATCH: Mutex<()> = Mutex::new(());
-pub(crate) fn reservations(runtime: &Path) -> Vec<EventReservation> {
-    ACTIVE
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .values()
-        .filter(|v| v.runtime == runtime)
-        .cloned()
-        .collect()
-}
 
 impl FileEventService {
     pub(crate) fn manual_skill_event(
@@ -254,132 +241,24 @@ impl FileEventService {
         self.prepare(event_id, context, inputs, &format!("manual:{request_id}"))
     }
 
-    pub fn manual_context(
-        &self,
-        target_root: &Path,
-        body: &Value,
-    ) -> RefineResult<InvocationContext> {
-        let runtime = self.runtime()?;
-        let node = FileNodeRegistryService::with_active_root(&self.refine_dir, runtime)
-            .active_node_id()?;
-        if body
-            .get("node_id")
-            .and_then(Value::as_str)
-            .is_some_and(|n| !n.eq_ignore_ascii_case(&node))
-        {
-            return Err(RefineError::Conflict(
-                "trigger this Event through its selected node's daemon".into(),
-            ));
-        }
-        let settings = FileSettingsService::with_active_root(&self.refine_dir, runtime).load()?;
-        let provider = settings
-            .get("agent_cli")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("claude")
-            .to_string();
-        let goal_id = body
-            .get("goal_id")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let mut goal = Value::Null;
-        let mut cwd = target_root.to_path_buf();
-        let mut round_idx = None;
-        let mut candidate_commit = None;
-        if let Some(id) = &goal_id {
-            goal = FileWorkItemService::new(&self.refine_dir).show_goal_detail(id)?;
-            let owner = goal
-                .get("node_id")
-                .and_then(Value::as_str)
-                .unwrap_or("default");
-            if !owner.eq_ignore_ascii_case(&node) {
-                return Err(RefineError::Conflict(format!(
-                    "Goal {id} is owned by node {owner}"
-                )));
-            }
-            round_idx = goal
-                .get("rounds")
-                .and_then(Value::as_array)
-                .and_then(|r| r.len().checked_sub(1));
-            candidate_commit = goal
-                .get("candidate_commit")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            if let Some(branch) = goal.get("branch_name").and_then(Value::as_str) {
-                use crate::infrastructure::git::worktrees::FileGitWorktreeService;
-                let git = FileGitWorktreeService::with_runtime_root(target_root, runtime);
-                if let Some(worktree) = git.existing_worktree_for_branch(branch)? {
-                    cwd = worktree;
-                }
-            }
-        }
-        Ok(InvocationContext {
-            node_id: node.clone(),
-            target_root: target_root.into(),
-            cwd: cwd.clone(),
-            provider,
-            goal_id,
-            round_idx,
-            workflow_revision: None,
-            candidate_commit,
-            data: json!({"goal": super::execution::goal_context(&goal), "system": {"node_id": node, "project_root": target_root, "workspace": cwd, "runtime_root": runtime, "refine_executable": std::env::current_exe().ok(), "refine_checkout": crate::infrastructure::runtime::checkout::active_refine_paths().ok().map(|(_, checkout)| checkout)}}),
-            metadata: Default::default(),
-        })
-    }
-
-    pub fn validate_manual_authority(&self, invocation: &EventInvocation) -> RefineResult<()> {
-        if self.invocation(&invocation.id)?.state == InvocationState::Cancelled {
-            return Err(RefineError::Conflict(
-                "Event invocation was cancelled".into(),
-            ));
-        }
-        let node = FileNodeRegistryService::with_active_root(&self.refine_dir, self.runtime()?)
-            .active_node_id()?;
-        if node != invocation.context.node_id {
-            return Err(RefineError::Conflict("Event execution node changed".into()));
-        }
-        if let Some(id) = &invocation.context.goal_id {
-            let goal = FileWorkItemService::new(&self.refine_dir).show_goal_detail(id)?;
-            let pinned = invocation.context.data.get("goal").unwrap_or(&Value::Null);
-            for key in ["status", "node_id", "candidate_commit", "event_generation"] {
-                if invocation.context.data.get("occurrence").is_some()
-                    && ["status", "event_generation"].contains(&key)
-                {
-                    continue;
-                }
-                if goal.get(key) != pinned.get(key) {
-                    return Err(RefineError::Conflict(format!(
-                        "Goal {id} {key} changed after this Event was requested"
-                    )));
-                }
-            }
-            let current_request = goal
-                .get("rounds")
-                .and_then(Value::as_array)
-                .and_then(|r| r.last())
-                .and_then(|r| r.get("prompt"));
-            let pinned_request = pinned
-                .get("rounds")
-                .and_then(Value::as_array)
-                .and_then(|r| r.last())
-                .and_then(|r| r.get("prompt"));
-            if current_request != pinned_request {
-                return Err(RefineError::Conflict(
-                    "Goal request changed after this Event was requested".into(),
-                ));
-            }
-            if goal.get("rounds").and_then(Value::as_array).map(Vec::len)
-                != pinned.get("rounds").and_then(Value::as_array).map(Vec::len)
-            {
-                return Err(RefineError::Conflict("Goal Round changed".into()));
-            }
-        }
-        Ok(())
-    }
-
     /// Called by the existing workflow worker; only pending records are inspected.
     pub fn dispatch_pending(&self, target_root: &Path) -> RefineResult<usize> {
-        let _dispatch = DISPATCH.lock().unwrap_or_else(|e| e.into_inner());
+        self.dispatch_pending_limit(target_root, 32)
+    }
+
+    pub(crate) fn dispatch_pending_limit(
+        &self,
+        target_root: &Path,
+        limit: usize,
+    ) -> RefineResult<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let _dispatch = match DISPATCH.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(0),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
         let runtime = self.runtime()?;
         let node = FileNodeRegistryService::with_active_root(&self.refine_dir, runtime)
             .active_node_id()?;
@@ -389,21 +268,29 @@ impl FileEventService {
             return Ok(0);
         }
         let engine = WorkflowEngine::with_target_root(runtime, target_root);
-        engine.ensure_automation_running()?;
+        let paused = engine.workflow_paused()?;
         let policy = engine.policy_for_refine_dir_and_node(&self.refine_dir, &node)?;
         let mut launched = 0;
-        for entry in std::fs::read_dir(directory)
+        let mut paths = std::fs::read_dir(directory)
             .map_err(|e| RefineError::Io(e.to_string()))?
-            .take(256)
-        {
-            let path = entry.map_err(|e| RefineError::Io(e.to_string()))?.path();
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        let offset = SCAN_CURSOR.load(Ordering::Relaxed) % paths.len();
+        paths.rotate_left(offset);
+        for path in paths.into_iter().take(256) {
+            SCAN_CURSOR.fetch_add(1, Ordering::Relaxed);
             if path.extension().and_then(|p| p.to_str()) != Some("json") {
                 continue;
             }
             let record: Value = match read_json(&path) {
                 Ok(record) => record,
                 Err(_) if !path.exists() => continue,
-                Err(e) => return Err(e),
+                Err(_) => continue,
             };
             if record.get("node_id").and_then(Value::as_str) != Some(&node) {
                 continue;
@@ -411,50 +298,71 @@ impl FileEventService {
             let Some(id) = record.get("id").and_then(Value::as_str) else {
                 continue;
             };
-            let invocation = self.invocation(id)?;
+            let invocation = match self.invocation(id) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
             // Active workflow phases own these invocations and their capacity themselves.
             if (invocation.context.workflow_revision.is_some() && !invocation.state.terminal())
-                || (invocation.state.terminal()
-                    && !(invocation.state == InvocationState::Succeeded
-                        && invocation.event.on_success.is_some()
-                        && !invocation.action_applied))
+                || (invocation.state.terminal() && !invocation.success_action_ready())
             {
                 continue;
             }
-            if !engine.soft_capacity_available(
-                &policy,
-                &node,
-                &invocation.context.provider,
-                &target_root.display().to_string(),
-            )? {
-                break;
-            }
-            let key = format!("{}:{id}", self.refine_dir.display());
-            let mut active = ACTIVE.get_or_init(Default::default).lock().unwrap();
-            if active.len() >= 32 {
-                break;
-            }
-            if active.contains_key(&key) {
+            if crate::application::workflow::engine::admission::reservations(runtime)
+                .iter()
+                .any(|r| r.invocation_id.as_deref() == Some(id))
+            {
                 continue;
             }
-            active.insert(
-                key.clone(),
-                EventReservation {
+            if paused {
+                self.record_wait(id, Some(WaitReason::Paused))?;
+                continue;
+            }
+            match crate::infrastructure::storage::workspace::WorkspaceLease::acquire(
+                &invocation.context.cwd,
+            ) {
+                Ok(lease) => drop(lease),
+                Err(RefineError::Degraded(message))
+                    if message.starts_with("workspace is in use") =>
+                {
+                    self.record_wait(id, Some(WaitReason::WorkspaceBusy))?;
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!("refine Skill admission: {error}");
+                    continue;
+                }
+            }
+            let key = format!("{}:{}:{id}", runtime.display(), self.refine_dir.display());
+            let Some(lease) = reserve(
+                &engine,
+                &policy,
+                key,
+                ExecutionReservation {
                     runtime: runtime.into(),
-                    invocation_id: id.into(),
+                    invocation_id: Some(id.into()),
+                    goal_id: None,
                     node: node.clone(),
                     provider: invocation.context.provider.clone(),
                     target: target_root.display().to_string(),
                 },
-            );
-            drop(active);
+            )?
+            else {
+                self.record_wait(id, Some(WaitReason::Capacity))?;
+                continue;
+            };
+            self.record_wait(id, None)?;
             let service = self.clone();
             std::thread::spawn(move || {
-                let result = service.execute(&invocation.id, || {
-                    service.validate_manual_authority(&invocation)
-                });
+                let _lease = lease;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    service.execute(&invocation.id, || {
+                        service.validate_manual_authority(&invocation)
+                    })
+                }))
+                .unwrap_or_else(|_| Err(RefineError::Degraded("Skill worker panicked".into())));
                 match result {
-                    Ok(mut result) if result.state == InvocationState::Succeeded => {
+                    Ok(mut result) if result.success_action_ready() => {
                         if let Err(error) = service.apply_success_action(&mut result) {
                             result.state = InvocationState::Error;
                             result.error = Some(error.to_string());
@@ -463,7 +371,11 @@ impl FileEventService {
                     }
                     Ok(_) => {}
                     Err(RefineError::Degraded(message))
-                        if message.starts_with("workspace is in use") => {}
+                        if message.starts_with("workspace is in use") =>
+                    {
+                        let _ =
+                            service.record_wait(&invocation.id, Some(WaitReason::WorkspaceBusy));
+                    }
                     Err(error) => {
                         if let Ok(mut result) = service.invocation(&invocation.id)
                             && !result.state.terminal()
@@ -474,174 +386,13 @@ impl FileEventService {
                         }
                     }
                 }
-                ACTIVE
-                    .get_or_init(Default::default)
-                    .lock()
-                    .unwrap()
-                    .remove(&key);
             });
             launched += 1;
+            if launched >= limit {
+                break;
+            }
         }
         Ok(launched)
-    }
-
-    pub(super) fn apply_success_action(
-        &self,
-        invocation: &mut EventInvocation,
-    ) -> RefineResult<()> {
-        let Some(action) = invocation.event.on_success.clone() else {
-            return Ok(());
-        };
-        if invocation.action_applied {
-            return Ok(());
-        }
-        let id = invocation.context.goal_id.clone().ok_or_else(|| {
-            RefineError::InvalidInput("Event success action requires a Goal".into())
-        })?;
-        with_record_lock(&self.refine_dir, &id, || {
-            let work = FileWorkItemService::new(&self.refine_dir);
-            let detail = work.show_goal_detail(&id)?;
-            if detail
-                .get("event_actions")
-                .is_some_and(|receipts| receipts.get(&invocation.id).is_some())
-            {
-                invocation.action_applied = true;
-                return self.save_invocation(invocation);
-            }
-            self.validate_manual_authority(invocation)?;
-            if let Some(occurrence) = invocation.context.data.get("occurrence")
-                && occurrence.get("generation") != detail.get("event_generation")
-            {
-                return Err(RefineError::Conflict(
-                    "Goal moved beyond this Event occurrence; no lifecycle action was applied"
-                        .into(),
-                ));
-            }
-            let depth = if invocation.event.kind == EventKind::Custom {
-                1
-            } else {
-                detail["event_action_depth"].as_u64().unwrap_or(0) + 1
-            };
-            if depth > 16 {
-                return Err(RefineError::Conflict("Event lifecycle action chain exceeded 16 actions; a new manual trigger is required".into()));
-            }
-            let current = work.show_goal_summary(&id)?;
-            let applied = super::transitions::with_action(
-                json!({"invocation_id":invocation.id, "action": action, "depth": depth, "at":chrono::Utc::now().to_rfc3339()}),
-                || {
-                    match action.as_str() {
-                        "start" => {
-                            work.start_goal_workflow(&id)?;
-                        }
-                        "accept" => {
-                            work.transition_goal_status(&id, GoalStatus::Done)?;
-                        }
-                        "retry" => {
-                            if !matches!(
-                                current.goal.status,
-                                GoalStatus::Failed | GoalStatus::Cancelled
-                            ) {
-                                return Err(RefineError::Conflict(
-                                    "retry requires Failed or Cancelled".into(),
-                                ));
-                            }
-                            work.transition_goal_status(&id, GoalStatus::Todo)?;
-                        }
-                        "reopen" => {
-                            work.undo_goal_summary(&id)?;
-                        }
-                        _ => {
-                            return Err(RefineError::InvalidInput(
-                                "unsupported success action".into(),
-                            ));
-                        }
-                    }
-                    Ok(())
-                },
-            );
-            if !matches!(&applied, Err(RefineError::Conflict(message)) if message.starts_with(super::transitions::PENDING))
-            {
-                applied?;
-            }
-            invocation.action_applied = true;
-            self.save_invocation(invocation)
-        })
-    }
-
-    pub(crate) fn cancel_goal_invocations(&self, goal_id: &str) -> RefineResult<()> {
-        let node = FileNodeRegistryService::with_active_root(&self.refine_dir, self.runtime()?)
-            .active_node_id()?;
-        let directory = self.refine_dir.join("automation/pending").join(node);
-        if !directory.exists() {
-            return Ok(());
-        }
-        let goal = FileWorkItemService::new(&self.refine_dir).show_goal_detail(goal_id)?;
-        for entry in std::fs::read_dir(directory).map_err(|e| RefineError::Io(e.to_string()))? {
-            let path = entry.map_err(|e| RefineError::Io(e.to_string()))?.path();
-            if path.extension().and_then(|p| p.to_str()) != Some("json") {
-                continue;
-            }
-            let record: Value = match read_json(&path) {
-                Ok(record) => record,
-                Err(_) if !path.exists() => continue,
-                Err(e) => return Err(e),
-            };
-            if let Some(id) = record["id"].as_str() {
-                let invocation = self.invocation(id)?;
-                if invocation.context.goal_id.as_deref() == Some(goal_id)
-                    && invocation.context.data["goal"].get("event_generation")
-                        != goal.get("event_generation")
-                {
-                    self.cancel_invocation(id)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn cancel_invocation(&self, id: &str) -> RefineResult<EventInvocation> {
-        with_record_lock(&self.refine_dir, &format!("event-{id}"), || {
-            let mut invocation = self.invocation(id)?;
-            if invocation.state.terminal() {
-                return Ok(invocation);
-            }
-            invocation.state = InvocationState::Cancelled;
-            invocation.completed_at = Some(chrono::Utc::now().to_rfc3339());
-            self.save_invocation(&invocation)?;
-            if let Some(operation_id) = invocation
-                .context
-                .metadata
-                .get("event_operation_id")
-                .and_then(Value::as_str)
-            {
-                use crate::infrastructure::process::supervisor::operations::{
-                    FileOperationRegistry, OperationRegistry,
-                };
-                FileOperationRegistry::new(self.runtime()?).cancel(operation_id)?;
-            }
-            self.terminate_invocation_processes(id)?;
-            Ok(invocation)
-        })
-    }
-
-    pub(super) fn terminate_invocation_processes(&self, id: &str) -> RefineResult<()> {
-        use crate::infrastructure::process::subprocess::FileProcessSupervisor;
-        let supervisor = FileProcessSupervisor::new(self.runtime()?);
-        for process in supervisor.list()? {
-            let metadata = process
-                .details
-                .as_deref()
-                .and_then(|v| serde_json::from_str::<Value>(v).ok());
-            if metadata
-                .as_ref()
-                .and_then(|m| m.get("event_invocation_id"))
-                .and_then(Value::as_str)
-                == Some(id)
-            {
-                supervisor.request_termination(&process.id, "terminate")?;
-            }
-        }
-        Ok(())
     }
 
     pub fn startup_ready(&self, target_root: &Path, startup_id: &str) -> RefineResult<()> {

@@ -42,7 +42,13 @@ fn run_planning(
         .trim()
         .to_string();
     let branch = "refine/GOAL1/round-1";
-    git(&target_root, &["checkout", "-b", branch]).unwrap();
+    let workspace = target_root.join(".git/refine-worktrees/refine-GOAL1-round-1");
+    crate::infrastructure::git::worktrees::FileGitWorktreeService::new(&target_root)
+        .ensure_worktree_from_base(branch, &workspace, &base)
+        .unwrap();
+    fs::write(target_root.join("manual.txt"), "untracked human work").unwrap();
+    let primary_index = fs::read(target_root.join(".git/index")).unwrap();
+    let primary_head = git_output(&target_root, &["rev-parse", "HEAD"]);
 
     fs::write(&smoke_ai, native_script(script_body)).unwrap();
     let mut permissions = fs::metadata(&smoke_ai).unwrap().permissions();
@@ -88,7 +94,7 @@ fn run_planning(
     let authority = work_items
         .claim_workflow_attempt("GOAL1", GoalStatus::Plan, round_idx, revision, &request)
         .unwrap();
-    let context = WorkflowContext::new(
+    let mut context = WorkflowContext::new(
         &runtime_root,
         &target_root,
         "GOAL1".to_string(),
@@ -99,26 +105,27 @@ fn run_planning(
         Default::default(),
         work_items.clone(),
     );
+    context.branch = Some(branch.into());
+    context.worktree_path = Some(workspace.display().to_string());
     let events =
         crate::application::events::FileEventService::with_runtime_root(&refine_dir, &runtime_root);
     if multiple {
         let config = events.config().unwrap();
-        let mut event = config.events["workflow.plan.enter"].clone();
-        let mut binding = event.bindings[0].clone();
-        binding.id = "independent-plan".into();
-        binding.order = 1;
-        event.bindings.push(binding);
+        let mut skill = config.skills["default-plan"].clone();
+        skill.id = "independent-plan".into();
+        skill.name = "Independent plan".into();
         events
             .save(
-                "events",
-                &event.id,
-                json!({"revision":config.revision, "item":event}),
+                "skills",
+                &skill.id,
+                json!({"revision":config.revision,"item":skill,
+            "trigger":{"source":"workflow.plan.enter","order":1}}),
             )
             .unwrap();
     }
     let goal = work_items.show_goal_detail("GOAL1").unwrap();
     let mut result =
-        run_governed_implementation_planning(&context, &goal, &agent_context, &target_root, branch);
+        run_governed_implementation_planning(&context, &goal, &agent_context, &workspace, branch);
 
     if retry {
         let error = result.unwrap_err();
@@ -129,8 +136,12 @@ fn run_planning(
         let workflow = WorkflowEngine::with_target_root(&runtime_root, &target_root);
         assert_eq!(
             workflow.settle_goal_failure("GOAL1", authority, "plan", &error),
-            Some(true)
+            crate::application::work_items::FailureSettlement::AuthoritativeFailure
         );
+        let settled = work_items.show_goal_detail("GOAL1").unwrap();
+        assert_eq!(settled["status"], "failed");
+        assert_eq!(settled["rounds"][0]["failure_category"], "plan");
+        assert_eq!(settled["rounds"][0]["failure_message"], error.to_string());
         work_items
             .transition_goal_status("GOAL1", GoalStatus::Todo)
             .unwrap();
@@ -142,7 +153,7 @@ fn run_planning(
         let authority = work_items
             .claim_workflow_attempt("GOAL1", GoalStatus::Plan, round_idx, revision, &request)
             .unwrap();
-        let context = WorkflowContext::new(
+        let mut context = WorkflowContext::new(
             &runtime_root,
             &target_root,
             "GOAL1".into(),
@@ -153,12 +164,14 @@ fn run_planning(
             Default::default(),
             work_items.clone(),
         );
+        context.branch = Some(branch.into());
+        context.worktree_path = Some(workspace.display().to_string());
         let goal = work_items.show_goal_detail("GOAL1").unwrap();
         result = run_governed_implementation_planning(
             &context,
             &goal,
             &agent_context,
-            &target_root,
+            &workspace,
             branch,
         );
     }
@@ -172,7 +185,7 @@ fn run_planning(
             .map(|i| events.invocation(i["id"].as_str().unwrap()).unwrap())
             .collect::<Vec<_>>()
     );
-    detail["file"] = json!(fs::read_to_string(target_root.join("app.txt")).unwrap());
+    detail["file"] = json!(fs::read_to_string(workspace.join("app.txt")).unwrap());
     unsafe {
         if let Some(previous) = previous_provider {
             std::env::set_var("REFINE_SMOKE_AI_PATH", previous);
@@ -180,6 +193,22 @@ fn run_planning(
             std::env::remove_var("REFINE_SMOKE_AI_PATH");
         }
     }
+    assert_eq!(
+        primary_index,
+        fs::read(target_root.join(".git/index")).unwrap()
+    );
+    assert_eq!(
+        primary_head,
+        git_output(&target_root, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        fs::read_to_string(target_root.join("manual.txt")).unwrap(),
+        "untracked human work"
+    );
+    assert_eq!(
+        fs::read_to_string(target_root.join("app.txt")).unwrap(),
+        "base\n"
+    );
     fs::remove_dir_all(temp_root).unwrap();
     (result, detail)
 }
@@ -189,7 +218,7 @@ fn run_planning(
 fn plan_skill_repairs_invalid_artifact_and_retains_diagnostics() {
     let (result, detail) = run_planning(
         "event-plan-repair",
-        "if 'previous response' not in prompt: result['artifacts']['plan']={'summary':'Missing checklist'}",
+        "if not prompt.startswith('Repair only'): result['artifacts']['plan']={'summary':'Missing checklist'}",
         false,
         false,
     );
@@ -227,7 +256,7 @@ fn plan_skill_exhausts_bounded_repairs_without_accepting_an_invalid_plan() {
         result
             .unwrap_err()
             .to_string()
-            .contains("after two repairs")
+            .contains("missing field `checklist`")
     );
     assert_eq!(
         detail["invocations"][0]["attempts"]

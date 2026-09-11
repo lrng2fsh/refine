@@ -338,7 +338,7 @@ fn quality_cancellation_before_provider_launch_records_cancelled_evidence() {
     assert!(
         error
             .to_string()
-            .contains("cancellation prevented provider launch")
+            .contains("cancellation prevented before Quality checks")
     );
     assert!(!fixture.candidate_root.join("provider-launched").exists());
     let detail = FileWorkItemService::new(&fixture.refine_dir)
@@ -487,10 +487,17 @@ fn quality_operation_restart_recovery_interrupts_and_terminates_its_provider() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous = std::env::var_os("REFINE_SMOKE_AI_PATH");
     unsafe { std::env::set_var("REFINE_SMOKE_AI_PATH", &fixture.smoke_ai) };
-    let operation = fixture
-        .runner()
-        .start_goal_checks("GOAL1", "smoke-ai", Default::default())
+    // Use the same registration/execution path as start_goal_checks, retaining
+    // completion so fixture deletion cannot race the worker's final writes.
+    let runner = fixture.runner();
+    let (operation, request) = runner
+        .register_goal_checks("GOAL1", "smoke-ai", Default::default())
         .unwrap();
+    let id = operation.id.clone();
+    let (completed, completion) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = completed.send(runner.run_registered(&id, request));
+    });
     wait_for_operation_process(&fixture.runtime_root, &operation.id);
     let recovered = FileOperationRegistry::new(&fixture.runtime_root)
         .recover_active_supervised()
@@ -514,6 +521,9 @@ fn quality_operation_restart_recovery_interrupts_and_terminates_its_provider() {
                 .unwrap_or("")
                 .contains(&operation.id))
     );
+    let _ = completion
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("recovered Quality worker did not finish");
     restore_smoke_ai(previous);
     fs::remove_dir_all(fixture.temp_root).unwrap();
 }
@@ -769,7 +779,7 @@ fn candidate_deletion_before_quality_registration_creates_no_quality_result() {
 }
 
 #[test]
-fn integrated_target_scopes_do_not_require_the_retired_candidate_worktree() {
+fn legacy_post_build_and_reconciliation_use_isolated_source_with_dirty_primary() {
     for reconciliation in [false, true] {
         let fixture = goal_quality_fixture(
             if reconciliation {
@@ -822,18 +832,38 @@ fn integrated_target_scopes_do_not_require_the_retired_candidate_worktree() {
                 .is_none()
         );
 
+        let primary = FileGitWorktreeService::new(&fixture.candidate_root)
+            .common_git_dir()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        fs::write(primary.join("candidate.txt"), "manual staged\n").unwrap();
+        git_output(&primary, &["add", "candidate.txt"]);
+        fs::write(primary.join("candidate.txt"), "manual unstaged\n").unwrap();
+        let before = (
+            fs::read(primary.join("candidate.txt")).unwrap(),
+            fs::read(primary.join(".git/index")).unwrap(),
+        );
         let operation = fixture
             .runner()
             .run_goal_checks("GOAL1", "smoke-ai", Default::default())
             .unwrap();
+        assert_eq!(
+            before,
+            (
+                fs::read(primary.join("candidate.txt")).unwrap(),
+                fs::read(primary.join(".git/index")).unwrap()
+            )
+        );
+        assert_ne!(
+            operation.operation.request["cwd"].as_str(),
+            primary.to_str()
+        );
         assert!(operation.result.ok);
         assert_eq!(
             operation.operation.request["evaluation_scope"],
-            if reconciliation {
-                "isolated_candidate"
-            } else {
-                "integrated_target"
-            }
+            "isolated_candidate"
         );
         assert!(!fixture.candidate_root.join("provider-launched").exists());
         fs::remove_dir_all(fixture.temp_root).unwrap();

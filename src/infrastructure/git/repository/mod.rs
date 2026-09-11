@@ -137,6 +137,7 @@ impl FileGitRepository {
                 .unwrap_or_default(),
             },
         )?;
+        output.require_complete_capture()?;
         Ok(GitCommandOutput {
             success: output.success(),
             stdout: output.stdout.into_bytes(),
@@ -189,6 +190,9 @@ fn git_at_untracked(
     args: &[&str],
 ) -> RefineResult<GitCommandOutput> {
     let mut command = std::process::Command::new("git");
+    crate::infrastructure::process::launch_environment::remove_inherited_git_environment(
+        &mut command,
+    );
     command.arg("-C").arg(target_root);
     if root != target_root {
         command.arg("-C").arg(root);

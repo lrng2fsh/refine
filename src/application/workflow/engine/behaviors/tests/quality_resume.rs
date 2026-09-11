@@ -10,7 +10,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 const UNRESOLVABLE_CANDIDATE: &str = "0123456789abcdef0123456789abcdef01234567";
-const SMOKE_AI_CORRECTION_FIXTURE_REPORT: &str = "workflow.quality.enter:default-quality: Smoke AI Quality fixture reviewed the candidate and retained existing tests.";
+const SMOKE_AI_CORRECTION_FIXTURE_REPORT: &str =
+    "workflow.quality.enter:default-quality: The candidate passes.";
 
 #[test]
 fn resume_with_a_durable_quality_proof_transitions_without_any_provider_invocation() {
@@ -58,7 +59,7 @@ fn resume_with_a_proof_for_another_candidate_reruns_the_whole_quality_phase() {
     };
     assert_eq!(to, GoalStatus::Governance);
     assert_eq!(reason, "Quality checks passed");
-    // The gate ran against the real candidate; the correction agent re-ran too.
+    // One fresh review covers the real candidate and supplies the supervised check.
     assert_eq!(fixture.invocation_count(), 1);
     let detail = fixture.work_items.show_goal_detail("GOAL1").unwrap();
     assert_eq!(
@@ -253,7 +254,8 @@ impl QualityResumeFixture {
         behavior_test_git(&target_root, &["commit", "-m", "base"]);
         let base = behavior_test_git(&target_root, &["rev-parse", "HEAD"]);
         let branch = "refine/GOAL1/round-1".to_string();
-        let worktree = temp_root.join("candidate");
+        let worktree = target_root.join(".git/refine-worktrees/refine-GOAL1-round-1");
+        fs::create_dir_all(worktree.parent().unwrap()).unwrap();
         behavior_test_git(
             &target_root,
             &["worktree", "add", "-b", &branch, worktree.to_str().unwrap()],

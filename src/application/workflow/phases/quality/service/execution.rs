@@ -2,6 +2,7 @@ use super::*;
 
 impl QualityService for FileQualityService {
     fn run_checks(&self, request: QualityCheckRequest) -> RefineResult<QualityCheckResult> {
+        self.ensure_operation_active(&request, "before Quality checks")?;
         if self.refine_dir.join("automation/config.json").exists() {
             return self.run_skill_checks(request);
         }
@@ -23,6 +24,7 @@ impl QualityService for FileQualityService {
                 candidate_commit: request.candidate_commit,
                 checked_at: None,
                 provider_attempts: Vec::new(),
+                skill_evidence: None,
             });
         }
         let test_names = definitions
@@ -170,6 +172,7 @@ impl QualityService for FileQualityService {
             candidate_commit: request.candidate_commit,
             checked_at: None,
             provider_attempts,
+            skill_evidence: None,
         };
         if !result.ok {
             result.summary = quality_failure_summary(&result);
@@ -204,6 +207,7 @@ impl QualityService for FileQualityService {
             candidate_commit: String::new(),
             checked_at: None,
             provider_attempts: Vec::new(),
+            skill_evidence: None,
         })
     }
 
@@ -222,6 +226,7 @@ impl QualityService for FileQualityService {
             candidate_commit: String::new(),
             checked_at: None,
             provider_attempts: Vec::new(),
+            skill_evidence: None,
         })
     }
 }
