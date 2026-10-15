@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GoalStatus {
+    Draft,
     Backlog,
     Todo,
     #[serde(alias = "in-progress")]
@@ -21,6 +22,7 @@ pub enum GoalStatus {
 impl GoalStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Draft => "draft",
             Self::Backlog => "backlog",
             Self::Todo => "todo",
             Self::Plan => "plan",
@@ -36,6 +38,7 @@ impl GoalStatus {
 
     pub fn parse_wire(value: &str) -> Option<Self> {
         match value {
+            "draft" => Some(Self::Draft),
             "backlog" => Some(Self::Backlog),
             "todo" => Some(Self::Todo),
             "plan" | "in-progress" => Some(Self::Plan),
@@ -70,6 +73,7 @@ pub enum AutomatedGoalStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BulkStatusTarget {
+    Draft,
     Backlog,
     Todo,
     Review,
@@ -185,7 +189,14 @@ pub fn user_status_transition(from: &GoalStatus, to: &GoalStatus) -> TransitionD
 
     let allowed = matches!(
         (from, to),
-        (Backlog, Todo) | (Todo, Backlog) | (Done, Review) | (Failed, Todo) | (Cancelled, Todo)
+        (Draft, Backlog)
+            | (Backlog, Draft)
+            | (Draft, Cancelled)
+            | (Backlog, Todo)
+            | (Todo, Backlog)
+            | (Done, Review)
+            | (Failed, Todo)
+            | (Cancelled, Todo)
     );
 
     if allowed {
@@ -195,10 +206,6 @@ pub fn user_status_transition(from: &GoalStatus, to: &GoalStatus) -> TransitionD
             "manual transition from {from:?} to {to:?} is not allowed"
         ))
     }
-}
-
-pub fn is_bulk_target_allowed(status: &GoalStatus) -> bool {
-    !is_automated_status(status)
 }
 
 pub fn is_automated_status(status: &GoalStatus) -> bool {
@@ -245,8 +252,8 @@ pub fn goal_operation_allowed(
         EditMetadata | EditNotes | Delete => {
             !matches!(status, Plan | Implement | Quality | Governance)
         }
-        SubmitNewRound => matches!(status, Todo | Failed | Review | Backlog),
-        EditLatestRound => matches!(status, Backlog | Todo | Review),
+        SubmitNewRound => matches!(status, Draft | Todo | Failed | Review | Backlog),
+        EditLatestRound => matches!(status, Draft | Backlog | Todo | Review),
         StartImplementation => matches!(status, Todo),
         CancelAutomation => is_automated_status(status),
         RetryAgent => matches!(status, Failed | Plan | Implement),
@@ -310,17 +317,6 @@ mod tests {
     }
 
     #[test]
-    fn bulk_targets_exclude_automated_states() {
-        assert!(!is_bulk_target_allowed(&GoalStatus::Plan));
-        assert!(!is_bulk_target_allowed(&GoalStatus::Implement));
-        assert!(!is_bulk_target_allowed(&GoalStatus::Quality));
-        assert!(!is_bulk_target_allowed(&GoalStatus::Governance));
-        assert!(is_bulk_target_allowed(&GoalStatus::Review));
-        assert!(is_bulk_target_allowed(&GoalStatus::Done));
-        assert!(is_bulk_target_allowed(&GoalStatus::Todo));
-    }
-
-    #[test]
     fn feature_rules_protect_specified_goal_statuses() {
         assert!(is_feature_protected_status(&GoalStatus::Review));
         assert!(is_feature_protected_status(&GoalStatus::Done));
@@ -355,4 +351,25 @@ mod tests {
             "\"governance\""
         );
     }
+}
+
+/// An explicit, revision-fenced workflow decision from any surface.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowControl {
+    pub to: GoalStatus,
+    pub reason: String,
+    #[serde(default)]
+    pub context: String,
+    pub expected_revision: u64,
+    pub request_id: String,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default = "default_actor")]
+    pub actor: String,
+    #[serde(default)]
+    pub invocation_id: Option<String>,
+}
+fn default_actor() -> String {
+    "operator".into()
 }

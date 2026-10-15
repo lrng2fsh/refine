@@ -5,13 +5,20 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
         Commands::Goal {
             action:
                 GoalAction::Create {
+                    status,
                     name,
                     target_root: Some(target_root),
                     id,
                 },
         } => {
-            let goal = direct_work_item_service(&target_root)?
-                .create_goal_summary(&name, id.as_deref())?;
+            let goal = direct_work_item_service(&target_root)?.create_goal_in_step(
+                &name,
+                id.as_deref(),
+                GoalStatus::parse_wire(&status).unwrap(),
+                None,
+                None,
+                None,
+            )?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({"goal": goal.goal})).unwrap()
@@ -134,6 +141,28 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({"goal": goal.goal})).unwrap()
+            );
+            Ok(())
+        }
+        Commands::Goal {
+            action:
+                GoalAction::RoundDelete {
+                    id,
+                    round,
+                    target_root: Some(target_root),
+                    expected_revision,
+                },
+        } => {
+            let service = direct_work_item_service(&target_root)?;
+            let revision = expected_revision.unwrap_or(
+                service.show_goal_detail(&id)?["workflow_revision"]
+                    .as_u64()
+                    .unwrap_or(0),
+            );
+            let goal = service.delete_goal_round(&id, (round - 1) as usize, revision)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({"deleted":true,"goal":goal.goal})).unwrap()
             );
             Ok(())
         }
@@ -354,6 +383,7 @@ pub(super) fn dispatch_command(command: Commands) -> RefineResult<()> {
 pub(super) fn dispatch_goal_daemon(action: GoalAction) -> RefineResult<()> {
     let response = match action {
         GoalAction::Create {
+            status,
             name,
             target_root: None,
             id,
@@ -362,6 +392,7 @@ pub(super) fn dispatch_goal_daemon(action: GoalAction) -> RefineResult<()> {
             "/work/goals",
             Some(json!({
                 "name": name,
+                "status":status,
                 "id": id
             })),
         )?,
@@ -461,6 +492,27 @@ pub(super) fn dispatch_goal_daemon(action: GoalAction) -> RefineResult<()> {
                 "PATCH",
                 &format!("/work/goals/{}", path_segment(&id)),
                 Some(json!({ "notes": notes })),
+            )?
+        }
+        GoalAction::RoundDelete {
+            id,
+            round,
+            target_root: None,
+            expected_revision,
+        } => {
+            let revision = match expected_revision {
+                Some(revision) => revision,
+                None => {
+                    daemon_json("GET", &format!("/work/goals/{}", path_segment(&id)), None)?["goal"]
+                        ["workflow_revision"]
+                        .as_u64()
+                        .unwrap_or(0)
+                }
+            };
+            daemon_json(
+                "DELETE",
+                &format!("/work/goals/{}/rounds/{}", path_segment(&id), round - 1),
+                Some(json!({"expected_revision":revision})),
             )?
         }
         GoalAction::Round {

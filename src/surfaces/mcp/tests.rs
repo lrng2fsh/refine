@@ -293,3 +293,64 @@ fn skills_replace_event_tools_and_preserve_typed_manual_parameters() {
     );
     assert!(request["body"].get("goal_id").is_none());
 }
+
+#[test]
+fn round_delete_tool_maps_exact_round_and_revision_to_shared_capability() {
+    let response = call(
+        json!({"jsonrpc":"2.0","id":20,"method":"tools/call","params":{
+            "name":"refine_delete_round","arguments":{"goal_id":"GOAL1","round_idx":1,"expected_revision":42}
+        }}),
+    );
+    let request = &response["result"]["structuredContent"];
+    assert_eq!(request["method"], "DELETE");
+    assert_eq!(request["path"], "/work/goals/GOAL1/rounds/1");
+    assert_eq!(request["body"]["expected_revision"], 42);
+}
+
+#[test]
+fn metrics_refresh_tool_supplies_the_shared_routes_required_json_body() {
+    let response = call(
+        json!({"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"refine_refresh_hub_metrics","arguments":{}}}),
+    );
+    let request = &response["result"]["structuredContent"];
+    assert_eq!(request["method"], "POST");
+    assert_eq!(request["path"], "/api/hub/metrics/refresh");
+    assert_eq!(request["body"], json!({}));
+}
+
+#[test]
+fn planning_tools_share_command_and_action_routes() {
+    let command = json!({"operation":"card.move","request_id":"same-intent","goal_id":"GOAL1","board_id":"board","lane_id":"ready","expected_revision":3});
+    let response = call(
+        json!({"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"refine_planning_command","arguments":command}}),
+    );
+    assert_eq!(
+        response["result"]["structuredContent"]["path"],
+        "/planning/commands"
+    );
+    assert_eq!(response["result"]["structuredContent"]["body"], command);
+    for (name, method, path, args) in [
+        ("refine_planning", "GET", "/planning", json!({})),
+        (
+            "refine_planning_action",
+            "GET",
+            "/planning/actions/same-intent",
+            json!({"id":"same-intent"}),
+        ),
+        (
+            "refine_cancel_planning_action",
+            "POST",
+            "/planning/actions/same-intent/cancel",
+            json!({"id":"same-intent"}),
+        ),
+    ] {
+        let response = call(
+            json!({"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":name,"arguments":args}}),
+        );
+        assert_eq!(
+            response["result"]["structuredContent"]["path"], path,
+            "{response}"
+        );
+        assert_eq!(response["result"]["structuredContent"]["method"], method);
+    }
+}

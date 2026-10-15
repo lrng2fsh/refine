@@ -146,9 +146,9 @@ test("workflow pause handler delegates the action model to the shared API and re
   }
 });
 
-test("Guide states the complete workflow pause and unpause contract", () => {
+test("Refine Hub states the complete workflow pause and unpause contract", () => {
   const guide = fs.readFileSync(
-    path.join(__dirname, "../src/surfaces/web/static/js/features/guide.js"),
+    path.join(__dirname, "../src/surfaces/refine-hub/product/reference.md"),
     "utf8",
   );
   assert.match(guide, /Pause or unpause workflow/);
@@ -204,8 +204,9 @@ test("every current agent provider process renders a process-specific Stop actio
     const actions = processes.renderActions(row);
     assert.match(actions, /data-testid="process-stop-agent"/);
     assert.match(actions, new RegExp(`data-stop-agent="${row.id}"`));
-    assert.match(actions, />Stop<\/button>/);
-    assert.doesNotMatch(actions, />Cancel<\/button>/);
+    assert.match(actions, /aria-label="Stop agent"/);
+    assert.match(actions, /navigation.svg#square/);
+    assert.doesNotMatch(actions, /aria-label="Cancel agent"/);
   }
   assert.match(
     processes.renderActions(rows[0]),

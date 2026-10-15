@@ -10,13 +10,6 @@ const AGENT_TERMINAL_MODES = new Set(["agent", "plan", "goal", "standalone", "sk
 const SYSTEM_OPERATION_LOG_LIMIT = 250;
 const GOAL_LOG_TAIL_LIMIT = 200;
 const GOAL_LOG_DEFAULT_ORDER = "tail";
-const SYSTEM_LOG_FILTERS = [
-  { status: "info", label: "Info" },
-  { status: "start", label: "Started" },
-  { status: "queued", label: "Queued" },
-  { status: "complete", label: "Completed" },
-  { status: "error", label: "Errors" },
-];
 const FILES_TREE_MAX_DEPTH = 3;
 const FILES_TREE_MAX_ENTRIES = 200;
 const FILES_SEARCH_MAX_RESULTS = 20;
@@ -29,17 +22,14 @@ const TERMINAL_LINE_HEIGHT = 1.35;
 let filesSearchTimer = null;
 let filesSearchRequestSeq = 0;
 let filesSearchAbortController = null;
-let toolbarResizeGesture = null;
 const chatState = {
   tabs: {},                // tabId → { goalId, label, sessionId, output, closedReason }
   activeTabId: null,
-  open: false,             // dock expanded?
-  bodyHeight: null,        // user-resized body height in px; null → 20vh default
-  fullscreen: false,       // when true, panel fills viewport below the topbar
+  open: false,             // window occupies the content area?
 };
 const systemOperationState = {
   messages: [],
-  filters: new Set(),
+  logTab: { mode: "system", logEntries: [], logQuery: "", logFollowing: false },
 };
 const filesState = {
   path: "",
@@ -160,7 +150,7 @@ function loadChatStateFromStorage() {
     if (parsed && typeof parsed === "object" && parsed.tabs) {
       chatState.tabs = Object.fromEntries(
         Object.entries(parsed.tabs).filter(([, tab]) => {
-          if (tab?.mode === "supervisor") return false;
+          if (["supervisor", "todo"].includes(tab?.mode)) return false;
           if (parsed.version === CHAT_TABS_STORAGE_VERSION) return true;
           const legacyDefault = ["standalone", "system", "files", "terminal"].includes(tab?.mode);
           return !legacyDefault || !!tab?.sessionId;
@@ -168,23 +158,12 @@ function loadChatStateFromStorage() {
       );
       for (const tab of Object.values(chatState.tabs)) {
         if (tab.mode === "standalone") tab.label = "Agent in Worktree";
-        if (tab.mode === "plan") tab.label = "Planing Agent";
+        if (tab.mode === "plan") tab.label = "Planning Agent";
       }
       if (parsed.activeTabId && chatState.tabs[parsed.activeTabId]) {
         chatState.activeTabId = parsed.activeTabId;
       }
       if (typeof parsed.open === "boolean") chatState.open = parsed.open;
-      if (typeof parsed.bodyHeight === "number" && parsed.bodyHeight > 0) {
-        chatState.bodyHeight = parsed.bodyHeight;
-      }
-      if (typeof parsed.fullscreen === "boolean") {
-        chatState.fullscreen = parsed.fullscreen;
-      }
-      if (Array.isArray(parsed.systemFilters)) {
-        systemOperationState.filters = new Set(
-          parsed.systemFilters.map((item) => String(item || "").trim()).filter(Boolean),
-        );
-      }
     }
   } catch {}
   ensureStandaloneTab();
@@ -213,59 +192,46 @@ function saveChatStateToStorage() {
           : undefined,
         logQuery: t.mode === "goal_logs" ? String(t.logQuery || "") : undefined,
         logOrder: t.mode === "goal_logs" ? normalizeGoalLogOrder(t.logOrder) : undefined,
+        logFilters: t.mode === "goal_logs" ? t.logFilters : undefined,
+        logFollowing: t.mode === "goal_logs" ? t.logFollowing : undefined,
     };
   }
   try {
     toolbarStateStorage().setItem(CHAT_TABS_STORAGE_KEY, JSON.stringify({
       tabs, activeTabId: chatState.activeTabId,
       version: CHAT_TABS_STORAGE_VERSION,
-      open: chatState.open, bodyHeight: chatState.bodyHeight,
-      fullscreen: chatState.fullscreen,
-      systemFilters: [...systemOperationState.filters],
+      open: chatState.open,
     }));
   } catch {}
 }
-
-function defaultToolbarBodyHeight() {
-  return Math.max(320, Math.round(window.innerHeight * 0.32));
-}
-
-function defaultChatBodyHeight() { return defaultToolbarBodyHeight(); }
-
-function clampToolbarBodyHeight(px) {
-  const min = 320;
-  const max = Math.max(min, Math.round(window.innerHeight * 0.85));
-  return Math.max(min, Math.min(max, Math.round(px)));
-}
-
-function clampChatBodyHeight(px) { return clampToolbarBodyHeight(px); }
 
 function initToolbar() {
   loadChatStateFromStorage();
   if (typeof drainPendingSystemOperations === "function") drainPendingSystemOperations();
   drawToolbar();
   observeToolbarSize();
-  observeTopbarHeight();
 }
 
 function initChatDock() { initToolbar(); }
 
 function closeToolbarAddMenuOnOutsideClick(event) {
-  const menu = $("#toolbar-dock")?.querySelector(".toolbar-add-menu");
+  const menu = document.querySelector(".toolbar-add-menu");
   if (menu?.open && !menu.contains(event.target)) menu.open = false;
 }
 
 document.addEventListener("click", closeToolbarAddMenuOnOutsideClick);
 
 function resetChatForProjectSwitch() {
+  if (typeof resetWorkspaceNavigation === "function") resetWorkspaceNavigation();
   chatState.tabs = {};
   chatState.activeTabId = null;
   chatState.open = false;
-  chatState.bodyHeight = null;
-  chatState.fullscreen = false;
-  systemOperationState.filters.clear();
+  toolbarSystemDashboard = null;
+  toolbarSystemDiagnosticsOpen = false;
+  resetSystemStateRecovery();
+  systemOperationState.messages = [];
+  systemOperationState.logTab = { mode: "system", logEntries: [], logQuery: "", logFollowing: false };
   resetFilesState();
-  resetTodoState();
   resetTerminalState();
   saveChatStateToStorage();
   drawToolbar();
@@ -303,6 +269,7 @@ function resetTerminalState() {
     }
     terminal.eventSource?.close();
     terminal.outputResizeObserver?.disconnect();
+    resetTerminalClipboard(terminal);
     terminal.term?.dispose();
     if (terminal.inputFlushTimer) clearTimeout(terminal.inputFlushTimer);
     if (terminal.resizeTimer) clearTimeout(terminal.resizeTimer);
@@ -311,35 +278,11 @@ function resetTerminalState() {
   if (stops.length) Promise.allSettled(stops).then(refreshProcessesTabForChatChange);
 }
 
-// Publish the topbar's actual height as --topbar-height on <html> so the
-// fullscreen Toolbar can anchor its top edge just below the main nav.
-function observeTopbarHeight() {
-  const topbar = document.querySelector(".topbar");
-  if (!topbar) return;
-  const apply = () => {
-    document.documentElement.style.setProperty(
-      "--topbar-height", `${topbar.offsetHeight}px`,
-    );
-  };
-  apply();
-  if (typeof ResizeObserver === "function") {
-    new ResizeObserver(apply).observe(topbar);
-  } else {
-    window.addEventListener("resize", apply);
-  }
-}
-
-// Keep --toolbar-dock-height in sync with whatever vertical space the dock
-// actually occupies (collapsed bar, expanded panel, or mid-drag). `body`
-// reads this variable as its bottom padding so page content never slides
-// underneath the dock.
+// Refit the active terminal when the shared content area changes size.
 function observeToolbarSize() {
   const root = $("#toolbar-dock");
   if (!root) return;
   const apply = () => {
-    document.documentElement.style.setProperty(
-      "--toolbar-dock-height", `${root.offsetHeight}px`,
-    );
     scheduleActiveTerminalFit();
   };
   apply();
@@ -388,20 +331,16 @@ function nextToolbarLabel(mode) {
     standalone: "Agent in Worktree",
     system: "System",
     files: "Files",
-    todo: "Todo List",
     terminal: "Terminal",
-    plan: "Planing Agent",
+    plan: "Planning Agent",
   }[mode] || "Tool";
   const count = Object.values(chatState.tabs).filter((tab) => tab.mode === mode).length + 1;
   return count === 1 ? base : `${base} ${count}`;
 }
 
 async function createToolbarTab(mode, options = {}) {
-  if (!["agent", "standalone", "system", "files", "todo", "terminal", "plan", "skill"].includes(mode)) return;
-  if (mode === "todo") {
-    const existing = Object.keys(chatState.tabs).find((id) => chatState.tabs[id]?.mode === "todo");
-    if (existing) return activateToolbarTab(existing);
-  }
+  if (!["agent", "standalone", "system", "files", "terminal", "plan", "skill"].includes(mode)) return;
+
   const tabId = nextToolbarTabId(mode);
   chatState.tabs[tabId] = normalizeInteractiveTerminalTab({
     goalId: null,
@@ -411,13 +350,8 @@ async function createToolbarTab(mode, options = {}) {
     initialPrompt: String(options.initialPrompt || "").trim(),
     skillLaunch: options.skillLaunch || null,
   });
-  chatState.activeTabId = tabId;
-  chatState.open = true;
   saveChatStateToStorage();
-  drawToolbar();
-  if (toolbarTabUsesTerminal(chatState.tabs[tabId])) {
-    await startTerminalSession(chatState.tabs[tabId]);
-  }
+  await activateToolbarTab(tabId);
   return tabId;
 }
 
@@ -450,11 +384,9 @@ function openGoalLogTail({ goalId, goalName = "" } = {}) {
   } else if (goalName) {
     chatState.tabs[tabId].goalName = goalName;
   }
-  chatState.activeTabId = tabId;
-  chatState.open = true;
-  saveChatStateToStorage();
-  drawToolbar();
-  loadGoalLogTail(chatState.tabs[tabId]);
+  chatState.tabs[tabId].logsLoaded = false;
+  void activateToolbarTab(tabId);
+
 }
 
 async function renderGoalPlan() {
@@ -469,10 +401,14 @@ async function openPlanChatDock(options = {}) {
   return createToolbarTab("plan", { initialPrompt });
 }
 
-async function activateToolbarTab(tabId, { toggleIfActive = false } = {}) {
+async function activateToolbarTab(tabId) {
   ensureStandaloneTab();
   const tab = chatState.tabs[tabId];
   if (!tab) return;
+  if (typeof navigateToWindow === "function") {
+    const pending = navigateToWindow(tabId);
+    if (pending) return pending;
+  }
   const previousTabId = chatState.activeTabId;
   const wasActive = previousTabId === tabId;
   const switchedTabs = !!previousTabId && !wasActive;
@@ -482,11 +418,6 @@ async function activateToolbarTab(tabId, { toggleIfActive = false } = {}) {
   const preserveCopy = terminalPreservesCopy(terminal);
   let shouldStart = !!terminal && !preserveCopy && !terminal.loading && !terminal.stopping &&
     (!terminal.sessionId || (terminal.statusChecked && terminal.exited));
-
-  if (toggleIfActive && wasActive && chatState.open && !shouldStart && terminal?.statusChecked !== false) {
-    toggleToolbar();
-    return;
-  }
 
   chatState.activeTabId = tabId;
   chatState.open = true;
@@ -505,33 +436,22 @@ async function activateToolbarTab(tabId, { toggleIfActive = false } = {}) {
   if (shouldStart) await startTerminalSession(tab);
 }
 
+// Compatibility entrypoints used by older commands and integrations.
 function toggleToolbar() {
-  chatState.open = !chatState.open;
-  // Collapsing the dock also exits fullscreen — leaving fullscreen on
-  // while the body is hidden would orphan the topbar offset.
-  if (!chatState.open) chatState.fullscreen = false;
-  saveChatStateToStorage();
-  drawToolbar();
+  if (chatState.open) return minimizeToolbar();
+  const tab = currentToolbarTab();
+  if (tab) return activateToolbarTab(chatState.activeTabId);
+  document.querySelector(".toolbar-add-menu")?.setAttribute("open", "");
 }
-
-function toggleChatDock() { toggleToolbar(); }
-
+function toggleChatDock() { return toggleToolbar(); }
 function minimizeToolbar() {
-  if (!chatState.open && !chatState.fullscreen) return;
-  chatState.open = false;
-  chatState.fullscreen = false;
-  saveChatStateToStorage();
-  drawToolbar();
+  if (typeof workspaceNavigation !== "undefined") {
+    location.hash = workspaceNavigation.mainHash || "#/";
+  } else {
+    chatState.open = false;
+    drawToolbar();
+  }
 }
-
-function toggleToolbarFullscreen() {
-  chatState.fullscreen = !chatState.fullscreen;
-  if (chatState.fullscreen) chatState.open = true;  // fullscreen implies open
-  saveChatStateToStorage();
-  drawToolbar();
-}
-
-function toggleChatFullscreen() { toggleToolbarFullscreen(); }
 
 function drawToolbar() {
   const root = $("#toolbar-dock");
@@ -543,19 +463,13 @@ function drawToolbar() {
   }
   ensureStandaloneTab();
   const active = currentToolbarTab();
-  const tabs = chatState.tabs;
-  const activeId = chatState.activeTabId;
   const filesActive = active?.mode === "files";
-  const todoActive = active?.mode === "todo";
   const systemActive = active?.mode === "system";
   const terminalActive = toolbarTabUsesTerminal(active);
   const goalLogsActive = active?.mode === "goal_logs";
 
   root.classList.toggle("open", !!chatState.open);
-  root.classList.toggle("fullscreen", !!chatState.fullscreen);
-  if (chatState.open && !chatState.bodyHeight) {
-    chatState.bodyHeight = defaultToolbarBodyHeight();
-  }
+  if (typeof renderWindowNavigation === "function") renderWindowNavigation();
   if (!terminalActive) {
     const output = root.querySelector(".terminal-output");
     // Keep the inactive xterm's DOM with its terminal instance. If Idiomorph
@@ -565,77 +479,34 @@ function drawToolbar() {
     releaseAfterMorph(output);
   }
   renderInto(root, `
-    <div class="toolbar-dock-resize" id="toolbar-dock-resize"
-         role="separator" aria-orientation="horizontal"
-         aria-label="Resize Toolbar"
-         data-testid="toolbar-resize"
-         title="Drag to resize"></div>
-    <div class="toolbar-dock-bar" id="toolbar-dock-bar"
-         data-testid="toolbar-bar"
-         title="${chatState.open ? "Click to collapse" : "Click a tab to expand Toolbar"}">
-      <span class="toolbar-dock-label">TOOLBAR</span>
-      <details class="toolbar-add-menu" data-testid="toolbar-add-menu">
-        <summary class="toolbar-add-button" data-testid="toolbar-add" aria-label="Add Toolbar tab" title="Add tab">
-          <svg class="toolbar-action-icon" data-testid="toolbar-add-icon" aria-hidden="true" viewBox="0 0 20 20" focusable="false">
-            <path d="M10 4v12M4 10h12"></path>
-          </svg>
-        </summary>
-        <div class="toolbar-add-options" role="menu">
-          ${[
-            ["agent", "Agent"],
-            ["standalone", "Agent in Worktree"],
-            ["system", "System"],
-            ["files", "Files"],
-            ["todo", "Todo List"],
-            ["terminal", "Terminal"],
-            ["plan", "Planing Agent"],
-          ].map(([mode, label]) => `<button type="button" role="menuitem" data-add-toolbar-tab="${mode}">${label}</button>`).join("")}
-        </div>
-      </details>
-      <div class="toolbar-tabs">
-        ${Object.entries(tabs).map(([id, t]) => `
-          <button class="toolbar-tab ${id === activeId ? "active" : ""} ${toolbarTabActivityClass(t)}"
-                  data-tab-id="${htmlEscape(id)}"
-                  data-testid="toolbar-tab-${htmlEscape(id)}"
-                  title="${htmlEscape(toolbarTabTitle(t))}">
-            ${htmlEscape(t.label)}${toolbarTabSessionDot(t)}
-            <span class="toolbar-tab-close" data-close-tab="${htmlEscape(id)}" data-testid="toolbar-tab-close" title="Close tab">
-              <svg class="toolbar-action-icon" data-testid="toolbar-tab-close-icon" aria-hidden="true" viewBox="0 0 20 20" focusable="false">
-                <path d="M5 5l10 10M15 5L5 15"></path>
-              </svg>
-            </span>
-          </button>`).join("")}
-      </div>
-      <button class="toolbar-dock-toggle toolbar-dock-fullscreen-btn${chatState.fullscreen ? " active" : ""}"
-              id="btn-dock-fullscreen"
-              data-testid="toolbar-fullscreen"
-              aria-label="${chatState.fullscreen ? "Exit fullscreen Toolbar" : "Fullscreen Toolbar"}"
-              aria-pressed="${chatState.fullscreen ? "true" : "false"}"
-              title="${chatState.fullscreen ? "Exit fullscreen" : "Fullscreen"}">⛶</button>
-      <button class="toolbar-dock-toggle toolbar-dock-collapse" id="btn-dock-toggle"
-              data-testid="toolbar-collapse"
-              aria-label="${chatState.open ? "Collapse Toolbar" : "Expand Toolbar"}"
-              title="${chatState.open ? "Collapse Toolbar" : "Expand Toolbar"}">▾</button>
-    </div>
+    <header class="window-content-header">
+      <h2>${htmlEscape(active?.label || "Window")}</h2>
+      <span class="muted">${htmlEscape(active ? toolbarTabTitle(active) : "")}</span>
+    </header>
     <div class="toolbar-dock-body${terminalActive ? " terminal-toolbar-body" : ""}"
-         data-testid="toolbar-body"
-         style="${chatState.bodyHeight ? `height:${chatState.bodyHeight}px` : ""}">
+         data-testid="toolbar-body">
       ${filesActive
         ? renderFilesPanel()
-        : todoActive
-          ? renderTodoPanel()
         : systemActive
           ? renderSystemPanel()
           : terminalActive
             ? renderTerminalPanel(active)
             : goalLogsActive
               ? renderGoalLogPanel(active)
-              : `<div class="toolbar-empty muted" data-testid="toolbar-empty">Use the Add button to open a tool or agent.</div>`}
+              : `<div class="toolbar-empty muted" data-testid="toolbar-empty">Use Tools to open a tool or agent.</div>`}
     </div>
   `, () => {
     if (filesActive) bindFilesPanel(root);
-    if (todoActive) bindTodoPanel(root);
-    if (systemActive) bindSystemPanel(root);
+    if (systemActive) {
+      bindGoalLogPanel(root, systemOperationState.logTab);
+      wireSystemStateRecovery();
+      bindOnce(root.querySelector("[data-system-diagnostics]"), "click", () => {
+        toolbarSystemDiagnosticsOpen = !toolbarSystemDiagnosticsOpen;
+        drawToolbar();
+      });
+      bindOnce(root.querySelector("[data-system-refresh]"), "click", () => refreshToolbarSyncHealth(true));
+      refreshToolbarSyncHealth();
+    }
     if (terminalActive) bindTerminalPanel(root, active);
     if (goalLogsActive) bindGoalLogPanel(root, active);
 
@@ -644,25 +515,10 @@ function drawToolbar() {
       if (out) scrollGoalLogEdge(active, out);
     }
 
-    $$(".toolbar-tab", root).forEach((el) => {
-      bindOnce(el, "click", (e) => void handleToolbarTabClick(e, el));
-    });
-    $$("[data-add-toolbar-tab]", root).forEach((el) => {
-      bindOnce(el, "click", () => {
-        root.querySelector(".toolbar-add-menu")?.removeAttribute("open");
-        void createToolbarTab(el.dataset.addToolbarTab);
-      });
-    });
-    bindOnce($("#btn-dock-toggle"), "click", toggleToolbar);
-    bindOnce($("#btn-dock-fullscreen"), "click", toggleToolbarFullscreen);
-
-    wireToolbarResize(root);
     if (filesActive && !filesState.entriesByPath[""] && !filesState.loading) {
       loadFilesDirectory("", { expand: true, redraw: true });
     }
-    if (todoActive && state.lastReporter && todoState.reporter !== state.lastReporter && !todoState.loading) {
-      void loadTodoListsForReporter(state.lastReporter);
-    }
+
     if (terminalActive) {
       const terminal = terminalStateFor(chatState.activeTabId);
       if (terminal?.sessionId && !terminal.statusChecked) {
@@ -684,7 +540,6 @@ function drawChatDock() { drawToolbar(); }
 function toolbarTabTitle(tab) {
   if (tab.mode === "agent") return "General-purpose agent terminal";
   if (tab.mode === "files") return "File browser";
-  if (tab.mode === "todo") return "Reporter todo lists";
   if (tab.mode === "system") return "System operations";
   if (toolbarTabUsesTerminal(tab)) return `${tab.label} terminal`;
   if (tab.mode === "goal_logs") return `Live logs for Goal ${tab.goalId}`;
@@ -722,6 +577,7 @@ function goalLogSearchText(entry) {
     ? entry.actions.flatMap((action) => [action?.label, action?.href, action?.command])
     : [];
   return [
+    entry?.id, entry?.goal_id, entry?.process_id, entry?.operation_id, entry?.log_type,
     entry?.datetime,
     entry?.severity,
     entry?.category,
@@ -735,7 +591,7 @@ function goalLogSearchText(entry) {
 function visibleGoalLogEntries(tab) {
   const query = String(tab?.logQuery || "").trim().toLocaleLowerCase();
   const entries = normalizeGoalLogEntries(tab?.logEntries)
-    .filter((entry) => !query || goalLogSearchText(entry).includes(query));
+    .filter((entry) => (!query || goalLogSearchText(entry).includes(query)) && Object.entries(tab.logFilters || {}).every(([key,value]) => !value || String(entry[key] || "").toLowerCase().includes(value.toLowerCase())));
   return normalizeGoalLogOrder(tab?.logOrder) === "head" ? entries.reverse() : entries;
 }
 
@@ -757,35 +613,75 @@ function mergeGoalLogEntries(...groups) {
   return [...merged.values()]
     .sort((left, right) => {
       const byTime = String(left.datetime || "").localeCompare(String(right.datetime || ""));
-      return byTime || goalLogEntryKey(left).localeCompare(goalLogEntryKey(right));
+      if (byTime) return byTime;
+      if (left.process_id && left.process_id === right.process_id && left.log_type === right.log_type
+          && Number.isFinite(left.stream_offset) && Number.isFinite(right.stream_offset)) {
+        return left.stream_offset - right.stream_offset;
+      }
+      return goalLogEntryKey(left).localeCompare(goalLogEntryKey(right));
     })
     .slice(-GOAL_LOG_TAIL_LIMIT);
 }
 
-async function loadGoalLogTail(tab, { redraw = true } = {}) {
-  if (!tab?.goalId || tab.logsLoading) return;
+let toolbarLogTimer = null;
+function logIsFollowing(tab) { return tab.mode === "system" ? tab.logFollowing === true : tab.logFollowing !== false; }
+function openSystemLogs() {
+  const id = Object.keys(chatState.tabs).find(id => chatState.tabs[id].mode === "system");
+  return id ? activateToolbarTab(id) : createToolbarTab("system");
+}
+function scheduleToolbarLogTail() {
+  if (toolbarLogTimer) return;
+  toolbarLogTimer = setTimeout(async () => {
+    toolbarLogTimer = null;
+    const tabs = Object.values(chatState.tabs).filter(tab => tab.mode === "goal_logs");
+    if (Object.values(chatState.tabs).some(tab => tab.mode === "system")) tabs.push(systemOperationState.logTab);
+    await Promise.allSettled(tabs.filter(tab => logIsFollowing(tab) && !tab.logPage).map(tab => loadGoalLogTail(tab, { redraw: false, tail: true })));
+    if (tabs.some(logIsFollowing)) scheduleToolbarLogTail();
+  }, 1500);
+  toolbarLogTimer?.unref?.();
+}
+async function loadGoalLogTail(tab, { redraw = true, tail = false } = {}) {
+  const sequence = (tab.logRequest || 0) + 1;
+  if (tail && tab.logsLoading) return;
+  tab.logRequest = sequence;
+  const generation = typeof captureNodeContextGeneration === "function" ? captureNodeContextGeneration() : null;
   tab.logsLoading = true;
   tab.logsError = "";
-  if (redraw && chatState.tabs[chatState.activeTabId] === tab) drawToolbar();
-  const params = new URLSearchParams({
-    goal_id: tab.goalId,
-    limit: String(GOAL_LOG_TAIL_LIMIT),
-    offset: "0",
-    sort: "datetime",
-    // Fetch the newest page, then mergeGoalLogEntries presents it oldest-first.
-    dir: "desc",
-  });
+  const activeTab = currentToolbarTab();
+  if (redraw && (activeTab === tab || (activeTab?.mode === "system" && tab === systemOperationState.logTab))) {
+    const status = $("#toolbar-dock")?.querySelector('[data-testid="goal-log-status"]');
+    if (status) status.textContent = "Searching retained logs…";
+  }
+  const params = new URLSearchParams({ archive: "1", limit: String(GOAL_LOG_TAIL_LIMIT), offset: String((tab.logPage || 0) * GOAL_LOG_TAIL_LIMIT), sort: "datetime", dir: "desc" });
+  if (tab.goalId) params.set("goal_id", tab.goalId);
+  if (tab.logQuery) params.set("q", tab.logQuery);
+  for (const [key, value] of Object.entries(tab.logFilters || {})) if (value) params.set(key, value);
+  if (tail) params.set("tail", "1");
   try {
-    const data = await api("GET", `/api/activity?${params}`);
-    // Preserve SSE entries that may arrive while the historical request is in flight.
-    tab.logEntries = mergeGoalLogEntries(data.activity, tab.logEntries);
+    const data = tail
+      ? await api("POST", `/api/activity/tail?${params}`, { cursors: tab.logCursors || {} }, { recordError: false })
+      : await api("GET", `/api/activity?${params}`, undefined, { recordError: false });
+    if (tab.logRequest !== sequence || (generation !== null && !isNodeContextGenerationCurrent(generation))) return;
+    const previousIds = new Set(normalizeGoalLogEntries(tab.logEntries).map(goalLogEntryKey));
+    if (tail && typeof tab.logTotal === "number") tab.logTotal += normalizeGoalLogEntries(data.activity).filter(entry => !previousIds.has(goalLogEntryKey(entry))).length;
+    tab.logEntries = tail ? mergeGoalLogEntries(tab.logEntries, data.activity) : mergeGoalLogEntries(data.activity);
+    tab.logCursors = data.cursors || {};
+    if (!tail) { tab.logTotal = data.page?.total; tab.logHasMore = data.page?.has_more; }
+    tab.archiveLoaded = true;
     tab.logsLoaded = true;
   } catch (error) {
-    tab.logsError = error?.message || "Could not load Goal logs.";
+    if (tab.logRequest === sequence) tab.logsError = error?.message || "Could not load logs.";
   } finally {
-    tab.logsLoading = false;
-    saveChatStateToStorage();
-    if (chatState.tabs[chatState.activeTabId] === tab) drawToolbar();
+    if (tab.logRequest === sequence) {
+      tab.logsLoading = false;
+      saveChatStateToStorage();
+      const visible = currentToolbarTab();
+      if (visible === tab || (visible?.mode === "system" && tab === systemOperationState.logTab)) {
+        const root = $("#toolbar-dock");
+        if (redraw || !updateGoalLogPanel(root, tab)) drawToolbar();
+      }
+      if (logIsFollowing(tab)) scheduleToolbarLogTail();
+    }
   }
 }
 
@@ -793,7 +689,7 @@ function handleGoalLogSseEvent(entry) {
   const goalId = String(entry?.goal_id || "");
   if (!goalId) return;
   const tab = chatState.tabs[goalLogTabId(goalId)];
-  if (!tab || tab.mode !== "goal_logs") return;
+  if (!tab || tab.mode !== "goal_logs" || !logIsFollowing(tab) || tab.archiveLoaded) return;
   const entries = normalizeGoalLogEntries(tab.logEntries);
   const key = goalLogEntryKey(entry);
   if (entries.some((candidate) => goalLogEntryKey(candidate) === key)) return;
@@ -806,21 +702,18 @@ function handleGoalLogSseEvent(entry) {
   }
 }
 
-function renderGoalLogPanel(tab) {
+function renderGoalLogPanel(tab, navigation = "") {
   const order = normalizeGoalLogOrder(tab.logOrder);
   const query = String(tab.logQuery || "");
+  const isSystem = tab.mode === "system";
+  const following = logIsFollowing(tab);
   return `
-    <div class="goal-log-panel" data-testid="toolbar-goal-log-panel">
+    <div class="goal-log-panel" data-testid="${isSystem ? "toolbar-system-panel" : "toolbar-goal-log-panel"}">
       <div class="goal-log-header">
-        <span class="goal-log-live" aria-label="Following live Goal logs"><span aria-hidden="true"></span>Following</span>
-        <a class="chat-goal-link"
-           href="#/goals/${encodeURIComponent(tab.goalId)}"
-           data-testid="goal-log-goal-link">
-          Goal ${htmlEscape(tab.goalId.slice(0, 10))}…
-        </a>
-        <a class="chat-goal-link"
-           href="#/logs?goal_id=${encodeURIComponent(tab.goalId)}"
-           data-testid="goal-log-full-link">Open full logs</a>
+        ${isSystem ? navigation + renderToolbarSyncHealth() : ""}
+        <button class="secondary small" type="button" id="btn-log-follow" aria-pressed="${following}" data-testid="log-follow">${following ? "Stop tail" : "Start tail"}</button>
+        <span class="muted small">${following ? "Following new output" : isSystem ? "Normal system events continue" : "Tail stopped"}</span>
+        ${!isSystem ? `<a class="chat-goal-link" href="#/goals/${encodeURIComponent(tab.goalId)}" data-testid="goal-log-goal-link">Goal ${htmlEscape(tab.goalId)}</a>` : ""}
         <span class="spacer"></span>
         <span class="muted small" data-testid="goal-log-status">${htmlEscape(goalLogStatus(tab))}</span>
         <button class="secondary small" type="button" id="btn-goal-log-refresh"
@@ -830,22 +723,28 @@ function renderGoalLogPanel(tab) {
         <label class="goal-log-search" for="goal-log-search">
           <span aria-hidden="true">${toolbarIcon("search")}</span>
           <input type="search" id="goal-log-search" value="${htmlEscape(query)}"
-                 autocomplete="off" placeholder="Search this trail"
-                 data-testid="goal-log-search" aria-label="Search Goal logs">
+                 autocomplete="off" placeholder="Search all retained messages, details, and output…"
+                 data-testid="goal-log-search" aria-label="Search logs">
         </label>
         <button class="secondary small goal-log-clear" type="button" id="btn-goal-log-clear"
                 data-testid="goal-log-search-clear" ${query ? "" : "disabled"}>Clear</button>
         <div class="goal-log-order" role="group" aria-label="Log stream order">
           <button class="secondary small ${order === "head" ? "active" : ""}" type="button"
                   data-goal-log-order="head" data-testid="goal-log-order-head"
-                  aria-pressed="${order === "head"}" title="Newest entries first">Head</button>
+                  aria-pressed="${order === "head"}" title="Newest entries first">Newest first</button>
           <button class="secondary small ${order === "tail" ? "active" : ""}" type="button"
                   data-goal-log-order="tail" data-testid="goal-log-order-tail"
-                  aria-pressed="${order === "tail"}" title="Newest entries last">Tail</button>
+                  aria-pressed="${order === "tail"}" title="Newest entries last">Newest last</button>
         </div>
       </div>
+      <div class="goal-log-controls log-filters">
+        ${[["log_type", "Type", ["event", "round", "operation", "api", "stdout", "stderr"]], ["severity", "Severity", ["info", "warn", "error", "unknown"]]].map(([key, label, values]) => `<label>${label}<select data-log-filter="${key}" aria-label="${label}"><option value="">All</option>${values.map(value => `<option value="${value}" ${tab.logFilters?.[key] === value ? "selected" : ""}>${({ event: "Application", round: "Round", operation: "Operation", api: "API", stdout: "Stdout", stderr: "Stderr", unknown: "Unclassified" })[value] || value}</option>`).join("")}</select></label>`).join("")}
+        ${[["category", "Category"], ["actor", "Actor"], ["process_id", "Process"]].map(([key,label]) => `<label>${label}<input type="text" data-log-filter="${key}" aria-label="${label}" value="${htmlEscape(tab.logFilters?.[key] || "")}" placeholder="Any ${label.toLowerCase()}"></label>`).join("")}
+        <button class="secondary small" data-log-page="newer" ${!tab.logPage ? "disabled" : ""}>Newer</button>
+        <button class="secondary small" data-log-page="older" ${!tab.logHasMore ? "disabled" : ""}>Older</button>
+      </div>
       <div class="goal-log-tail" id="goal-log-tail" role="log" aria-live="polite"
-           aria-label="Live logs for Goal ${htmlEscape(tab.goalId)}"
+           aria-label="${isSystem ? "System logs" : `Logs for Goal ${htmlEscape(tab.goalId)}`}"
            data-testid="goal-log-tail">
         <div id="goal-log-lines">${renderGoalLogLines(tab)}</div>
       </div>
@@ -856,6 +755,7 @@ function goalLogStatus(tab) {
   if (tab.logsLoading) return "Loading…";
   if (tab.logsError) return tab.logsError;
   const total = normalizeGoalLogEntries(tab.logEntries).length;
+  if (typeof tab.logTotal === "number") return `${total} shown · ${tab.logTotal} matches in retained history · page ${(tab.logPage || 0) + 1}`;
   const visible = visibleGoalLogEntries(tab).length;
   return String(tab.logQuery || "").trim()
     ? `${visible} of ${total} matching ${total === 1 ? "entry" : "entries"}`
@@ -864,30 +764,41 @@ function goalLogStatus(tab) {
 
 function renderGoalLogLines(tab) {
   const entries = visibleGoalLogEntries(tab);
-  if (entries.length) return entries.map(renderGoalLogLine).join("");
+  if (entries.length) return entries.map(entry => renderGoalLogLine(entry, tab.logQuery)).join("");
   if (tab.logsError) {
     return `<div class="goal-log-empty" data-testid="goal-log-empty">${htmlEscape(tab.logsError)}</div>`;
   }
   const query = String(tab.logQuery || "").trim();
   return `<div class="goal-log-empty" data-testid="goal-log-empty">${query
-    ? `No recent logs match “${htmlEscape(query)}”.`
-    : "Waiting for Goal activity."}</div>`;
+    ? `No logs match “${htmlEscape(query)}”.`
+    : tab.mode === "system" ? "Waiting for system activity. Start tail to include raw agent and process output." : "Waiting for Goal activity."}</div>`;
 }
 
-function renderGoalLogLine(entry) {
+function highlightLogText(value, query) {
+  const text = String(value || ""), needle = String(query || "").trim().toLowerCase();
+  if (!needle) return htmlEscape(text);
+  let result = "", start = 0, index;
+  while ((index = text.toLowerCase().indexOf(needle, start)) !== -1) {
+    result += htmlEscape(text.slice(start, index)) + "<mark>" + htmlEscape(text.slice(index, index + needle.length)) + "</mark>";
+    start = index + needle.length;
+  }
+  return result + htmlEscape(text.slice(start));
+}
+function renderGoalLogLine(entry, query = "") {
   const severity = normalizeSystemLogStatus(entry.severity);
   const details = goalLogDetailsText(entry.details);
   const actor = String(entry.actor || "").trim();
   return `
     <div class="goal-log-line goal-log-${htmlEscape(severity)}" data-testid="goal-log-line">
-      <span class="goal-log-time">${htmlEscape(formatSystemLogTime(entry.datetime))}</span>
+      <span class="goal-log-time" title="${htmlEscape(entry.timestamp_kind === "file_modified" ? `Approximate: log file last updated ${entry.datetime}; raw output has no recorded line timestamp` : entry.timestamp_kind === "received" ? `Received ${entry.datetime}; raw output has no recorded line timestamp` : entry.datetime || "")}">${htmlEscape(formatSystemLogTime(entry.datetime))}</span>
       <span class="goal-log-severity">[${htmlEscape(entry.severity || "info")}]</span>
+      ${entry.log_type ? `<span class="goal-log-type">[${htmlEscape(entry.log_type)}]</span>` : ""}
+      ${entry.process_id ? `<span class="goal-log-process">[${htmlEscape(entry.process_id)}]</span>` : ""}
       <span class="goal-log-category">[${htmlEscape(entry.category || "activity")}]</span>
       ${actor ? `<span class="goal-log-actor">[${htmlEscape(actor)}]</span>` : ""}
-      <span class="goal-log-message">
-        ${mdInline(String(entry.message || ""))}${renderGoalLogActions(entry.actions)}
-        ${details ? `<details><summary>Details</summary><pre>${htmlEscape(details)}</pre></details>` : ""}
-      </span>
+      ${entry.goal_id ? `<a class="goal-log-goal" href="#/goals/${encodeURIComponent(entry.goal_id)}">${htmlEscape(entry.goal_id)}</a>` : ""}
+      ${entry.round ? `<span class="goal-log-round">[Round ${htmlEscape(entry.round)}]</span>` : ""}
+      <span class="goal-log-message">${query ? highlightLogText(entry.message, query) : mdInline(String(entry.message || ""))}${renderGoalLogActions(entry.actions)}${details ? `<pre class="log-inline-details">${highlightLogText(details, query)}</pre>` : ""}</span>
     </div>`;
 }
 
@@ -915,14 +826,36 @@ function updateGoalLogPanel(root, tab) {
   const lines = root.querySelector("#goal-log-lines");
   const status = root.querySelector('[data-testid="goal-log-status"]');
   if (!lines || !status) return false;
+  const viewport = root.querySelector("#goal-log-tail");
+  const pinned = viewport && viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 40;
   renderInto(lines, renderGoalLogLines(tab));
   status.textContent = goalLogStatus(tab);
-  scrollGoalLogEdge(tab, root.querySelector("#goal-log-tail"));
+  const older = root.querySelector('[data-log-page="older"]');
+  const newer = root.querySelector('[data-log-page="newer"]');
+  if (older) older.disabled = !tab.logHasMore;
+  if (newer) newer.disabled = !tab.logPage;
+  if (pinned && logIsFollowing(tab)) scrollGoalLogEdge(tab, viewport);
   return true;
 }
 
 function bindGoalLogPanel(root, boundTab) {
-  const liveTab = () => currentToolbarTab() || boundTab;
+  const liveTab = () => boundTab.mode === "system" ? systemOperationState.logTab : boundTab;
+  let searchTimer;
+  const reload = () => {
+    const tab = liveTab(); tab.logPage = 0; tab.logCursors = {}; tab.logRequest = (tab.logRequest || 0) + 1; tab.logsLoading = false;
+    clearTimeout(searchTimer); searchTimer = setTimeout(() => loadGoalLogTail(tab), 250);
+  };
+  bindOnce(root.querySelector("#btn-log-follow"), "click", () => {
+    const tab = liveTab(); tab.logFollowing = !logIsFollowing(tab); tab.logRequest = (tab.logRequest || 0) + 1; tab.logsLoading = false;
+    if (tab.logFollowing) { tab.logPage = 0; loadGoalLogTail(tab, { tail: true }); }
+    drawToolbar();
+  });
+  root.querySelectorAll("[data-log-filter]").forEach(input => bindOnce(input, input.tagName === "SELECT" ? "change" : "input", () => {
+    const tab = liveTab(); tab.logFilters = { ...tab.logFilters, [input.dataset.logFilter]: input.value }; reload();
+  }));
+  root.querySelectorAll("[data-log-page]").forEach(button => bindOnce(button, "click", () => {
+    const tab = liveTab(); tab.logFollowing = false; tab.logPage = Math.max(0, (tab.logPage || 0) + (button.dataset.logPage === "older" ? 1 : -1)); loadGoalLogTail(tab);
+  }));
   bindOnce(root.querySelector("#btn-goal-log-refresh"), "click", () => {
     liveTab().logsLoaded = false;
     loadGoalLogTail(liveTab());
@@ -931,12 +864,15 @@ function bindGoalLogPanel(root, boundTab) {
   const clear = root.querySelector("#btn-goal-log-clear");
   bindOnce(search, "input", (event) => {
     liveTab().logQuery = event.currentTarget.value;
+    reload();
     if (clear) clear.disabled = !liveTab().logQuery;
     updateGoalLogPanel(root, liveTab());
     saveChatStateToStorage();
   });
   bindOnce(clear, "click", () => {
     liveTab().logQuery = "";
+    liveTab().logFilters = {};
+    reload();
     if (search) {
       search.value = "";
       search.focus();
@@ -970,11 +906,14 @@ function recordSystemOperation(payload, redraw = true) {
   if (!item.message) return;
   if (isDuplicateSystemOperation(item)) return;
   systemOperationState.messages.push(item);
+  const tab = systemOperationState.logTab;
+  const entry = { ...item, id: payload?.details?.activity_id || `system:${item.timestamp}:${item.message}`, datetime: item.timestamp, goal_id: payload?.details?.goal_id, severity: ["warn", "error"].includes(item.status) ? item.status : "info", details: item.details, operation_status: item.status, log_type: "event" };
+  if (!tab.logPage) tab.logEntries = mergeGoalLogEntries(tab.logEntries, [entry]);
   if (systemOperationState.messages.length > SYSTEM_OPERATION_LOG_LIMIT) {
     systemOperationState.messages = systemOperationState.messages.slice(-SYSTEM_OPERATION_LOG_LIMIT);
   }
   if (redraw && chatState.open && currentToolbarTab()?.mode === "system") {
-    drawToolbar();
+    if (!updateGoalLogPanel($("#toolbar-dock"), tab)) drawToolbar();
   }
 }
 
@@ -994,121 +933,69 @@ function isDuplicateSystemOperation(item) {
   });
 }
 
-function renderSystemPanel() {
-  const messages = systemOperationState.messages.slice(-SYSTEM_OPERATION_LOG_LIMIT);
-  const activeFilters = activeSystemLogFilters(messages);
-  const visibleMessages = !activeFilters.size
-    ? messages
-    : messages.filter((item) => activeFilters.has(item.status));
-  const countLabel = !activeFilters.size
-    ? `${messages.length} / ${SYSTEM_OPERATION_LOG_LIMIT}`
-    : `${visibleMessages.length} of ${messages.length}`;
-  return `
-    <div class="system-panel" data-testid="toolbar-system-panel">
-      <div class="system-panel-header" data-testid="toolbar-system-header">
-        <span>System operations</span>
-        ${renderSystemLogFilters(messages, activeFilters)}
-        <span class="muted small" data-testid="system-log-count">${countLabel}</span>
-      </div>
-      <div class="system-log" role="log" aria-live="polite" aria-label="Recent system operations"
-           data-testid="system-log">
-        ${visibleMessages.length
-          ? visibleMessages.map(renderSystemLogLine).join("")
-          : `<div class="system-log-empty" data-testid="system-log-empty">${activeFilters.size || messages.length ? "No system activity matches this filter." : "Waiting for system activity."}</div>`}
-      </div>
-    </div>`;
+let toolbarSystemDashboard = null;
+let toolbarSystemDiagnosticsOpen = false;
+let toolbarSyncHealth = { generation: null, status: null, request: 0 };
+
+function renderToolbarSyncHealth() {
+  const current = toolbarSyncHealth.generation === captureNodeContextGeneration();
+  const status = current ? toolbarSyncHealth.status : null;
+  const label = status === null ? "Checking…" : status === "healthy" ? "Healthy" : "Unhealthy";
+  return `<span class="toolbar-sync-health ${status === "healthy" ? "healthy" : status ? "unhealthy" : ""}"
+    data-testid="toolbar-sync-health" role="status" aria-label="State sync: ${label}">State sync: ${label}</span>`;
 }
 
-function renderSystemLogFilters(messages, activeFilters) {
-  const options = systemLogFilterOptions(messages);
-  return `
-    <div class="system-log-filters" aria-label="Filter system operations">
-      <label class="system-log-filter${!activeFilters.size ? " active" : ""}">
-        <input type="checkbox"
-               data-system-log-filter="all"
-               data-testid="system-log-filter-all"
-               ${!activeFilters.size ? "checked" : ""}
-               aria-label="Show all system operations">
-        <span>All</span>
-      </label>
-      ${options.map((option) => `
-        <label class="system-log-filter system-log-filter-${option.status}${activeFilters.has(option.status) ? " active" : ""}">
-          <input type="checkbox"
-                 data-system-log-filter="${htmlEscape(option.status)}"
-                 data-testid="system-log-filter-${htmlEscape(option.status)}"
-                 ${activeFilters.has(option.status) ? "checked" : ""}
-                 aria-label="Show ${htmlEscape(option.label.toLowerCase())} system operations">
-          <span>${htmlEscape(option.label)}</span>
-        </label>`).join("")}
-    </div>`;
-}
-
-function systemLogFilterOptions(messages) {
-  const options = [...SYSTEM_LOG_FILTERS];
-  const knownStatuses = new Set(options.map((option) => option.status));
-  for (const item of messages) {
-    if (knownStatuses.has(item.status)) continue;
-    knownStatuses.add(item.status);
-    options.push({ status: item.status, label: systemLogStatusLabel(item.status) });
+async function refreshToolbarSyncHealth(force = false) {
+  const generation = captureNodeContextGeneration();
+  if (!force && toolbarSyncHealth.generation === generation) return;
+  const request = toolbarSyncHealth.request + 1;
+  toolbarSyncHealth = { generation, status: null, request };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const dashboard = await api("GET", "/api/dashboard?node=current", undefined, { recordError: false, cache: false, signal: controller.signal });
+    if (!isNodeContextGenerationCurrent(generation) || toolbarSyncHealth.request !== request) return;
+    toolbarSystemDashboard = dashboard;
+    toolbarSyncHealth.status = dashboard.state_sync_health?.status || "unknown";
+    await reconcileSystemStateRecovery(dashboard);
+    if (!isNodeContextGenerationCurrent(generation) || toolbarSyncHealth.request !== request) return;
+  } catch {
+    if (!isNodeContextGenerationCurrent(generation) || toolbarSyncHealth.request !== request) return;
+    toolbarSystemDashboard = { needs_attention: [{ kind: "banner", message: "System diagnostics are unavailable. Retry to check current health." }] };
+    toolbarSyncHealth.status = "unknown";
+  } finally {
+    clearTimeout(timeout);
   }
-  return options;
+  const label = document.querySelector('[data-testid="toolbar-sync-health"]');
+  if (label) label.outerHTML = renderToolbarSyncHealth();
+  if (currentToolbarTab()?.mode === "system" && toolbarSystemDiagnosticsOpen) drawToolbar();
 }
 
-function activeSystemLogFilters(messages) {
-  const knownStatuses = new Set(systemLogFilterOptions(messages).map((option) => option.status));
-  return new Set([...systemOperationState.filters].filter((status) => knownStatuses.has(status)));
-}
-
-function bindSystemPanel(root) {
-  $$("[data-system-log-filter]", root).forEach((el) => {
-    bindOnce(el, "change", () => {
-      const filter = el.dataset.systemLogFilter || "all";
-      if (filter === "all") {
-        systemOperationState.filters.clear();
-      } else if (systemOperationState.filters.has(filter)) {
-        systemOperationState.filters.delete(filter);
-      } else {
-        systemOperationState.filters.add(filter);
-      }
-      saveChatStateToStorage();
-      drawToolbar();
-    });
-  });
-}
-
-function systemLogStatusLabel(status) {
-  return String(status || "info")
-    .split(/[-_]+/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ") || "Info";
-}
-
-function renderSystemLogLine(item) {
-  const time = formatSystemLogTime(item.timestamp);
-  const details = systemOperationDetailEntries(item.details);
-  return `
-    <div class="system-log-line system-log-${item.status}"
-         data-testid="system-log-line"
-         data-system-log-status="${htmlEscape(item.status)}"
-         data-system-log-category="${htmlEscape(item.category)}">
-      <time class="system-log-time" datetime="${htmlEscape(item.timestamp)}" title="${htmlEscape(item.timestamp)}">${htmlEscape(time)}</time>
-      <div class="system-log-body">
-        <div class="system-log-headline">
-          <span class="system-log-status" data-testid="system-log-status">${htmlEscape(systemLogStatusLabel(item.status))}</span>
-          <span class="system-log-category" data-testid="system-log-category">${htmlEscape(item.category)}</span>
-          <span class="system-log-message" data-testid="system-log-message">${htmlEscape(item.message)}</span>
-        </div>
-        ${details.length ? `
-          <dl class="system-log-details" data-testid="system-log-details">
-            ${details.map(([key, value]) => `
-              <div class="system-log-detail" data-testid="system-log-detail">
-                <dt>${htmlEscape(key)}</dt>
-                <dd>${htmlEscape(value)}</dd>
-              </div>`).join("")}
-          </dl>` : ""}
-      </div>
-    </div>`;
+function renderSystemPanel() {
+  const dashboard = toolbarSyncHealth.generation === captureNodeContextGeneration() ? toolbarSystemDashboard : null;
+  const issues = (dashboard?.needs_attention || []).filter(item => item.kind === "banner");
+  const unhealthy = issues.some(item => item.severity !== "info");
+  const navigation = `<div class="goal-log-header system-diagnostics-nav">
+    <button class="secondary small" data-system-diagnostics aria-pressed="${toolbarSystemDiagnosticsOpen}">${toolbarSystemDiagnosticsOpen ? "View logs" : `Diagnostics${unhealthy ? " · Unhealthy" : ""}`}</button>
+    ${toolbarSystemDiagnosticsOpen ? renderToolbarSyncHealth() : ""}
+    ${toolbarSystemDiagnosticsOpen ? '<button class="secondary small" data-system-refresh>Refresh</button>' : ""}
+  </div>`;
+  if (!toolbarSystemDiagnosticsOpen) return renderGoalLogPanel(systemOperationState.logTab, navigation);
+  const health = dashboard?.state_sync_health;
+  return navigation + `<div class="system-diagnostics" data-testid="system-diagnostics">
+    ${issues.map(item => `<p>${htmlEscape(item.message || "")}</p>`).join("") || `<p class="muted">${dashboard ? "No system issues reported." : "Checking system health…"}</p>`}
+    ${dashboard?.workflow_health && !issues.some(item => item.workflow_health) ? `<p>Workflow: ${htmlEscape(dashboard.workflow_health.state || "unknown")}${dashboard.workflow_health.reason ? ` — ${htmlEscape(dashboard.workflow_health.reason)}` : ""}</p>` : ""}
+    ${health ? `<dl class="system-recovery-evidence">${[
+      ["Last attempt", health.last_attempt_at], ["Attempt", health.last_attempt_id],
+      ["Source", health.last_attempt_source], ["Last success", health.last_success_at],
+      ["Failure since", health.failure_since], ["Stale since", health.stale_since],
+      ["Conflict report", health.last_conflict_report_id], ["Report location", health.last_conflict_report_location],
+    ].map(([label, value]) => systemRecoveryField(label, value)).join("")}</dl>` : ""}
+    ${health?.last_error ? `<p>${htmlEscape(health.last_error)}</p>` : ""}
+    ${dashboard?.aggregate_counts_authoritative === false ? '<p>All-node counts may be out of date.</p>' : ""}
+    <a href="#/settings/runtime">Runtime settings</a> · <a href="#/settings/workflow">Workflow settings</a>
+    ${dashboard ? renderSystemStateRecovery(dashboard) : ""}
+  </div>`;
 }
 
 function systemOperationDetailEntries(details) {
@@ -1254,7 +1141,7 @@ async function startTerminalSession(tab = currentToolbarTab()) {
   const terminal = terminalStateFor(tabId);
   if (!terminal || terminal.loading || terminal.stopping || terminal.connected) return;
   terminal.loading = true;
-  terminal.clipboard = null;
+  resetTerminalClipboard(terminal);
   terminal.error = "";
   drawToolbar();
   try {
@@ -1266,7 +1153,7 @@ async function startTerminalSession(tab = currentToolbarTab()) {
       goal_id: tab.goalId || undefined,
       feature_id: tab.featureId || undefined,
       initial_prompt: tab.initialPrompt || undefined,
-      ...(tab.mode === "skill" ? {skill_id: tab.skillLaunch?.id, parameters: tab.skillLaunch?.parameters || {}} : {}),
+      ...(tab.mode === "skill" ? {skill_id: tab.skillLaunch?.id, parameters: tab.skillLaunch?.parameters || {}, hub_id: tab.skillLaunch?.hubId || null} : {}),
       worktree: tab.mode === "standalone" ? tab.worktree || undefined : undefined,
     });
     // Goal attachment is runtime-owned. Keep the tab in its loading state
@@ -1276,9 +1163,9 @@ async function startTerminalSession(tab = currentToolbarTab()) {
       ? await waitForBackgroundOperation(queued.operation, { timeoutMs: 3000 })
       : queued;
     terminal.eventSource?.close();
+    resetTerminalClipboard(terminal);
     terminal.term?.dispose();
     terminal.term = null;
-    terminal.clipboard = null;
     terminal.display = "";
     terminal.historyReplayPending = false;
     terminal.sessionId = result.id || "";
@@ -1407,6 +1294,7 @@ async function reattachTerminalSession(tab = currentToolbarTab(), existingTermin
         refreshProcessesTabForChatChange();
       }
       if (chatState.activeTabId === tabId) drawToolbar();
+      else if (typeof renderWindowNavigation === "function") renderWindowNavigation();
       return terminal.connected;
     } catch (error) {
       if (terminal.sessionId !== sessionId || terminal.stopping) return false;
@@ -1424,6 +1312,7 @@ async function reattachTerminalSession(tab = currentToolbarTab(), existingTermin
         terminal.error = `Unable to reattach terminal: ${error?.message || String(error)}`;
       }
       if (chatState.activeTabId === tabId) drawToolbar();
+      else if (typeof renderWindowNavigation === "function") renderWindowNavigation();
       return false;
     } finally {
       terminal.attachmentPromise = null;
@@ -1454,18 +1343,21 @@ function connectTerminalEvents(tab = currentToolbarTab()) {
       tab.attentionMessage = terminal.attentionMessage;
       saveChatStateToStorage();
       if (chatState.activeTabId === tabId) drawToolbar();
+      else if (typeof renderWindowNavigation === "function") renderWindowNavigation();
     } catch {}
   });
   bindOnce(source, "terminal_error", (event) => {
     handleTerminalEvent(event, terminal);
     terminal.error = "Terminal stream error.";
     if (chatState.activeTabId === tabId) drawToolbar();
+      else if (typeof renderWindowNavigation === "function") renderWindowNavigation();
   });
   bindOnce(source, "terminal_exit", (event) => {
     handleTerminalEvent(event, terminal);
     finishTerminalExit(tab, terminal);
     refreshProcessesTabForChatChange();
     if (chatState.activeTabId === tabId) drawToolbar();
+      else if (typeof renderWindowNavigation === "function") renderWindowNavigation();
   });
   source.onerror = () => {
     if (terminal.exited || terminal.eventSource !== source) return;
@@ -1478,6 +1370,7 @@ function connectTerminalEvents(tab = currentToolbarTab()) {
     terminal.reattaching = true;
     void reattachTerminalSession(tab, terminal);
     if (chatState.activeTabId === tabId) drawToolbar();
+      else if (typeof renderWindowNavigation === "function") renderWindowNavigation();
   };
 }
 
@@ -1732,7 +1625,7 @@ function ensureTerminalRenderer(output, tab = currentToolbarTab()) {
   if (terminal.term) {
     terminal.term.dispose();
     terminal.term = null;
-    terminal.clipboard = null;
+    resetTerminalClipboard(terminal);
   }
   const size = terminalSize(output, terminal);
   // Opening xterm against a hidden host bakes transient minimum dimensions
@@ -1762,6 +1655,7 @@ function ensureTerminalRenderer(output, tab = currentToolbarTab()) {
   term.attachCustomKeyEventHandler?.(
     (event) => handleTerminalCustomKeyEvent(event, terminal, tab, term),
   );
+  resetTerminalClipboard(terminal);
   terminal.term = term;
   bindTerminalClipboardEvents(terminal);
   resizeTerminalRenderer(output, terminal);
@@ -2571,10 +2465,7 @@ async function openFilesToolbar(options = {}) {
       sessionId: null,
     };
   }
-  chatState.activeTabId = tabId;
-  chatState.open = true;
-  saveChatStateToStorage();
-  drawToolbar();
+  await activateToolbarTab(tabId);
   const opts = typeof options === "string" ? { path: options } : options;
   const path = String(opts.path || "");
   const search = String(opts.search || "").trim();
@@ -2756,62 +2647,10 @@ function parentPath(path) {
   return parts.join("/");
 }
 
-function wireToolbarResize(root) {
-  const handle = root.querySelector("#toolbar-dock-resize");
-  const body = root.querySelector(".toolbar-dock-body");
-  if (!handle || !body) return;
-  bindOnce(handle, "pointerdown", (e) => {
-    if (!chatState.open) return;
-    e.preventDefault();
-    finishToolbarResize();
-    toolbarResizeGesture = {
-      root,
-      pointerId: e.pointerId,
-      startY: e.clientY,
-      startHeight: body.getBoundingClientRect().height,
-    };
-    root.classList.add("resizing");
-    // The Toolbar redraws for terminal lifecycle events. Keep the gesture on
-    // document so replacing the resize handle cannot strand pointer capture.
-    document.addEventListener("pointermove", moveToolbarResize);
-    document.addEventListener("pointerup", finishToolbarResize);
-    document.addEventListener("pointercancel", finishToolbarResize);
-  });
-}
-
-function moveToolbarResize(event) {
-  const gesture = toolbarResizeGesture;
-  if (!gesture || event.pointerId !== gesture.pointerId) return;
-  const body = gesture.root.querySelector(".toolbar-dock-body");
-  if (!body) return;
-  // Drag up grows the panel; drag down shrinks it.
-  const next = clampToolbarBodyHeight(
-    gesture.startHeight + (gesture.startY - event.clientY),
-  );
-  body.style.height = next + "px";
-  chatState.bodyHeight = next;
-  if (toolbarTabUsesTerminal(currentToolbarTab())) resizeTerminalRenderer();
-}
-
-function finishToolbarResize(event = null) {
-  const gesture = toolbarResizeGesture;
-  if (!gesture || (event?.pointerId != null && event.pointerId !== gesture.pointerId)) return;
-  toolbarResizeGesture = null;
-  document.removeEventListener("pointermove", moveToolbarResize);
-  document.removeEventListener("pointerup", finishToolbarResize);
-  document.removeEventListener("pointercancel", finishToolbarResize);
-  gesture.root.classList.remove("resizing");
-  saveChatStateToStorage();
-  scheduleActiveTerminalFit();
-}
-
-function wireChatDockResize(root) { wireToolbarResize(root); }
-
-// Back-compat alias used by helpers below; thin wrapper.
 function drawChat() { drawToolbar(); }
 
 function refreshProcessesTabForChatChange() {
-  if (state.currentRoute !== "node") return;
+  if (state.currentRoute !== "control") return;
   if (typeof readSettingsTab === "function" && readSettingsTab() !== "processes") return;
   if (typeof refreshSettings !== "function") return;
   refreshSettings().catch(() => {});
@@ -2828,7 +2667,7 @@ function handleToolbarTabClick(event, tabElement) {
   }
   const tabId = tabElement?.dataset?.tabId;
   if (!tabId) return;
-  return activateToolbarTab(tabId, { toggleIfActive: true });
+  return activateToolbarTab(tabId);
 }
 
 async function closeChatTab(tabId) {
@@ -2866,6 +2705,7 @@ async function closeChatTab(tabId) {
 function removeToolbarTab(tabId) {
   const currentTerminal = terminalStates.get(tabId);
   currentTerminal?.eventSource?.close();
+  resetTerminalClipboard(currentTerminal);
   currentTerminal?.term?.dispose();
   terminalStates.delete(tabId);
   delete chatState.tabs[tabId];
@@ -2874,6 +2714,7 @@ function removeToolbarTab(tabId) {
   }
   saveChatStateToStorage();
   drawChat();
+  if (typeof navigateAfterWindowClose === "function") navigateAfterWindowClose(tabId);
 }
 
 function removeToolbarTabsForStoppedProcess(processId, sessionId = "") {

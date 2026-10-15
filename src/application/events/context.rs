@@ -16,6 +16,7 @@ pub fn goal_context(goal: &Value) -> Value {
             "id",
             "name",
             "description",
+            "planning",
             "status",
             "node_id",
             "priority",
@@ -32,6 +33,8 @@ pub fn goal_context(goal: &Value) -> Value {
             "candidate_commit",
             "event_generation",
             "workflow_revision",
+            "round_edit_revision",
+            "workflow_context",
         ],
     );
     context["rounds"] = json!(

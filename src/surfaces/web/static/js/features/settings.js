@@ -2,6 +2,10 @@
 
 let _targetAppDraftDirty = false;
 
+async function renderControl() {
+  await renderSettingsSurface("control");
+}
+
 async function renderSettings() {
   await renderSettingsSurface("settings");
 }
@@ -44,6 +48,7 @@ async function refreshSettings(options = {}) {
     const nodeGeneration = captureNodeContextGeneration();
     const data = await loadSettingsSurfaceData(surface, activeSlug);
     if (!data || !isNodeContextGenerationCurrent(nodeGeneration)) return;
+    if (surface !== settingsSurfaceForRoute() || activeSlug !== readSettingsTab(surface)) return;
     drawSettingsSurface(surface, data, activeSlug);
   } catch (e) {
     const root = document.getElementById("settings-content");
@@ -76,6 +81,7 @@ async function refreshSettingsTab(slug, options = {}) {
     const nodeGeneration = captureNodeContextGeneration();
     const data = await loadSettingsSurfaceData(surface, activeSlug);
     if (!data || !isNodeContextGenerationCurrent(nodeGeneration)) return;
+    if (surface !== settingsSurfaceForRoute() || activeSlug !== readSettingsTab(surface)) return;
     updateSettingsTabContent(
       activeSlug,
       renderSettingsTabBody(surface, activeSlug, data),
@@ -96,7 +102,9 @@ async function loadSettingsSurfaceData() {
   updateActiveNodeLabel();
   if (project.attached === false) {
     enterNoProjectMode(project);
-    return detachedSettingsSurfaceData(project);
+    const data = detachedSettingsSurfaceData(project);
+    if (activeSlug === "workflow") data.workflow = await loadWorkflowSettings(true);
+    return data;
   }
   const needs = settingsSurfaceDataNeeds(surface, activeSlug);
   const [
@@ -135,7 +143,8 @@ async function loadSettingsSurfaceData() {
     </option>`).join("");
   return {
     noProject: false,
-    automation: needs.skills ? await loadAutomationSettings(activeSlug) : null,
+    workflow: activeSlug === "workflow" ? await loadWorkflowSettings() : null,
+    hub: activeSlug === "hubs" ? await api("GET", "/api/hub/sites") : null,
     s: settings,
     diag: diag || {},
     reps: state.reporters,
@@ -147,7 +156,8 @@ async function loadSettingsSurfaceData() {
     activeNodeLabel,
     processes: processes || {},
     source: source || {},
-    cli: (settings.agent_cli || "claude").toLowerCase(),
+    providers: s.providers || {},
+    cli: s.providers?.node_override || "",
     projectApps,
     currentProject,
     projectRegistryEnabled: project.registry_enabled !== false,
@@ -158,7 +168,6 @@ async function loadSettingsSurfaceData() {
 function settingsSurfaceDataNeeds(surface, slug) {
   const needs = {
     settings: false,
-    skills: false,
     diagnostics: false,
     reporters: false,
     dashboard: false,
@@ -170,7 +179,6 @@ function settingsSurfaceDataNeeds(surface, slug) {
   else if (slug === "reporters") { needs.reporters = true; needs.nodes = true; }
   else if (slug === "target-app" || slug === "runtime") { needs.settings = true; needs.nodes = true; }
   else if (slug === "processes") { needs.processes = true; needs.source = true; }
-  else if (slug === "skills") needs[slug] = true;
   return needs;
 }
 
@@ -411,9 +419,8 @@ function renderSettingsGuideIcon(itemId = "", title = "setting") {
             class="settings-guide-icon"
             data-guide-label-item="${htmlEscape(itemId)}"
             data-testid="settings-guide-${htmlEscape(itemId)}"
-            tabindex="-1"
-            title="Open Guide: ${htmlEscape(title)}"
-            aria-label="Open Guide for ${htmlEscape(title)}">
+            title="Open Refine Hub: ${htmlEscape(title)}"
+            aria-label="Open Refine Hub for ${htmlEscape(title)}">
       <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
         <circle cx="12" cy="12" r="9"></circle>
         <path d="M9.8 9.4a2.4 2.4 0 0 1 4.4 1.3c0 1.7-2.2 2.1-2.2 3.8"></path>
@@ -677,15 +684,21 @@ function bindSettingsMarkdownFields(root) {
 }
 
 const SETTINGS_SURFACES = {
+  control: {
+    title: "Control",
+    basePath: "#/control",
+    storageKey: "refine_control_tab",
+    tabs: [{ slug: "processes", label: "Processes" }],
+  },
   settings: {
     title: "Settings",
     basePath: "#/settings",
     storageKey: "refine_settings_tab",
     tabs: [
-      { slug: "processes", label: "Processes" },
-      { slug: "application", label: "Application" },
+      { slug: "application", label: "Nodes" },
       { slug: "reporters", label: "Reporters" },
-      { slug: "skills", label: "Skills" },
+      { slug: "workflow", label: "Prompts" },
+      { slug: "hubs", label: "Hubs" },
       { slug: "target-app", label: "Target App" },
       { slug: "runtime", label: "Runtime" },
     ],
@@ -704,7 +717,7 @@ function isSettingsRoute(route = state.currentRoute) {
 }
 
 function normalizeSettingsTab(slug, surface = settingsSurfaceForRoute()) {
-  if (["events", "releases"].includes(slug)) return "skills";
+  if (["skills", "templates", "events", "releases", "prompts"].includes(slug)) return "workflow";
   if (slug === "system") return "processes";
   if (slug === "agents") return "processes";
   if (surface === SETTINGS_SURFACES.settings && (slug === "application-config" || slug === "target-app-config")) {
@@ -756,13 +769,14 @@ function setSettingsTab(slug) {
   $$("[data-tab-pane]").forEach((pane) => {
     pane.classList.toggle("active", pane.dataset.tabPane === normalized);
   });
-  $$(".settings-tab").forEach((btn) => {
+  $$("#settings-tabs .settings-tab").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.tabTarget === normalized);
   });
 }
 
 
 function renderSettingsTabStrip(activeSlug, surface = settingsSurfaceForRoute()) {
+  if (surface === SETTINGS_SURFACES.control) return "";
   const releaseStatus = (surface === SETTINGS_SURFACES.settings)
     // The banner has its own authoritative read. Main settings redraws must not
     // morph this empty placeholder over its current status while that read is
@@ -792,13 +806,15 @@ function renderSettingsPane(slug, body, activeSlug) {
 }
 
 function bindSettingsTabHandlers() {
-  $$(".settings-tab", $("#settings-tabs")).forEach((btn) => {
+  $$("#settings-tabs .settings-tab").forEach((btn) => {
     bindOnce(btn, "click", () => {
       setSettingsTab(btn.dataset.tabTarget);
     });
   });
-  bindRuntimeUpgradeBanner();
-  refreshRuntimeUpgradeBanner();
+  if (settingsSurfaceForRoute() === SETTINGS_SURFACES.settings) {
+    bindRuntimeUpgradeBanner();
+    refreshRuntimeUpgradeBanner();
+  }
 }
 
 function renderSqliteCacheSection(error = null) {
@@ -857,6 +873,7 @@ function bindRebuildCacheHandler() {
 
 
 function renderSettingsTabBody(surface, slug, data) {
+  if (slug === "workflow") return renderWorkflowSettings(data.workflow);
   if (data.noProject) {
     if (surface === SETTINGS_SURFACES.settings && slug === "application") {
       return renderSettingsApplicationTab({
@@ -876,15 +893,13 @@ function renderSettingsTabBody(surface, slug, data) {
     }
     if (surface === SETTINGS_SURFACES.settings && slug === "runtime") {
       return renderDetachedNodeConfig(
-        renderNodeRuntimeConfigSections(data.s || {}, data.activeNodeLabel, data.cli || "claude"),
+        renderNodeRuntimeConfigSections(data.s || {}, data.activeNodeLabel, data.cli || "", data.providers),
       );
     }
     return renderSettingsNoProjectTab(surface.title);
   }
+  if (surface === SETTINGS_SURFACES.control) return renderProcessesTab(data.processes, data.source);
   if (surface === SETTINGS_SURFACES.settings) {
-    if (slug === "processes") {
-      return renderProcessesTab(data.processes, data.source);
-    }
     if (slug === "reporters") {
       return renderSettingsReportersTab(data.reps, data.activeNodeLabel);
     }
@@ -909,10 +924,10 @@ function renderSettingsTabBody(surface, slug, data) {
       });
     }
     if (slug === "runtime") {
-      return renderNodeRuntimeConfigSections(data.s, data.activeNodeLabel, data.cli);
+      return renderNodeRuntimeConfigSections(data.s, data.activeNodeLabel, data.cli, data.providers);
     }
   }
-  if (slug === "skills") return renderAutomationSettings(slug, data.automation);
+  if (slug === "hubs") return renderHubsSettings(data.hub);
   return `<p class="muted">Unknown settings tab.</p>`;
 }
 
@@ -921,7 +936,7 @@ function renderSettingsNoProjectTab(title = "Settings") {
     <section class="settings-section" data-testid="settings-no-project">
       <h3>No app configured.</h3>
       <p class="muted">Open the Guide to configure Refine and attach an app before using ${htmlEscape(title)} settings.</p>
-      <button type="button" class="secondary" data-settings-open-guide data-testid="settings-open-guide">Open Guide</button>
+      <button type="button" class="secondary" data-settings-open-guide data-testid="settings-open-guide">Open Refine Hub</button>
     </section>`;
 }
 
@@ -933,7 +948,7 @@ function renderDetachedNodeConfig(body) {
         Node configuration is shown for reference. Attach an app before saving
         application or runtime settings.
       </p>
-      <button type="button" class="secondary" data-settings-open-guide data-testid="settings-open-guide">Open Guide</button>
+      <button type="button" class="secondary" data-settings-open-guide data-testid="settings-open-guide">Open Refine Hub</button>
     </section>
     ${disableSettingsControls(body)}`;
 }
@@ -958,6 +973,7 @@ function bindSettingsNoProjectTab() {
 }
 
 function bindSettingsTabBody(surface, slug, data) {
+  if (slug === "workflow") { bindWorkflowSettings(data.workflow); return; }
   if (data.noProject) {
     if (surface === SETTINGS_SURFACES.settings && slug === "application") {
       bindSettingsApplicationTab(data.currentProject);
@@ -966,18 +982,18 @@ function bindSettingsTabBody(surface, slug, data) {
     }
     return;
   }
+  if (surface === SETTINGS_SURFACES.control) bindSettingsProcessesTab(data.source);
   if (surface === SETTINGS_SURFACES.settings) {
-    if (slug === "processes") bindSettingsProcessesTab(data.source);
-    else if (slug === "reporters") bindSettingsReportersTab();
+    if (slug === "reporters") bindSettingsReportersTab();
     else if (slug === "application") {
       bindSettingsApplicationTab(data.currentProject);
       bindSettingsNodesTab();
     }
     else if (slug === "target-app") bindNodeApplicationConfigControls();
-    else if (slug === "runtime") bindNodeRuntimeConfigControls();
+    else if (slug === "runtime") bindNodeRuntimeConfigControls(data.providers);
 
   }
-  if (slug === "skills") bindAutomationSettings(slug, data.automation);
+  if (slug === "hubs") bindHubsSettings();
 }
 
 function drawSettingsSurface(surface, data, activeSlugOverride = null) {

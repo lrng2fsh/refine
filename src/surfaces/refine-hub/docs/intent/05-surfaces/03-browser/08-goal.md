@@ -1,0 +1,72 @@
+# Goal
+
+## Key Ideas
+
+- **Atomic Work Unit**: a Goal is the basic unit of meaningful software change.
+- **Prompt-Driven**: every Goal should preserve a direct, actionable instruction for the agent.
+- **Round-Based Work**: repeated attempts, recovery, and follow-up instructions should be durable.
+- **Modal Detail**: detail should preserve the user's surrounding context.
+- **Human Control**: explicit workflow actions may override automated transition rules.
+
+## Purpose
+
+The Goal surface exists to create, inspect, update, discuss, implement, retry, review, and verify individual work items.
+
+It should make the work understandable to both humans and agents: what should be accomplished, what has been tried, what happened, and what can happen next.
+
+## Expected Role
+
+Each Round shows one read-only Implementation Plan card sourced from the
+authoritative Goal detail. The active phase and final checklist are primary;
+the original proposal and independent criticism remain expandable history.
+Phase timestamps, failures, verification, and per-item implementation outcomes
+make discrepancies inspectable without turning the browser into a planning
+state machine. Expanded Round and planning-history sections remain open across
+SSE-driven redraws.
+
+The browser never orchestrates or polls implementation planning. Existing Goal
+SSE and reconnect reconciliation deliver the same Round object observed by CLI,
+API, MCP, and exports, and Open Agent attaches to the active workflow phase.
+Between phase-process registrations it reports that Workflow is between phases
+and never launches a diagnostic substitute for a Goal active in Plan or Implement.
+
+The Goal UI should expose identity, status, priority, reporter, assignee, Feature membership, node ownership, notes, rounds, implementation reports, logs, governance, quality, chat, and workflow actions.
+
+Current implementation details that matter to intent:
+
+- Goals list uses URL-backed filters for status, reporter, assignee, Feature, rounds, node, severity, category, actor, sort, and page;
+- Goal details open as a modal over the current page;
+- a Goal owned by another node should offer **Transfer to my node** in the modal
+  action menu when the browser has an authoritative active-node context. The
+  action uses the shared single-item transfer capability; server-side workflow
+  and Feature-membership constraints remain authoritative, and rejected
+  transfers are surfaced without changing ownership;
+- failed Feature-blocking Goals should explain what they block and log user-visible notices to System;
+- new rounds can be submitted for failed or review states where shared rules allow it;
+- bulk operations should use shared work item behavior and preserve node/Feature constraints;
+- confirmed bulk actions should immediately acknowledge that Refine is working on them asynchronously, before the authoritative outcome is available;
+- the primary workflow action uses the same split-button layout as Open Agent: a button derived from the current Goal status (Backlog → Todo, Review → Done, Failed → Todo, Cancelled → Failed, with Todo for all other statuses) and a separate arrow menu, with every workflow step available from every Goal state. The primary action updates on every modal redraw, including live refreshes. Choosing a step invokes the shared human override, stops active Goal agents, and selects that exact step on the existing Round. Review → Done changes status without merging code; Review approval remains a separate integration action;
+- every Round has a subdued gray, accessible trash-can button. Confirmation describes full record deletion and stopping current work. After deletion the Goal is in Backlog; the user can select Todo to resubmit the remaining Round;
+- the bulk status picker includes Backlog, Todo, Plan, Implement, Quality, Governance, Review, Done, Failed, and Cancelled. Explicit assignment applies to active and terminal Goals and reports per-Goal failures. Automation continues to follow normal rules;
+- each implemented round should retain a timestamped, plain-language report of what changed, why, and the deterministic verification outcomes; the report should be visible with that round when the Goal opens.
+- Goals bulk actions should export all or a selected subset as Jira-importable SOC 2 evidence containing each request, implementation reports, review outcomes, notes, and exact commit range without requiring users to reconstruct delivery history manually. Each row should fit Jira by preserving Goal identity and commit traceability first, compacting repeated machine verdict payloads, and visibly marking any lower-priority evidence shortened at a valid character boundary. One Goal's verbose history should not abort the other selected rows. The export should run as a visible, cancellable operation that survives page reloads and can recover after daemon interruption.
+
+The Goal surface should keep agent work concrete. A Goal without an actionable prompt is too vague for reliable automation.
+
+Workflow controls expose explicit step changes with reason, context, expected revision, and request identity. The Goal shows pending error handling and retained decision history. Forced Done is clearly status-only; forced integration is a separate action against the retained candidate. Node switches and late responses preserve the selected-node boundary.
+
+## Future Direction
+
+Future Goals should carry richer evidence: screenshots, test output, design rationale, dependency traces, risk assessments, and agent reasoning summaries.
+
+As AI systems improve, the Goal surface may become less about manual editing and more about approving, redirecting, and auditing autonomous work.
+
+The Goal status tag is the sole top-level failure summary. Do not repeat it in generic Goal failure banners. Each Round is the only collapsible container. Inside it, a flat Request / Plan / Implement / Quality / Governance / Failed / Prompts / Activity tab row shares one unboxed content area. Plan is selected initially when a recorded plan exists, otherwise Request is selected. Explicit tab choices persist per Goal and Round across refreshes, without transferring to a different Round after deletion. All tabs remain visible with clear empty states. Each automated-step tab shows its artifacts first (plans, implementation reports, Skill results, evidence, and recorded artifact references), followed by that step's chronological activity in the same unboxed panel. There are no nested Artifacts/Activity tabs. Recorded Event sources identify the step independently of Skill roles; older receipts without a source use their recorded roles. Retained artifacts from previous executions or candidate refreshes remain visible and are labelled as history. Failed consolidates failure investigation. Activity contains quality and governance results, workflow decisions, and the complete Round log chronology. Activity also retains entries without a known step. Step activity uses recorded workflow metadata, transitions and Round-scoped manual decisions; it never assigns old entries from the Goal's current status. Tabs support keyboard arrows, Home/End, visible focus, and accessible tab/panel relationships.
+
+Workflow visualization cards subtly highlight the selected status filter. Multiple selected statuses each receive the same highlight; an all-status selection is visually neutral. Selection must survive filtered-table refreshes and route reloads.
+
+Round plan display reads both recorded Plan Skill results and legacy implementation-plan records. Moving to a Skill-driven workflow must not hide an already recorded plan.
+
+Failed is always visible after Governance and before Prompts. It leads with the recorded failure message, category, and timestamp, followed by supporting Event, Skill, implementation-plan, gate, and warning/error log diagnostics, then labelled historical failures. A failed Round without a recorded cause explicitly says the reason is unavailable; legacy logs remain supporting evidence and are never presented as proof of the cause. With no evidence, the panel says “No failure evidence has been recorded for this Round.” Only the latest Round may use the current Goal status. Retry snapshots, failure history, and retained candidate-refresh evidence remain inspectable, deduplicated using recorded identities where available, without implying the current execution failed. An unrelated latest log is never attached to an older recorded cause. When a Skill contract error includes an explicit cause after invocation metadata, surface that cause first while retaining the complete recorded error. Diagnostic evidence, rule actions, workflow decisions, and log details are inline, without nested disclosure toggles or boxed panels. Long evidence wraps; the modal owns vertical scrolling, with no additional Failed, Activity, or log scrollbar.
+
+A visible View Logs button opens the Goal-scoped log window and dismisses the modal. Round Failed gathers investigation evidence and Activity shows the attempt chronology; the log window provides full retained log search and live output.

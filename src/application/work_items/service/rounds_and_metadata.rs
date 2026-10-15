@@ -470,8 +470,7 @@ impl FileWorkItemService {
         })?;
         if fields.contains_key("implementation_plan") {
             return Err(RefineError::InvalidInput(
-                "implementation_plan is Workflow-owned evidence and can only be changed through its fenced planning authority"
-                    .to_string(),
+                "Historical implementation plans are read-only".into(),
             ));
         }
 
@@ -501,9 +500,6 @@ impl FileWorkItemService {
             "quality_skill_results",
             "guidance_decision",
             "rule_state",
-            "meta_rule_state",
-            "product_state",
-            "constitution_state",
             "governance_message",
             "governance_details",
             "governance_checked_at",
@@ -584,20 +580,60 @@ impl FileWorkItemService {
     }
 
     pub fn delete_goal_record(&self, goal_id: &str) -> RefineResult<()> {
+        self.delete_goal_record_checked(goal_id, None)
+    }
+
+    pub fn delete_draft_goal_record(
+        &self,
+        goal_id: &str,
+        expected_revision: u64,
+    ) -> RefineResult<()> {
+        self.delete_goal_record_checked(goal_id, Some(expected_revision))
+    }
+
+    fn delete_goal_record_checked(
+        &self,
+        goal_id: &str,
+        draft_revision: Option<u64>,
+    ) -> RefineResult<()> {
         let _goal_lock = self.acquire_goal_mutation_lock(goal_id)?;
         let current = self.show_goal_summary(goal_id)?;
         self.ensure_goal_owned(&current)?;
+        if let Some(expected) = draft_revision {
+            if current.goal.status != GoalStatus::Draft {
+                return Err(RefineError::Conflict(
+                    "Only Draft Goals can be deleted from Project Planning".into(),
+                ));
+            }
+            let (_, goal) = self.read_goal_value_unchecked_locked(&current)?;
+            if super::record_persistence::workflow_revision(&goal) != expected {
+                return Err(RefineError::Conflict(
+                    "Goal changed; refresh before deleting".into(),
+                ));
+            }
+        }
         validate_goal_operation(&current.goal.status, &GoalOperation::Delete)?;
         let goal_path = self.refine_dir.join(&current.goal.json_path);
+        ActiveGoalIndex::prepare_goal_write(&self.refine_dir, &goal_path, None)?;
         fs::remove_file(&goal_path).map_err(|error| {
             RefineError::Io(format!(
                 "failed to delete Goal {}: {error}",
                 goal_path.display()
             ))
         })?;
-        // A deleted record cannot be re-projected, so the removal is recorded
-        // explicitly rather than derived from the file that no longer exists.
-        if let Err(error) = ActiveGoalIndex::forget_goal(&self.refine_dir, &current.goal.id) {
+        if let Some(parent) = goal_path.parent() {
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    RefineError::Io(format!(
+                        "failed to commit Goal deletion {}: {error}",
+                        goal_path.display()
+                    ))
+                })?;
+        }
+        // The absence is a committed source change too. If indexing is
+        // interrupted, its preceding marker lets the daemon finish discovery.
+        if let Err(error) = ActiveGoalIndex::complete_goal_write(&self.refine_dir, &goal_path) {
             eprintln!(
                 "refine: active Goal index still lists deleted Goal {}: {error}",
                 current.goal.id
@@ -607,5 +643,20 @@ impl FileWorkItemService {
             let _ = fs::remove_dir(parent);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl FileWorkItemService {
+    pub(crate) fn seed_legacy_implementation_plan(
+        &self,
+        goal_id: &str,
+        round_idx: usize,
+        fields: &Value,
+    ) -> RefineResult<()> {
+        let summary = self.show_goal_summary(goal_id)?;
+        let (_lock, path, mut value) = self.read_goal_value_unchecked(&summary)?;
+        value["rounds"][round_idx]["implementation_plan"] = fields["implementation_plan"].clone();
+        write_json_atomically(&path, &value)
     }
 }

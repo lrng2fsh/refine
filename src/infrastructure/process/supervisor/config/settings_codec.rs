@@ -18,13 +18,12 @@ pub(super) fn default_settings() -> JsonObject {
         ("agent_idle_timeout_seconds", "900"),
         ("agent_hard_cap_seconds", "7200"),
         ("agent_limit_pause_seconds", "60"),
-        ("max_automatic_round_retries", "5"),
+        ("workflow_error_timeout_seconds", "600"),
         ("worker_memory_limit_mb", ""),
         ("ui_memory_limit_mb", ""),
         ("worker_cpu_priority", "normal"),
         ("resource_isolation_mode", "process_group"),
         ("chat_idle_timeout_seconds", "300"),
-        ("backlog_promote_after_seconds", "3600"),
         ("worktree_cleanup_after_seconds", "0"),
         ("state_sync_debounce_seconds", "5"),
         ("state_sync_stale_threshold_seconds", "900"),
@@ -36,9 +35,7 @@ pub(super) fn default_settings() -> JsonObject {
         ("git_remote", "origin"),
         ("merge_target_branch", "main"),
         ("quality_enabled", "0"),
-        ("workflow_conflict_resolution", "on"),
         ("allowed_commands", ""),
-        ("agent_cli", "claude"),
         ("target_app_start_instructions", ""),
         ("target_app_stop_instructions", ""),
         ("target_app_build_instructions", ""),
@@ -79,13 +76,12 @@ pub(super) fn allowed_settings() -> BTreeSet<&'static str> {
         "agent_idle_timeout_seconds",
         "agent_hard_cap_seconds",
         "agent_limit_pause_seconds",
-        "max_automatic_round_retries",
+        "workflow_error_timeout_seconds",
         "worker_memory_limit_mb",
         "ui_memory_limit_mb",
         "worker_cpu_priority",
         "resource_isolation_mode",
         "chat_idle_timeout_seconds",
-        "backlog_promote_after_seconds",
         "worktree_cleanup_after_seconds",
         "state_sync_debounce_seconds",
         "state_sync_stale_threshold_seconds",
@@ -97,7 +93,6 @@ pub(super) fn allowed_settings() -> BTreeSet<&'static str> {
         "git_remote",
         "merge_target_branch",
         "quality_enabled",
-        "workflow_conflict_resolution",
         "allowed_commands",
         "agent_cli",
         "target_app_start_instructions",
@@ -179,42 +174,18 @@ pub(super) fn is_retired_development_request_setting(key: &str) -> bool {
 pub(super) fn normalize_setting(key: &str, value: &Value) -> RefineResult<String> {
     match key {
         "agent_cli" => {
-            let raw = as_string(value);
-            let choice = raw.trim();
-            let known = choice.to_ascii_lowercase();
-            if matches!(
-                known.as_str(),
-                "claude" | "codex" | "gemini" | "copilot" | "smoke-ai"
-            ) {
-                Ok(known)
-            } else if !choice.is_empty()
-                && !choice.as_bytes().contains(&0)
-                && !choice.chars().any(char::is_whitespace)
-            {
-                // A configured generic provider is one executable path/name.
-                // Provider-specific prompt semantics still remain centralized
-                // in HostAgentProviderService's generic capability contract.
-                Ok(choice.to_string())
-            } else {
-                Err(RefineError::InvalidInput(
-                    "agent_cli must be a known provider or one generic CLI executable without whitespace"
-                        .to_string(),
-                ))
+            if value.is_null() {
+                return Ok(String::new());
             }
+            let choice = value.as_str().ok_or_else(|| {
+                RefineError::InvalidInput("agent_cli must be a provider ID or null".into())
+            })?;
+            if choice.contains('\0') || choice != choice.trim() {
+                return Err(RefineError::InvalidInput("invalid provider ID".into()));
+            }
+            Ok(choice.to_string())
         }
         "quality_enabled" => Ok(if value_is_truthy(value) { "1" } else { "0" }.to_string()),
-        // Resolve-in-place for conflicted candidate refreshes. Off falls back
-        // to queueing a fenced recovery Round on every rebase conflict.
-        "workflow_conflict_resolution" => {
-            let choice = as_string(value).trim().to_ascii_lowercase();
-            if matches!(choice.as_str(), "on" | "off") {
-                Ok(choice)
-            } else {
-                Err(RefineError::InvalidInput(
-                    "workflow_conflict_resolution must be on or off".to_string(),
-                ))
-            }
-        }
         "target_app_env_json" => {
             let raw = as_string(value);
             let parsed = serde_json::from_str::<Value>(raw.trim()).map_err(|_| {
@@ -241,7 +212,7 @@ pub(super) fn normalize_setting(key: &str, value: &Value) -> RefineResult<String
                 normalize_range(key, value, 1, 100)
             }
         }
-        "max_automatic_round_retries" => normalize_range(key, value, 0, 100),
+        "workflow_error_timeout_seconds" => normalize_range(key, value, 1, 86400),
         "automatic_agent_resource_budget_percent" => normalize_range(key, value, 1, 100),
         "target_app_tcp_check_port" => {
             let text = as_string(value);
@@ -282,7 +253,6 @@ pub(super) fn normalize_setting(key: &str, value: &Value) -> RefineResult<String
                 "agent_idle_timeout_seconds"
                     | "agent_hard_cap_seconds"
                     | "agent_limit_pause_seconds"
-                    | "backlog_promote_after_seconds"
                     | "worktree_cleanup_after_seconds"
                     | "state_sync_debounce_seconds"
                     | "project_update_pulse_interval_seconds"

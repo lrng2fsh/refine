@@ -20,6 +20,7 @@ const state = {
   screenDataCache: new Map(),
 };
 
+// Draft belongs to Project Planning, before the workflow begins.
 const WORKFLOW_STATUSES = [
   "backlog",
   "todo",
@@ -34,6 +35,7 @@ const WORKFLOW_STATUSES = [
 ];
 const STATUS_FILTER_OPTIONS = ["", ...WORKFLOW_STATUSES];
 const WORKFLOW_STATUS_LABELS = {
+  draft: "Draft",
   "backlog": "Backlog",
   "todo": "To do",
   "plan": "Plan",
@@ -76,46 +78,20 @@ function reviewStateClass(value, passedClass = "done", failedClass = "failed", e
 }
 
 function governanceReviewStatus(round) {
-  const ruleState = normalizeReviewState(round?.rule_state);
-  if (ruleState === "unclassified") {
-    return {
-      visible: false,
-      passed: false,
-      states: {
-        rules: ruleState,
-        product: normalizeReviewState(round?.product_state),
-        constitution: normalizeReviewState(round?.constitution_state),
-        meta: normalizeReviewState(round?.meta_rule_state),
-      },
-    };
-  }
-  const states = {
-    rules: ruleState,
-    product: normalizeReviewState(round?.product_state),
-    constitution: normalizeReviewState(round?.constitution_state),
-    meta: normalizeReviewState(round?.meta_rule_state),
-  };
+  const state = normalizeReviewState(round?.rule_state);
   return {
-    visible: true,
-    passed: states.rules === "passed"
-      && states.product === "passed"
-      && states.constitution === "passed",
-    states,
+    visible: state !== "unclassified",
+    passed: state === "passed",
+    state,
   };
 }
 
 function updateActiveNodeLabel() {
-  const el = document.getElementById("active-node-label");
   const project = state.project || {};
   const active = project.active_node || null;
   const activeId = project.active_node_id || "";
   const label = (typeof active === "string" ? active : (active?.display_name || active?.name))
     || activeId || "none";
-  const visibleLabel = project.attached === false ? "none" : label;
-  if (el) {
-    el.textContent = visibleLabel;
-    el.title = el.textContent;
-  }
   updatePageTitle(project.attached === false ? "" : label);
 }
 
@@ -148,8 +124,8 @@ function renderNoProjectEmptyState(title = "Refine") {
     <h2>${htmlEscape(title)}</h2>
     <div class="empty-state" data-testid="no-project-empty">
       <div class="empty-state-title">No app configured.</div>
-      <p class="muted">Open the Guide to configure Refine and attach an app.</p>
-      <button type="button" class="secondary" id="empty-open-guide" data-testid="no-project-open-guide">Open Guide</button>
+      <p class="muted">Open Refine Hub to configure Refine and attach an app.</p>
+      <button type="button" class="secondary" id="empty-open-guide" data-testid="no-project-open-guide">Open Refine Hub</button>
     </div>`;
   $("#empty-open-guide")?.addEventListener("click", () => {
     if (typeof openGuide === "function") {
@@ -183,18 +159,11 @@ function enterNoProjectMode(project = null, { openGuidePanel = false } = {}) {
     sseSource.close();
     sseSource = null;
   }
-  if (openGuidePanel && typeof openGuide === "function") {
-    openGuide({
-      context: "no-app",
-      categoryId: "get-started",
-      itemId: "quickstart-add-app",
-      openTarget: true,
-    });
-  }
+
 }
 
 function refreshCurrentSettingsSurface(options = {}) {
-  if (!["settings", "node", "project"].includes(state.currentRoute || "")) return undefined;
+  if (!["control", "settings", "node", "project"].includes(state.currentRoute || "")) return undefined;
   if (typeof refreshActiveSettingsTab === "function") {
     return refreshActiveSettingsTab(options);
   }
@@ -264,7 +233,7 @@ function defaultScreenDataPaths() {
     "/api/project/status",
     "/api/dashboard?node=current",
     "/api/features?limit=50&offset=0",
-    "/api/goals?limit=50&offset=0&facets=1",
+    "/api/goals?exclude_draft=1&limit=50&offset=0&facets=1",
     "/api/activity?limit=50&offset=0&facets=1",
     "/api/changes?limit=50&offset=0",
     "/api/nodes",
@@ -380,7 +349,7 @@ async function api(method, path, body, options = {}) {
       }
       throw err;
     }
-    if (method !== "GET") {
+    if (method !== "GET" && !path.startsWith("/api/activity/tail?")) {
       // The screen the user is on refreshes itself after its own mutation, and
       // SSE announces the change to every other screen. Forcing an 11-request
       // prefetch burst here multiplied every click into a page-load's worth of
@@ -1193,18 +1162,12 @@ async function applyProjectAttachResult(result, options = {}) {
   await refreshTargetAppToggle();
   if (location.hash !== "#/settings/application") {
     location.hash = "#/settings/application";
-  } else if (["settings", "node", "project"].includes(state.currentRoute || "")) {
+  } else if (["control", "settings", "node", "project"].includes(state.currentRoute || "")) {
     await refreshSettings();
   } else {
     navigate();
   }
-  if (options.openGuide && typeof openGuide === "function") {
-    openGuide({
-      context: result.config_created ? "app-created" : "app-existing",
-      categoryId: "node",
-      itemId: "project-application",
-    });
-  }
+
 }
 
 // ---- Modals (replace native prompt / confirm) -------------------------------
@@ -1630,6 +1593,7 @@ async function handleReporterAdd(sel) {
                                   "", { title: "Add reporter" });
   if (!name || !name.trim()) {
     sel.value = state.lastReporter || "";
+    if (typeof syncTopbarPickers === "function") syncTopbarPickers();
     return null;
   }
   try {
@@ -1651,6 +1615,7 @@ async function handleReporterAdd(sel) {
   } catch (e) {
     toast(`Could not add reporter: ${e.message}`, "error");
     sel.value = state.lastReporter || "";
+    if (typeof syncTopbarPickers === "function") syncTopbarPickers();
     return null;
   }
 }
@@ -1668,12 +1633,12 @@ function mergeReporterIntoProjection(reporter) {
 
 function setLastReporter(name) {
   const wasEmpty = !state.lastReporter;
-  const changed = state.lastReporter !== name;
   state.lastReporter = name;
   if (name) localStorage.setItem("refine_last_reporter", name);
   else localStorage.removeItem("refine_last_reporter");
   const g = $("#global-reporter");
   if (g) g.value = name;
+  if (typeof syncTopbarPickers === "function") syncTopbarPickers();
   // Keep any in-page "Submitting as X" indicator in sync without re-rendering
   // the form (which would lose the user's typed-but-unsubmitted text).
   for (const el of $$(".js-reporter-name")) el.textContent = name;
@@ -1688,9 +1653,6 @@ function setLastReporter(name) {
   // Dashboard's "Awaiting your review" section is reporter-scoped — refresh
   // it whenever the selection changes so the list re-targets immediately.
   if (state.currentRoute === "dashboard") refreshDashboard();
-  if (changed && typeof handleTodoReporterChanged === "function") {
-    handleTodoReporterChanged(name);
-  }
 }
 
 // react to "+ Add new reporter" selection on any dropdown
@@ -1713,7 +1675,7 @@ document.addEventListener("change", async (e) => {
 });
 
 function closeTopbarMenus(target = null) {
-  for (const menu of $$(".topbar-actions details[open]")) {
+  for (const menu of $$(".topbar-actions details[open], .navigation-rail .nav-menu[open]")) {
     if (!target || !menu.contains(target)) menu.open = false;
   }
 }
@@ -1726,7 +1688,13 @@ document.addEventListener("click", (e) => {
   if (menuSummary) {
     closeTopbarMenus(menuSummary);
   }
-  if (e.target.closest("#btn-new-goal")) {
+  const railCommand = e.target.closest("#rail-new-menu [data-rail-command]");
+  if (railCommand) {
+    e.preventDefault();
+    closeTopbarMenus();
+    closeMobileNavigation();
+    runCommand(railCommand.dataset.railCommand);
+  } else if (e.target.closest("#btn-new-goal")) {
     e.preventDefault();
     closeTopbarMenus();
     runCommand("goal.new");
@@ -1823,8 +1791,7 @@ function scheduleRouteDataRefresh() {
     // Refresh only the table on background updates so an active workflow
     // keystroke in the search box isn't interrupted by a full re-render.
     if (state.currentRoute === "goals") refreshGoalsTable();
-    if (state.currentRoute === "logs") loadLogs();
-    if (["settings", "node", "project"].includes(state.currentRoute || "")) {
+    if (["control", "settings", "node", "project"].includes(state.currentRoute || "")) {
       refreshCurrentSettingsSurface();
     }
     // Changes screen: an approved implementation can land asynchronously;
@@ -1850,14 +1817,15 @@ function initSSE() {
   if (sseSource) sseSource.close();
   sseSource = new EventSource("/api/sse");
   sseSource.onopen = () => {
+    if (typeof refreshToolbarSyncHealth === "function") refreshToolbarSyncHealth(true);
     const reconnected = sseLastErrorNoticeAt > 0;
     sseLastErrorNoticeAt = 0;
     invalidateScreenDataCache();
     reconcilePendingBackgroundOperations();
-    if (reconnected) toast("Live updates reconnected.", "success");
+    if (reconnected) recordSystemOperation({ message: "Live updates reconnected.", status: "info" });
     if (reconnected && typeof reconcileNodeContext === "function") {
       reconcileNodeContext({ external: true }).catch((error) => {
-        toast(`Could not reconcile Node context: ${error.message || error}`, "error");
+        recordSystemOperation({ message: `Could not reconcile Node context: ${error.message || error}`, status: "error" });
       });
     }
     // SSE is a notification transport, not durable state. Reconcile the visible
@@ -1865,9 +1833,8 @@ function initSSE() {
     // and reconnect so a missed frame can never leave the workflow UI stale.
     if (state.currentRoute === "dashboard") refreshDashboard();
     if (state.currentRoute === "goals") refreshGoalsTable();
-    if (state.currentRoute === "logs") loadLogs();
     if (state.currentRoute === "changes") loadChanges();
-    if (["settings", "node", "project"].includes(state.currentRoute || "")) {
+    if (["control", "settings", "node", "project"].includes(state.currentRoute || "")) {
       refreshCurrentSettingsSurface({ force: true });
     }
     if (state.currentRoute === "goals_detail" && state.currentGoal) {
@@ -1895,7 +1862,6 @@ function initSSE() {
     // screen doesn't blink back to `Loading…` on every event.
     if (typeof scheduleAgentStatusRefresh === "function") scheduleAgentStatusRefresh();
     if (state.currentRoute === "dashboard") refreshDashboard();
-    if (state.currentRoute === "logs") loadLogs();
     if (state.currentRoute === "changes") loadChanges();
   });
   sseSource.addEventListener("goal_log_added", (e) => {
@@ -1912,19 +1878,20 @@ function initSSE() {
     scheduleRouteDataRefresh();
   });
   sseSource.addEventListener("runtime_change", () => {
+    if (typeof refreshToolbarSyncHealth === "function") refreshToolbarSyncHealth(true);
     invalidateScreenDataCache();
     if (typeof scheduleAgentStatusRefresh === "function") scheduleAgentStatusRefresh();
     if (typeof refreshTargetAppToggle === "function") refreshTargetAppToggle();
     if (state.currentRoute === "dashboard") refreshDashboard();
-    if (["settings", "node", "project"].includes(state.currentRoute || "")) {
+    if (["control", "settings", "node", "project"].includes(state.currentRoute || "")) {
       refreshCurrentSettingsSurface();
     }
   });
   sseSource.addEventListener("state_sync_health", () => {
+    if (typeof refreshToolbarSyncHealth === "function") refreshToolbarSyncHealth(true);
     invalidateScreenDataCache();
     if (state.currentRoute === "dashboard") refreshDashboard();
-    if (state.currentRoute === "logs") loadLogs();
-    if (["settings", "node", "project"].includes(state.currentRoute || "")) {
+    if (["control", "settings", "node", "project"].includes(state.currentRoute || "")) {
       refreshCurrentSettingsSurface();
     }
   });
@@ -1989,9 +1956,6 @@ function initSSE() {
     if (typeof refreshSourceUpdateNav === "function") refreshSourceUpdateNav({ quiet: true });
     scheduleRouteDataRefresh();
   });
-  sseSource.addEventListener("round_log_added", () => {
-    if (state.currentRoute === "logs") loadLogs();
-  });
   sseSource.addEventListener("system_operation", (e) => {
     if (!sseEventChanged("SystemOperation", e)) return;
     try {
@@ -2005,7 +1969,7 @@ function initSSE() {
     const now = Date.now();
     if (now - sseLastErrorNoticeAt > 30000) {
       sseLastErrorNoticeAt = now;
-      toast("Live updates disconnected. Reconnecting automatically…", "warn");
+      recordSystemOperation({ message: "Live updates disconnected. Reconnecting automatically…", status: "warn" });
     }
     // Keep the EventSource alive: the browser automatically reconnects it and
     // `onopen` above reconciles durable backend truth after transport recovery.

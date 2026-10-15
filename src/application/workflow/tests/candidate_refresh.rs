@@ -1,14 +1,7 @@
 use super::*;
 
-use std::sync::mpsc;
-use std::time::Duration;
-
-use crate::application::persistence_sync::resolution::{
-    ResolutionRequest, ResolverOutcome, ScriptedResolver, ScriptedStep,
-};
-use crate::application::work_items::WorkflowAttemptAuthority;
+use crate::application::work_items::WorkflowStepAuthority;
 use crate::application::workflow::engine::context::WorkflowContext;
-use crate::infrastructure::git::with_repository_git_lock;
 use crate::infrastructure::git::worktrees::{FileGitWorktreeService, GitWorktreeService};
 
 struct RefreshFixture {
@@ -20,15 +13,15 @@ struct RefreshFixture {
     base: String,
     candidate: String,
     target: String,
-    authority: WorkflowAttemptAuthority,
+    authority: WorkflowStepAuthority,
 }
 
 impl RefreshFixture {
     fn new(conflict: bool) -> Self {
-        Self::new_with_retry(conflict, None)
+        Self::with_prior_recovery(conflict, None)
     }
 
-    fn new_with_retry(conflict: bool, automatic_retry_attempt: Option<u32>) -> Self {
+    fn with_prior_recovery(conflict: bool, prior_attempt: Option<u32>) -> Self {
         let temp_root = unique_temp_dir("workflow-candidate-refresh");
         let target_root = temp_root.join("repo");
         let runtime_root = temp_root.join("run/8080");
@@ -93,7 +86,7 @@ impl RefreshFixture {
         work_items
             .transition_goal_status("GOAL1", GoalStatus::Todo)
             .unwrap();
-        if let Some(attempt) = automatic_retry_attempt {
+        if let Some(attempt) = prior_attempt {
             work_items
                 .advance_automated_goal_status("GOAL1", GoalStatus::Plan)
                 .unwrap();
@@ -103,36 +96,36 @@ impl RefreshFixture {
             work_items
                 .advance_automated_goal_status("GOAL1", GoalStatus::Quality)
                 .unwrap();
+            // Exercise an explicit recovery selection within the existing authored Round.
+            let goal = work_items.show_goal_detail("GOAL1").unwrap();
             work_items
-                .queue_quality_recovery_summary(
+                .control_workflow(
                     "GOAL1",
-                    0,
-                    None,
-                    attempt,
-                    "seed shared automatic retry lineage",
-                    "Continue the recovery lineage.",
+                    &crate::application::work_items::WorkflowControl {
+                        to: GoalStatus::Plan,
+                        reason: format!("Explicit recovery after historical attempt {attempt}"),
+                        context: "Continue the recovery lineage".into(),
+                        expected_revision: goal["workflow_revision"].as_u64().unwrap_or(0),
+                        request_id: "fixture-recovery".into(),
+                        force: false,
+                        actor: "Operator".into(),
+                        invocation_id: None,
+                    },
                 )
                 .unwrap();
         }
-        let branch = if automatic_retry_attempt.is_some() {
-            "refine/GOAL1/round-2"
-        } else {
-            "refine/GOAL1/round-1"
-        };
-        let worktree = if automatic_retry_attempt.is_some() {
-            let service = FileGitWorktreeService::new(&target_root);
-            let target = service.managed_worktree_path(branch).unwrap();
-            PathBuf::from(
-                service
-                    .ensure_worktree_at_commit(branch, &target, &candidate)
-                    .unwrap(),
-            )
-        } else {
-            worktree
-        };
-        work_items
-            .advance_automated_goal_status("GOAL1", GoalStatus::Plan)
-            .unwrap();
+        // Selecting Plan retains the authored Round and its candidate checkout.
+        // A fresh fixture still enters Plan through ordinary automated progress.
+        let branch = "refine/GOAL1/round-1";
+        if prior_attempt.is_none() {
+            work_items
+                .advance_automated_goal_status("GOAL1", GoalStatus::Plan)
+                .unwrap();
+        }
+        let selected = work_items.show_goal_detail("GOAL1").unwrap();
+        assert_eq!(selected["status"], "plan");
+        assert_eq!(selected["rounds"].as_array().unwrap().len(), 1);
+        assert_eq!(selected["rounds"][0]["prompt"], "Implement");
         work_items
             .update_goal_git_refs("GOAL1", branch, "main", &base, Some(&candidate))
             .unwrap();
@@ -204,7 +197,7 @@ fn attempt_concurrent_refresh(
     worktree: PathBuf,
     work_items: FileWorkItemService,
     candidate: String,
-    authority: WorkflowAttemptAuthority,
+    authority: WorkflowStepAuthority,
     barrier: std::sync::Arc<std::sync::Barrier>,
 ) -> RefineResult<CandidateRefreshOutcome> {
     let mut context = WorkflowContext::new(
@@ -222,7 +215,7 @@ fn attempt_concurrent_refresh(
     context.worktree_path = Some(worktree.display().to_string());
     context.commit = Some(candidate);
     barrier.wait();
-    refresh_candidate_for_target_advancement(&mut context, GoalStatus::Governance, 5)
+    refresh_candidate_for_target_advancement(&mut context, GoalStatus::Governance)
 }
 
 #[test]
@@ -230,7 +223,7 @@ fn target_advancement_rebases_a_provable_delta_and_records_both_identities() {
     let fixture = RefreshFixture::new(false);
     let mut context = fixture.context();
     let outcome =
-        refresh_candidate_for_target_advancement(&mut context, GoalStatus::Governance, 5).unwrap();
+        refresh_candidate_for_target_advancement(&mut context, GoalStatus::Governance).unwrap();
     let CandidateRefreshOutcome::Refreshed {
         replacement_candidate,
         ..
@@ -364,33 +357,39 @@ fn authority_loss_after_rebase_restores_the_original_candidate_branch() {
 }
 
 #[test]
-fn refresh_conflict_aborts_and_queues_one_fenced_recovery_round() {
+fn refresh_conflict_aborts_and_retains_evidence_without_another_round() {
     let fixture = RefreshFixture::new(true);
     let mut context = fixture.context();
     // Resolver disabled (`workflow_conflict_resolution` off): exactly the
     // pre-resolver behavior.
     let outcome =
-        refresh_candidate_with_resolver(&mut context, GoalStatus::Governance, 5, None).unwrap();
-    assert!(matches!(
-        outcome,
-        CandidateRefreshOutcome::RecoveryQueued { .. }
-    ));
+        refresh_candidate_for_target_advancement(&mut context, GoalStatus::Governance).unwrap();
+    assert!(matches!(outcome, CandidateRefreshOutcome::Stopped { .. }));
     assert_eq!(
         git_output(&fixture.worktree, &["rev-parse", "HEAD"]).trim(),
         fixture.candidate
     );
     let detail = fixture.work_items.show_goal_detail("GOAL1").unwrap();
-    assert_eq!(detail["status"], "todo");
-    assert_eq!(detail["rounds"].as_array().unwrap().len(), 2);
+    assert_eq!(detail["status"], "failed");
+    assert_eq!(detail["rounds"].as_array().unwrap().len(), 1);
     assert_eq!(
         detail["rounds"][0]["workflow_recovery"]["reason"],
         "candidate refresh conflicted"
     );
-    assert_eq!(
-        detail["rounds"][1]["automatic_retry"]["kind"],
-        "integration"
+    assert!(
+        detail["rounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|round| round["automatic_retry"].is_null())
     );
-    assert_eq!(detail["rounds"][1]["automatic_retry"]["attempt"], 1);
+    assert!(
+        detail["rounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|round| round["automatic_retry"].is_null())
+    );
     assert_eq!(
         detail["rounds"][0]["workflow_recovery"]["retained_evidence"]["original_candidate_commit"],
         fixture.candidate
@@ -403,90 +402,38 @@ fn refresh_conflict_aborts_and_queues_one_fenced_recovery_round() {
 }
 
 #[test]
-fn refresh_conflict_records_explicit_exhaustion_without_a_successor_round() {
-    let fixture = RefreshFixture::new_with_retry(true, Some(5));
+fn refresh_conflict_after_explicit_recovery_has_no_successor_round() {
+    let fixture = RefreshFixture::with_prior_recovery(true, Some(5));
     let mut context = fixture.context();
     let outcome =
-        refresh_candidate_with_resolver(&mut context, GoalStatus::Governance, 5, None).unwrap();
-    assert!(matches!(
-        outcome,
-        CandidateRefreshOutcome::RecoveryExhausted { .. }
-    ));
+        refresh_candidate_for_target_advancement(&mut context, GoalStatus::Governance).unwrap();
+    assert!(matches!(outcome, CandidateRefreshOutcome::Stopped { .. }));
     assert_eq!(
         git_output(&fixture.worktree, &["rev-parse", "HEAD"]).trim(),
         fixture.candidate
     );
     let detail = fixture.work_items.show_goal_detail("GOAL1").unwrap();
     assert_eq!(detail["status"], "failed");
-    assert_eq!(detail["rounds"].as_array().unwrap().len(), 2);
+    assert_eq!(detail["rounds"].as_array().unwrap().len(), 1);
+    assert_eq!(detail["rounds"][0]["workflow_recovery"]["state"], "failed");
+    assert!(detail["rounds"][0]["workflow_recovery"]["successor_round"].is_null());
+    assert_eq!(detail["rounds"][0]["failure_category"], "integration");
     assert_eq!(
-        detail["rounds"][1]["workflow_recovery"]["state"],
-        "exhausted"
-    );
-    assert_eq!(detail["rounds"][1]["workflow_recovery"]["attempt"], 5);
-    assert_eq!(
-        detail["rounds"][1]["failure_category"],
-        "integration_retry_exhausted"
-    );
-    assert_eq!(
-        detail["rounds"][1]["workflow_recovery"]["retained_evidence"]["original_candidate_commit"],
+        detail["rounds"][0]["workflow_recovery"]["retained_evidence"]["original_candidate_commit"],
         fixture.candidate
     );
 }
 
 #[test]
-fn integration_merge_conflict_queues_one_fenced_recovery_round_with_the_conflicted_paths() {
+fn integration_merge_conflict_retains_paths_without_another_round() {
     let fixture = RefreshFixture::new(true);
     let mut context = fixture.context();
     let outcome =
-        crate::application::workflow::engine::behaviors::queue_integration_merge_conflict_recovery(
+        crate::application::workflow::engine::behaviors::settle_integration_merge_conflict(
             &mut context,
             vec!["app.txt".to_string()],
             "candidate integration failed: CONFLICT (content): Merge conflict in app.txt"
                 .to_string(),
-            5,
-        )
-        .unwrap();
-    let crate::application::workflow::engine::behaviors::contract::WorkflowAdvanceOutcome::Completed {
-        final_status,
-        ..
-    } = outcome
-    else {
-        panic!("expected a completed outcome");
-    };
-    assert_eq!(final_status, GoalStatus::Todo);
-    let detail = fixture.work_items.show_goal_detail("GOAL1").unwrap();
-    assert_eq!(detail["status"], "todo");
-    assert_eq!(detail["rounds"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        detail["rounds"][0]["workflow_recovery"]["reason"],
-        "candidate integration merge conflicted"
-    );
-    assert_eq!(
-        detail["rounds"][1]["automatic_retry"]["kind"],
-        "integration"
-    );
-    assert_eq!(detail["rounds"][1]["automatic_retry"]["attempt"], 1);
-    // The conflicted paths survive into the recovery Round evidence exactly
-    // as the rebase path retains `rebase.conflicts`.
-    assert!(
-        detail["rounds"][0]["workflow_recovery"]["retained_evidence"]["merge"]["conflicts"]
-            .as_array()
-            .is_some_and(|conflicts| conflicts.iter().any(|path| path == "app.txt"))
-    );
-}
-
-#[test]
-fn integration_merge_conflict_exhaustion_fails_with_integration_retry_exhausted() {
-    let fixture = RefreshFixture::new_with_retry(true, Some(5));
-    let mut context = fixture.context();
-    let outcome =
-        crate::application::workflow::engine::behaviors::queue_integration_merge_conflict_recovery(
-            &mut context,
-            vec!["app.txt".to_string()],
-            "candidate integration failed: CONFLICT (content): Merge conflict in app.txt"
-                .to_string(),
-            5,
         )
         .unwrap();
     let crate::application::workflow::engine::behaviors::contract::WorkflowAdvanceOutcome::Completed {
@@ -499,416 +446,97 @@ fn integration_merge_conflict_exhaustion_fails_with_integration_retry_exhausted(
     assert_eq!(final_status, GoalStatus::Failed);
     let detail = fixture.work_items.show_goal_detail("GOAL1").unwrap();
     assert_eq!(detail["status"], "failed");
-    assert_eq!(detail["rounds"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        detail["rounds"][1]["workflow_recovery"]["state"],
-        "exhausted"
-    );
-    assert_eq!(
-        detail["rounds"][1]["failure_category"],
-        "integration_retry_exhausted"
-    );
-    assert!(
-        detail["rounds"][1]["workflow_recovery"]["retained_evidence"]["merge"]["conflicts"]
-            .as_array()
-            .is_some_and(|conflicts| conflicts.iter().any(|path| path == "app.txt"))
-    );
-}
-
-#[test]
-fn integration_recovery_uses_the_next_shared_automatic_retry_attempt() {
-    let fixture = RefreshFixture::new_with_retry(true, Some(4));
-    let mut context = fixture.context();
-    let outcome =
-        refresh_candidate_with_resolver(&mut context, GoalStatus::Governance, 5, None).unwrap();
-    assert!(matches!(
-        outcome,
-        CandidateRefreshOutcome::RecoveryQueued { .. }
-    ));
-    let detail = fixture.work_items.show_goal_detail("GOAL1").unwrap();
-    // The claimed trailing Round was itself an unworked automation-appended
-    // recovery Round, so the queued recovery reuses it in place instead of
-    // growing an unbounded chain of inert Rounds; the shared attempt counter
-    // still advances and lineage keeps naming the worked source Round.
-    assert_eq!(detail["rounds"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        detail["rounds"][1]["automatic_retry"]["kind"],
-        "integration"
-    );
-    assert_eq!(detail["rounds"][1]["automatic_retry"]["attempt"], 5);
-    assert_eq!(detail["rounds"][1]["automatic_retry"]["source_round"], 1);
-}
-
-fn completing_edit(edit: impl FnMut(&ResolutionRequest<'_>) + Send + 'static) -> ScriptedStep {
-    let mut edit = edit;
-    Box::new(move |request| {
-        edit(request);
-        Ok(ResolverOutcome::Completed)
-    })
-}
-
-#[test]
-fn workflow_conflict_resolution_defaults_on_and_honors_off() {
-    let mut settings = crate::model::JsonObject::new();
-    assert!(workflow_conflict_resolution_enabled(&settings));
-    settings.insert("workflow_conflict_resolution".to_string(), json!("off"));
-    assert!(!workflow_conflict_resolution_enabled(&settings));
-    settings.insert("workflow_conflict_resolution".to_string(), json!("on"));
-    assert!(workflow_conflict_resolution_enabled(&settings));
-}
-
-#[test]
-fn conflicted_refresh_resolves_in_place_without_holding_the_repository_lock() {
-    let fixture = RefreshFixture::new(true);
-    let mut context = fixture.context();
-    let probe_root = fixture.target_root.clone();
-    let resolver = ScriptedResolver::new(vec![completing_edit(move |request| {
-        // The resolver must run outside the repository lock: a probe thread
-        // acquiring it has to succeed while the resolver is in flight.
-        let (sender, receiver) = mpsc::channel();
-        let lock_root = probe_root.clone();
-        std::thread::spawn(move || {
-            let acquired = with_repository_git_lock(&lock_root, || Ok(())).is_ok();
-            let _ = sender.send(acquired);
-        });
-        assert!(
-            receiver
-                .recv_timeout(Duration::from_secs(10))
-                .unwrap_or(false),
-            "repository lock was held during resolver invocation"
-        );
-        // The markers carry the merge base as well as both sides, whatever
-        // the user's own `merge.conflictStyle` is: a resolver cannot tell
-        // which side changed what from two versions alone.
-        let conflicted = fs::read_to_string(request.workspace_dir.join("app.txt")).unwrap();
-        assert!(
-            conflicted.contains("|||||||") && conflicted.contains("base\n"),
-            "the conflicted file must show the base section: {conflicted}"
-        );
-        fs::write(
-            request.workspace_dir.join("app.txt"),
-            "candidate and target\n",
-        )
-        .unwrap();
-    })]);
-
-    let outcome =
-        refresh_candidate_with_resolver(&mut context, GoalStatus::Governance, 5, Some(&resolver))
-            .unwrap();
-
-    let CandidateRefreshOutcome::Refreshed {
-        replacement_candidate,
-        evidence,
-        ..
-    } = outcome
-    else {
-        panic!("expected a resolved refresh, got a recovery outcome");
-    };
-    assert_ne!(replacement_candidate, fixture.candidate);
-    // No recovery Round was queued; the note lives in the refresh evidence.
-    let detail = fixture.work_items.show_goal_detail("GOAL1").unwrap();
-    assert_eq!(detail["status"], "governance");
     assert_eq!(detail["rounds"].as_array().unwrap().len(), 1);
-    assert_eq!(detail["candidate_commit"], replacement_candidate);
-    let resolution = &detail["rounds"][0]["workflow_candidate_refresh"]["conflict_resolution"];
-    assert_eq!(resolution["outcome"], "resolved");
+    assert_eq!(
+        detail["rounds"][0]["workflow_recovery"]["reason"],
+        "candidate integration merge conflicted"
+    );
     assert!(
-        resolution["files"]
-            .as_array()
-            .is_some_and(|files| files.iter().any(|file| file == "app.txt"))
-    );
-    assert_eq!(
-        resolution["attempts"].as_array().unwrap().len(),
-        1,
-        "{resolution}"
-    );
-    assert_eq!(resolution["attempts"][0]["outcome"], "accepted");
-    assert_eq!(evidence["conflict_resolution"]["outcome"], "resolved");
-    assert_eq!(
-        git_output(&fixture.worktree, &["status", "--porcelain"]),
-        ""
-    );
-    assert_eq!(
-        git_output(
-            &fixture.worktree,
-            &["show", &format!("{replacement_candidate}:app.txt")]
-        ),
-        "candidate and target\n"
-    );
-    // The resolved delta still descends linearly from the advanced target.
-    assert_eq!(
-        git_output(
-            &fixture.worktree,
-            &["merge-base", &fixture.target, &replacement_candidate]
-        )
-        .trim(),
-        fixture.target
-    );
-}
-
-#[test]
-fn rejected_resolutions_exhaust_the_budget_into_todays_fallback_with_a_question() {
-    let fixture = RefreshFixture::new(true);
-    let mut context = fixture.context();
-    // Both attempts claim completion without touching the workspace, so the
-    // no-markers gate rejects each one.
-    let resolver = ScriptedResolver::new(vec![
-        completing_edit(|_request| {}),
-        completing_edit(|request| {
-            assert!(
-                request
-                    .feedback
-                    .is_some_and(|feedback| feedback.contains("conflict markers")),
-                "second attempt must carry the gate rejection as feedback"
-            );
-        }),
-    ]);
-
-    let outcome =
-        refresh_candidate_with_resolver(&mut context, GoalStatus::Governance, 5, Some(&resolver))
-            .unwrap();
-
-    let CandidateRefreshOutcome::RecoveryQueued { reason, evidence } = outcome else {
-        panic!("expected today's recovery fallback");
-    };
-    assert_eq!(reason, "candidate refresh conflicted");
-    assert_eq!(
-        git_output(&fixture.worktree, &["rev-parse", "HEAD"]).trim(),
-        fixture.candidate
-    );
-    let detail = fixture.work_items.show_goal_detail("GOAL1").unwrap();
-    assert_eq!(detail["status"], "todo");
-    assert_eq!(detail["rounds"].as_array().unwrap().len(), 2);
-    let retained = &detail["rounds"][0]["workflow_recovery"]["retained_evidence"];
-    assert!(
-        retained["rebase"]["conflicts"]
-            .as_array()
-            .is_some_and(|conflicts| conflicts.iter().any(|path| path == "app.txt"))
-    );
-    assert_eq!(retained["conflict_resolution"]["outcome"], "needs_decision");
-    assert_eq!(
-        retained["conflict_resolution"]["attempts"]
+        detail["rounds"]
             .as_array()
             .unwrap()
-            .len(),
-        2
+            .iter()
+            .all(|round| round["automatic_retry"].is_null())
     );
-    let question = retained["conflict_resolution"]["question"]
-        .as_str()
-        .unwrap();
-    assert!(question.contains("GOAL1"), "{question}");
-    assert!(question.contains("app.txt"), "{question}");
-    assert_eq!(evidence["conflict_resolution"]["outcome"], "needs_decision");
+    assert!(
+        detail["rounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|round| round["automatic_retry"].is_null())
+    );
+    // The conflicted paths survive into the recovery Round evidence exactly
+    // as the rebase path retains `rebase.conflicts`.
+    assert!(
+        detail["rounds"][0]["workflow_recovery"]["retained_evidence"]["merge"]["conflicts"]
+            .as_array()
+            .is_some_and(|conflicts| conflicts.iter().any(|path| path == "app.txt"))
+    );
 }
 
 #[test]
-fn an_unavailable_resolver_falls_back_immediately_without_more_attempts() {
-    let fixture = RefreshFixture::new(true);
+fn integration_merge_conflict_after_explicit_recovery_fails_once() {
+    let fixture = RefreshFixture::with_prior_recovery(true, Some(5));
     let mut context = fixture.context();
-    let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let counted = std::sync::Arc::clone(&calls);
-    let resolver = ScriptedResolver::new(vec![Box::new(move |_request: &ResolutionRequest<'_>| {
-        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(ResolverOutcome::Unavailable)
-    }) as ScriptedStep]);
-
     let outcome =
-        refresh_candidate_with_resolver(&mut context, GoalStatus::Governance, 5, Some(&resolver))
-            .unwrap();
-
-    assert!(matches!(
-        outcome,
-        CandidateRefreshOutcome::RecoveryQueued { .. }
-    ));
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(
-        git_output(&fixture.worktree, &["rev-parse", "HEAD"]).trim(),
-        fixture.candidate
-    );
-    let detail = fixture.work_items.show_goal_detail("GOAL1").unwrap();
-    assert_eq!(
-        detail["rounds"][0]["workflow_recovery"]["retained_evidence"]["conflict_resolution"]["outcome"],
-        "unavailable"
-    );
-}
-
-#[test]
-fn a_target_tip_moved_during_resolution_retries_boundedly_then_resolves() {
-    let fixture = RefreshFixture::new(true);
-    let mut context = fixture.context();
-    let advance_root = fixture.target_root.clone();
-    let resolver = ScriptedResolver::new(vec![completing_edit(move |request| {
-        // The target advances while the resolver holds no lock; the
-        // continue hold must detect it and abort instead of publishing a
-        // replacement based on a stale tip.
-        fs::write(advance_root.join("app.txt"), "target v2\n").unwrap();
-        git(&advance_root, &["add", "app.txt"]).unwrap();
-        git(
-            &advance_root,
-            &["commit", "-m", "advance during resolution"],
+        crate::application::workflow::engine::behaviors::settle_integration_merge_conflict(
+            &mut context,
+            vec!["app.txt".to_string()],
+            "candidate integration failed: CONFLICT (content): Merge conflict in app.txt"
+                .to_string(),
         )
         .unwrap();
-        fs::write(
-            request.workspace_dir.join("app.txt"),
-            "candidate and target\n",
-        )
-        .unwrap();
-    })]);
-
-    let error =
-        refresh_candidate_with_resolver(&mut context, GoalStatus::Governance, 5, Some(&resolver))
-            .unwrap_err();
-    let RefineError::TargetAdvanced {
-        expected, current, ..
-    } = error
-    else {
-        panic!("expected TargetAdvanced for the caller's bounded retry loop");
-    };
-    assert_eq!(expected, fixture.target);
-    assert_ne!(current, fixture.target);
-    // The rebase was aborted: the candidate branch is restored and no state
-    // was persisted, so the caller's refresh loop can simply run again.
-    assert_eq!(
-        git_output(&fixture.worktree, &["rev-parse", "HEAD"]).trim(),
-        fixture.candidate
-    );
-    assert_eq!(
-        git_output(&fixture.worktree, &["status", "--porcelain"]),
-        ""
-    );
-    let detail = fixture.work_items.show_goal_detail("GOAL1").unwrap();
-    assert_eq!(detail["status"], "governance");
-    assert_eq!(detail["candidate_commit"], fixture.candidate);
-
-    // The bounded retry (the caller's refresh-again loop) succeeds against
-    // the moved tip.
-    let retry_resolver = ScriptedResolver::new(vec![completing_edit(|request| {
-        fs::write(
-            request.workspace_dir.join("app.txt"),
-            "candidate and target v2\n",
-        )
-        .unwrap();
-    })]);
-    let outcome = refresh_candidate_with_resolver(
-        &mut context,
-        GoalStatus::Governance,
-        5,
-        Some(&retry_resolver),
-    )
-    .unwrap();
-    let CandidateRefreshOutcome::Refreshed {
-        replacement_candidate,
-        target_commit,
+    let crate::application::workflow::engine::behaviors::contract::WorkflowAdvanceOutcome::Completed {
+        final_status,
         ..
     } = outcome
     else {
-        panic!("expected the retried refresh to resolve");
+        panic!("expected a completed outcome");
     };
-    assert_eq!(target_commit, current);
-    assert_eq!(
-        git_output(
-            &fixture.worktree,
-            &["show", &format!("{replacement_candidate}:app.txt")]
-        ),
-        "candidate and target v2\n"
+    assert_eq!(final_status, GoalStatus::Failed);
+    let detail = fixture.work_items.show_goal_detail("GOAL1").unwrap();
+    assert_eq!(detail["status"], "failed");
+    assert_eq!(detail["rounds"].as_array().unwrap().len(), 1);
+    assert_eq!(detail["rounds"][0]["workflow_recovery"]["state"], "failed");
+    assert_eq!(detail["rounds"][0]["failure_category"], "integration");
+    assert!(
+        detail["rounds"][0]["workflow_recovery"]["retained_evidence"]["merge"]["conflicts"]
+            .as_array()
+            .is_some_and(|conflicts| conflicts.iter().any(|path| path == "app.txt"))
     );
 }
 
-/// `rebase --continue` commits the whole index, so scope is an acceptance
-/// gate rather than an instruction: an edit outside the conflicted files is
-/// rejected with feedback and never reaches the replacement candidate.
 #[test]
-fn an_out_of_scope_edit_is_rejected_before_it_reaches_the_replacement() {
-    let fixture = RefreshFixture::new(true);
+fn an_explicit_recovery_failure_does_not_create_another_round() {
+    let fixture = RefreshFixture::with_prior_recovery(true, Some(4));
     let mut context = fixture.context();
-    let resolver = ScriptedResolver::new(vec![
-        completing_edit(|request| {
-            fs::write(
-                request.workspace_dir.join("app.txt"),
-                "candidate and target\n",
-            )
-            .unwrap();
-            fs::write(request.workspace_dir.join("unrelated.txt"), "drive-by\n").unwrap();
-        }),
-        completing_edit(|request| {
-            assert!(
-                request
-                    .feedback
-                    .is_some_and(|feedback| feedback.contains("unrelated.txt")),
-                "the rejection must name the out-of-scope file: {:?}",
-                request.feedback
-            );
-            fs::remove_file(request.workspace_dir.join("unrelated.txt")).unwrap();
-            fs::write(
-                request.workspace_dir.join("app.txt"),
-                "candidate and target\n",
-            )
-            .unwrap();
-        }),
-    ]);
-
     let outcome =
-        refresh_candidate_with_resolver(&mut context, GoalStatus::Governance, 5, Some(&resolver))
-            .unwrap();
-
-    let CandidateRefreshOutcome::Refreshed {
-        replacement_candidate,
-        ..
-    } = outcome
-    else {
-        panic!("expected the corrected second attempt to resolve");
-    };
+        refresh_candidate_for_target_advancement(&mut context, GoalStatus::Governance).unwrap();
+    assert!(matches!(outcome, CandidateRefreshOutcome::Stopped { .. }));
     let detail = fixture.work_items.show_goal_detail("GOAL1").unwrap();
-    let resolution = &detail["rounds"][0]["workflow_candidate_refresh"]["conflict_resolution"];
-    assert_eq!(resolution["attempts"][0]["outcome"], "rejected");
-    assert_eq!(
-        resolution["attempts"][0]["out_of_scope_files"][0],
-        "unrelated.txt"
+    // Reassignment and its failed execution retain the original authored Round.
+    assert_eq!(detail["rounds"].as_array().unwrap().len(), 1);
+    assert!(
+        detail["rounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|round| round["automatic_retry"].is_null())
     );
-    assert_eq!(resolution["attempts"][1]["outcome"], "accepted");
-    // The replacement carries the resolution and nothing else.
-    let files = git_output(
-        &fixture.worktree,
-        &["ls-tree", "-r", "--name-only", &replacement_candidate],
+    assert!(
+        detail["rounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|round| round["automatic_retry"].is_null())
     );
-    assert!(!files.contains("unrelated.txt"), "{files}");
-}
-
-/// A resolver that reads both intents and cannot choose escalates with its
-/// own question, and is not asked again for the rest of its budget.
-#[test]
-fn a_declared_decision_escalates_with_the_resolvers_own_question() {
-    const QUESTION: &str = "Goal GOAL1 rewrote app.txt for the candidate line while the target rewrote it for \
-         another; which line should survive?";
-    let fixture = RefreshFixture::new(true);
-    let mut context = fixture.context();
-    let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let counted = std::sync::Arc::clone(&calls);
-    let resolver = ScriptedResolver::new(vec![Box::new(move |_request: &ResolutionRequest<'_>| {
-        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(ResolverOutcome::NeedsDecision {
-            question: QUESTION.to_string(),
-        })
-    }) as ScriptedStep]);
-
-    let outcome =
-        refresh_candidate_with_resolver(&mut context, GoalStatus::Governance, 5, Some(&resolver))
-            .unwrap();
-
-    assert!(matches!(
-        outcome,
-        CandidateRefreshOutcome::RecoveryQueued { .. }
-    ));
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    // The rebase was aborted: the exact recorded candidate is restored.
-    assert_eq!(
-        git_output(&fixture.worktree, &["rev-parse", "HEAD"]).trim(),
-        fixture.candidate
+    assert!(
+        detail["rounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|round| round["automatic_retry"].is_null())
     );
-    let detail = fixture.work_items.show_goal_detail("GOAL1").unwrap();
-    let retained = &detail["rounds"][0]["workflow_recovery"]["retained_evidence"];
-    assert_eq!(retained["conflict_resolution"]["outcome"], "needs_decision");
-    assert_eq!(retained["conflict_resolution"]["question"], QUESTION);
 }
 
 /// Crash-only: an interruption during unlocked resolution leaves the rebase
@@ -916,7 +544,7 @@ fn a_declared_decision_escalates_with_the_resolvers_own_question() {
 /// and must abort the rebase it found rather than hand the recovery Round a
 /// wedged worktree.
 #[test]
-fn an_interrupted_rebase_is_aborted_before_the_recovery_round_is_queued() {
+fn an_interrupted_rebase_is_aborted_and_retained_without_a_new_round() {
     let fixture = RefreshFixture::new(true);
     // Exactly what a crash between the two holds leaves behind.
     assert!(git(&fixture.worktree, &["rebase", "main"]).is_err());
@@ -926,9 +554,9 @@ fn an_interrupted_rebase_is_aborted_before_the_recovery_round_is_queued() {
     let mut context = fixture.context();
 
     let outcome =
-        refresh_candidate_with_resolver(&mut context, GoalStatus::Governance, 5, None).unwrap();
+        refresh_candidate_for_target_advancement(&mut context, GoalStatus::Governance).unwrap();
 
-    let CandidateRefreshOutcome::RecoveryQueued { evidence, .. } = outcome else {
+    let CandidateRefreshOutcome::Stopped { evidence, .. } = outcome else {
         panic!("expected the recovery fallback");
     };
     assert!(!worktree_git.operation_in_progress().unwrap());

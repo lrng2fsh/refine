@@ -51,7 +51,8 @@ fn static_goal_detail_logs_feature_blocking_notice_to_system() {
     let goals_detail = fs::read_to_string(static_root.join("js/features/goals-detail.js")).unwrap();
 
     assert!(goals_detail.contains("feature_blocking_notice"));
-    assert!(goals_detail.contains(r#"data-testid="goal-feature-blocking-banner""#));
+    assert!(goals_detail.contains(r#"data-testid="goal-round-history""#));
+    assert!(goals_detail.contains("htmlEscape(notice.message)"));
     assert!(goals_detail.contains("function recordFeatureBlockingNotice"));
     assert!(goals_detail.contains("recordUiNotice(notice.message"));
     assert!(goals_detail.contains(r#"source: "workflow""#));
@@ -68,10 +69,10 @@ fn static_goal_detail_uses_shared_governance_review_state_helpers() {
     assert!(common.contains("function reviewStateClass"));
     assert!(goals_detail.contains("governanceReviewStatus(round)"));
     assert!(goals_detail.contains("governanceReviewStatus(latest)"));
-    assert!(goals_detail.contains("reviewStateClass(states.product)"));
-    assert!(goals_detail.contains("reviewStateClass(states.constitution)"));
-    assert!(!goals_detail.contains(r#"product_state === "pass""#));
-    assert!(!goals_detail.contains(r#"constitution_state === "pass""#));
+    assert!(goals_detail.contains("reviewStateClass(state)"));
+    assert!(!common.contains("product_state"));
+    assert!(!common.contains("constitution_state"));
+    assert!(!common.contains("meta_rule_state"));
 }
 
 #[test]

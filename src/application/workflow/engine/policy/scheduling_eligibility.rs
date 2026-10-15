@@ -83,7 +83,7 @@ fn feature_eligible_goal_ids<'a>(
     let mut lowest_holding_order: BTreeMap<(String, &str), i64> = BTreeMap::new();
     let mut occupying_count: BTreeMap<(String, &str), usize> = BTreeMap::new();
     for goal in goals.clone() {
-        if goal.round_count == 0 {
+        if goal.round_count == 0 || goal.status == GoalStatus::Draft {
             continue;
         }
         let (Some(feature_id), Some(order)) = (goal.feature_id.as_deref(), goal.feature_order)
@@ -104,7 +104,7 @@ fn feature_eligible_goal_ids<'a>(
     goals
         .into_iter()
         .filter(|goal| {
-            if goal.round_count == 0 {
+            if goal.round_count == 0 || goal.status == GoalStatus::Draft {
                 return false;
             }
             let (Some(feature_id), Some(order)) = (goal.feature_id.as_deref(), goal.feature_order)
@@ -300,5 +300,81 @@ mod tests {
             feature_order: None,
             json_path: format!("goals/{id}/goal.json"),
         }
+    }
+}
+
+impl crate::application::workflow::WorkflowEngine {
+    /// Shared by actual admission, independent health, and preparation readback.
+    pub(crate) fn workflow_blocking_reason(
+        &self,
+        goal: &GoalIndexProjection,
+        detail: &serde_json::Value,
+        ordering: &SchedulingEligibility,
+        node: &str,
+    ) -> crate::error::RefineResult<Option<String>> {
+        if !crate::application::fleet::nodes::node_ids_match(
+            goal.node_id.as_deref().unwrap_or("default"),
+            node,
+        ) {
+            return Ok(Some("Goal is assigned to another node".into()));
+        }
+        if detail["workflow_integration_control"]["state"] == "pending" {
+            // Reconcile the accepted operation even on a parked step. Its
+            // original inputs and occurrence are checked before any Git effect;
+            // settlement cannot reopen or advance superseding work.
+            return Ok(None);
+        }
+        if !matches!(
+            goal.status,
+            GoalStatus::Todo
+                | GoalStatus::Plan
+                | GoalStatus::Implement
+                | GoalStatus::Quality
+                | GoalStatus::Governance
+        ) {
+            return Ok(Some(format!(
+                "Workflow step {} does not authorize execution",
+                goal.status.as_str()
+            )));
+        }
+        if goal.round_count == 0
+            || detail["rounds"]
+                .as_array()
+                .and_then(|r| r.last())
+                .and_then(|r| r["prompt"].as_str())
+                .is_none_or(|s| s.trim().is_empty())
+        {
+            return Ok(Some("No actionable current Round".into()));
+        }
+        for (key, reason) in [
+            (
+                "pending_workflow_outcome",
+                "Current step Error handling is pending",
+            ),
+            (
+                "pending_event_transition",
+                "Current workflow transition gates are pending",
+            ),
+        ] {
+            if detail[key]["state"] == "pending" {
+                return Ok(Some(reason.into()));
+            }
+        }
+        if let Some(reason) = self.unresolved_workflow_outcome(&goal.id, detail)? {
+            return Ok(Some(reason));
+        }
+        if !ordering.feature_eligible(&goal.id) {
+            return Ok(Some("Feature ordering blocks this Goal".into()));
+        }
+        if !ordering.priority_eligible(goal) {
+            return Ok(Some("Higher-priority work blocks this Goal".into()));
+        }
+        if goal.status == GoalStatus::Todo {
+            if let Some(root) = self.refine_dir()? {
+                return crate::application::events::FileEventService::new(root)
+                    .missing_workflow_requirement(detail, node);
+            }
+        }
+        Ok(None)
     }
 }

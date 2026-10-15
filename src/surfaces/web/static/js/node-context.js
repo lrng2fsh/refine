@@ -67,6 +67,7 @@ function hydrateNodeSelector(project, registry) {
 
 function nodeContextDirtySurfaces() {
   const dirty = [];
+  if (typeof hubEditor !== "undefined" && hubEditor?.isConnected && hubEditor.dataset.nodeContextDirty === "true") dirty.push({label: hubEditor.dataset.nodeContextLabel || "Hub", root: hubEditor});
   if (typeof automationEditor !== "undefined" && automationEditor?.dataset.nodeContextDirty === "true") dirty.push({label: "Events or Skills", root: automationEditor});
   const newGoal = document.querySelector("[data-testid='new-goal-modal']");
   const newGoalPrompt = newGoal?.querySelector("[data-testid='new-goal-prompt']");
@@ -111,6 +112,7 @@ async function confirmLocalNodeContextDiscard() {
 }
 
 async function discardLocalNodeContextSurfaces() {
+  if (typeof hubEditor !== "undefined") hubEditor?._close();
   if (typeof automationEditor !== "undefined") automationEditor?._close();
   if (typeof automationHistory !== "undefined") automationHistory?._close();
   if (typeof _discardNewGoalForNodeSwitch === "function") _discardNewGoalForNodeSwitch();
@@ -138,6 +140,7 @@ function preserveExternalDirtySurfaces(dirty) {
 
 function closeCleanNodeContextModals() {
   const dirtyRoots = new Set(nodeContextDirtySurfaces().map((item) => item.root).filter(Boolean));
+  if (typeof hubEditor !== "undefined" && hubEditor && !dirtyRoots.has(hubEditor)) hubEditor._close();
   if (typeof automationEditor !== "undefined" && automationEditor && !dirtyRoots.has(automationEditor)) automationEditor._close();
   if (typeof automationHistory !== "undefined") automationHistory?._close();
   if (typeof _newGoalModalOpen !== "undefined" && _newGoalModalOpen
@@ -164,9 +167,8 @@ async function refreshNodeContextRoute({ preservedDirty = [] } = {}) {
   if (route === "dashboard" && typeof refreshDashboard === "function") return refreshDashboard();
   if (route === "goals" && typeof refreshGoalsTable === "function") return refreshGoalsTable();
   if (route === "features" && typeof refreshFeaturesTable === "function") return refreshFeaturesTable();
-  if (route === "logs" && typeof loadLogs === "function") return loadLogs();
   if (route === "changes" && typeof loadChanges === "function") return loadChanges();
-  if (["settings", "node", "project"].includes(route || "")) {
+  if (["control", "settings", "node", "project"].includes(route || "")) {
     return refreshCurrentSettingsSurface({ force: true });
   }
   if (typeof navigate === "function") return navigate();
@@ -194,6 +196,8 @@ async function applyAuthoritativeNodeContext(project, registry, {
   if (changed) {
     nodeContextGeneration += 1;
     if (typeof refreshManualSkills === "function") refreshManualSkills();
+    if (typeof refreshHubs === "function") refreshHubs();
+    if (typeof refreshPlanningNavigation === "function") refreshPlanningNavigation();
     invalidateScreenDataCache();
     if (external) preserveExternalDirtySurfaces(preservedDirty);
     else if (!surfacesPrepared) await discardLocalNodeContextSurfaces();

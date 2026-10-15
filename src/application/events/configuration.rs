@@ -18,6 +18,8 @@ struct SkillEventBinding {
 #[serde(deny_unknown_fields)]
 struct SkillTrigger {
     #[serde(default)]
+    planning: Option<PlanningFilter>,
+    #[serde(default)]
     id: Option<String>,
     source: String,
     #[serde(default)]
@@ -31,6 +33,7 @@ struct SkillTrigger {
 fn skill_value(skill: &Skill) -> Value {
     let mut value = json!(skill);
     value.as_object_mut().unwrap().remove("role");
+    value["removable"] = json!(!super::hub_skill::protected(&skill.id));
     value
 }
 
@@ -105,14 +108,54 @@ impl FileEventService {
     pub fn config(&self) -> RefineResult<Arc<AutomationConfig>> {
         let store = AutomationStore::new(&self.refine_dir);
         let config = store.initialize(|| super::migration::migrate(&self.refine_dir))?;
-        if config.schema_version < SCHEMA_VERSION {
-            store.upgrade(super::migration::single_trigger_skills)
+        let config = if config.schema_version < SCHEMA_VERSION {
+            store.upgrade(|config| {
+                if config.schema_version < 2 {
+                    super::migration::single_trigger_skills(config)?;
+                }
+                for source in system_catalog() {
+                    config
+                        .events
+                        .entry(source.clone())
+                        .or_insert_with(|| EventDefinition {
+                            id: source.clone(),
+                            name: source.clone(),
+                            kind: EventKind::System,
+                            source: Some(source),
+                            enabled: true,
+                            scope: Scope::default(),
+                            parameters: vec![],
+                            bindings: vec![],
+                            on_success: None,
+                        });
+                }
+                config.schema_version = SCHEMA_VERSION;
+                Ok(())
+            })?
         } else {
-            Ok(config)
-        }
+            config
+        };
+        let config = if !config.skills.contains_key(super::hub_skill::ID)
+            || !config
+                .skills
+                .contains_key(crate::application::hub::metrics::SKILL_ID)
+        {
+            match store.update(config.revision, |config| {
+                super::hub_skill::install(config);
+                Ok(())
+            }) {
+                Ok(config) => config,
+                Err(RefineError::Conflict(_)) => return self.config(),
+                Err(error) => return Err(error),
+            }
+        } else {
+            config
+        };
+        super::migration::retire_settings(&self.refine_dir)?;
+        Ok(config)
     }
     pub fn catalog(&self) -> Value {
-        json!({"sources": system_catalog(), "custom_source": CUSTOM_EVENT_ID, "roles": WORKFLOW_STEPS.iter().copied().chain(std::iter::once("task")).collect::<Vec<_>>()})
+        json!({"sources": system_catalog(), "custom_source": CUSTOM_EVENT_ID, "completion_contract": crate::application::agent_io::contracts::skill_result::report_contract(), "roles": WORKFLOW_STEPS.iter().copied().chain(std::iter::once("task")).collect::<Vec<_>>()})
     }
     pub fn skill_catalog(&self) -> Value {
         json!({"sources": std::iter::once(CUSTOM_EVENT_ID.to_string()).chain(system_catalog()).collect::<Vec<_>>()})
@@ -125,27 +168,27 @@ impl FileEventService {
             .ok_or_else(|| RefineError::NotFound(format!("Skill {id}")))?;
         let triggers: Vec<_> = config.events.values().flat_map(|event| {
             event.bindings.iter().filter(|b| b.skill_id == id).map(|b| {
-                json!({"id": b.id, "source": event.source.as_deref().unwrap_or(CUSTOM_EVENT_ID), "mode": b.mode, "order": b.order, "inputs": b.inputs})
+                json!({"id": b.id, "source": event.source.as_deref().unwrap_or(CUSTOM_EVENT_ID), "mode": b.mode, "order": b.order, "inputs": b.inputs, "planning": b.planning})
             })
         }).collect();
         Ok(
-            json!({"revision": config.revision, "item": skill_value(skill), "trigger": triggers.first()}),
+            json!({"revision": config.revision, "item": skill_value(skill), "trigger": if triggers.len() == 1 { triggers.first() } else { None }, "triggers": triggers}),
         )
     }
     pub fn list(&self, collection: &str, node: Option<&str>) -> RefineResult<Value> {
         let config = self.config()?;
-        let trigger_sources: std::collections::BTreeMap<_, _> = config
-            .events
-            .values()
-            .flat_map(|event| {
-                event.bindings.iter().map(move |b| {
-                    (
-                        b.skill_id.as_str(),
-                        event.source.as_deref().unwrap_or(CUSTOM_EVENT_ID),
-                    )
-                })
-            })
-            .collect();
+        let mut trigger_sources = std::collections::BTreeMap::<&str, Vec<&str>>::new();
+        for event in config.events.values() {
+            for binding in &event.bindings {
+                let sources = trigger_sources
+                    .entry(binding.skill_id.as_str())
+                    .or_default();
+                let source = event.source.as_deref().unwrap_or(CUSTOM_EVENT_ID);
+                if !sources.contains(&source) {
+                    sources.push(source);
+                }
+            }
+        }
         let items: Vec<Value> = match collection {
             "skills" => config
                 .skills
@@ -153,7 +196,16 @@ impl FileEventService {
                 .filter(|s| node.is_none_or(|n| s.scope.applies(n)))
                 .map(|skill| {
                     let mut value = skill_value(skill);
-                    value["trigger_source"] = json!(trigger_sources.get(skill.id.as_str()));
+                    let sources = trigger_sources
+                        .get(skill.id.as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                    value["trigger_source"] = json!(if sources.len() == 1 {
+                        sources.first()
+                    } else {
+                        None
+                    });
+                    value["trigger_sources"] = json!(sources);
                     value
                 })
                 .collect(),
@@ -199,7 +251,7 @@ impl FileEventService {
         }
         if body.get("triggers").is_some() {
             return Err(RefineError::InvalidInput(
-                "A Skill has one trigger; use trigger instead of triggers".into(),
+                "Use event_bindings to save multiple assignments".into(),
             ));
         }
         let revision = body
@@ -223,7 +275,9 @@ impl FileEventService {
             ));
         }
         object.insert("id".into(), json!(id));
+        object.remove("removable");
         object.remove("trigger_source");
+        object.remove("trigger_sources");
         // The Skill editor owns its assignments. Apply the complete selection with
         // the Skill under the same revision fence; leave other Skills untouched.
         let assignments = body
@@ -255,6 +309,11 @@ impl FileEventService {
                     let skill: Skill = serde_json::from_value(item.clone())
                         .map_err(|e| RefineError::InvalidInput(e.to_string()))?;
                     let is_new = !config.skills.contains_key(id);
+                    if trigger.is_some() && prior.values().map(Vec::len).sum::<usize>() > 1 {
+                        return Err(RefineError::InvalidInput(
+                            "This Skill has multiple assignments. Use event_bindings to edit assignments, or omit trigger to edit the shared Skill.".into(),
+                        ));
+                    }
                     if body.get("create_only") == Some(&json!(true)) && !is_new {
                         return Err(RefineError::Conflict(
                             "A Skill with this ID already exists".into(),
@@ -302,6 +361,7 @@ impl FileEventService {
                         Some(vec![SkillEventBinding {
                             event_id,
                             binding: Binding {
+                                planning: trigger.planning,
                                 id: trigger
                                     .id
                                     .unwrap_or_else(|| format!("trigger-{}", uuid::Uuid::new_v4())),
@@ -376,6 +436,19 @@ impl FileEventService {
         Ok(json!({"revision": config.revision, "item": saved}))
     }
     pub fn remove(&self, collection: &str, id: &str, revision: u64) -> RefineResult<Value> {
+        if collection == "skills" {
+            if super::hub_skill::protected(id) {
+                return Err(RefineError::InvalidInput(
+                    "Built-in Hub Skills cannot be removed".into(),
+                ));
+            }
+            let hub = crate::application::hub::Hub::new(&self.refine_dir, &self.refine_dir);
+            if !hub.for_skill(id)?.is_empty() {
+                return Err(RefineError::InvalidInput(
+                    "Assign another Skill to the associated Hubs before removing this Skill".into(),
+                ));
+            }
+        }
         self.config()?;
         let config = AutomationStore::new(&self.refine_dir).update(revision, |config| {
             let prior = skill_assignment_ids(config, id);

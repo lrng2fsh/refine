@@ -20,17 +20,13 @@ use crate::application::projects::projection::{
     PROJECTION_SNAPSHOT_FILE, PageRequest, ProjectionQuery,
 };
 use crate::application::work_items::{
-    BulkFeatureSelection, BulkFeatureUpdate, BulkGoalSelection, BulkGoalUpdate,
-    FeatureGoalAuthoringRequest, FileWorkItemService, GoalAuthoringRequest,
+    BulkFeatureSelection, BulkFeatureUpdate, BulkGoalSelection, FeatureGoalAuthoringRequest,
+    FileWorkItemService, GoalAuthoringRequest,
 };
 use crate::application::workers::FileRunnerWorkerService;
-use crate::application::workflow::WorkflowEngine;
-use crate::application::workflow::engine::scheduling::BacklogPromotionService;
 use crate::application::workflow::governance::integration::FileGovernanceIntegrationService;
 use crate::error::RefineError;
-use crate::infrastructure::agents::invocation::{
-    AgentProviderService, HostAgentProviderService, ProviderInvocation,
-};
+use crate::infrastructure::agents::invocation::{AgentProviderService, ProviderInvocation};
 use crate::infrastructure::git::with_repository_git_lock;
 use crate::infrastructure::git::worktrees::{FileGitWorktreeService, GitWorktreeService};
 use crate::infrastructure::observability::activity::{ActivityService, FileActivityService};

@@ -2,6 +2,42 @@ use super::*;
 
 #[derive(Debug, Subcommand)]
 pub enum WorkflowAction {
+    /// Inspect a Goal's authoritative workflow state and pending outcome.
+    Show { id: String },
+    /// Move a Goal with context. --force records an explicit policy override.
+    Move {
+        id: String,
+        #[arg(long)]
+        to: CliGoalStatus,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        context_file: Option<PathBuf>,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        force: bool,
+        #[arg(long, default_value = "operator")]
+        actor: String,
+        #[arg(long)]
+        invocation_id: Option<String>,
+    },
+    /// Explicitly integrate a pinned candidate despite missing workflow checks.
+    Integrate {
+        id: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        force: bool,
+        #[arg(long, default_value = "operator")]
+        actor: String,
+    },
     /// Pause workflow automation: block new Goal admission and quiesce automatic Git sync and inactive-worktree cleanup at safe boundaries. Active Goal executions continue unless stopped separately.
     Pause {
         /// Runtime directory where Refine keeps daemon state.
@@ -18,6 +54,7 @@ pub enum WorkflowAction {
 
 #[derive(Clone, Debug, ValueEnum)]
 pub enum CliGoalStatus {
+    Draft,
     Backlog,
     Todo,
     Plan,
@@ -33,6 +70,7 @@ pub enum CliGoalStatus {
 impl From<CliGoalStatus> for GoalStatus {
     fn from(value: CliGoalStatus) -> Self {
         match value {
+            CliGoalStatus::Draft => Self::Draft,
             CliGoalStatus::Backlog => Self::Backlog,
             CliGoalStatus::Todo => Self::Todo,
             CliGoalStatus::Plan => Self::Plan,

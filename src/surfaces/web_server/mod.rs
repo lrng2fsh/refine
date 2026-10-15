@@ -19,6 +19,14 @@ pub struct ApiRouteGroup {
 
 pub const API_GROUPS: &[ApiRouteGroup] = &[
     ApiRouteGroup {
+        prefix: "/api/hub",
+        capability: "Hub sites, assets, JSON collections, indexes, queries and publishing",
+    },
+    ApiRouteGroup {
+        prefix: "/workflow/goals",
+        capability: "Inspect and control workflow outcomes, explicit retries, audited forced moves and integration",
+    },
+    ApiRouteGroup {
         prefix: "/system",
         capability: "install state, daemon status, semantic releases, release update, source promotion, doctor",
     },
@@ -79,8 +87,16 @@ pub const API_GROUPS: &[ApiRouteGroup] = &[
         capability: "internal system occurrences and legacy configuration compatibility",
     },
     ApiRouteGroup {
+        prefix: "/planning",
+        capability: "Shared project boards, lanes, Goal cards, routing and durable lane actions",
+    },
+    ApiRouteGroup {
+        prefix: "/templates",
+        capability: "editable system prompt Templates and rendering previews",
+    },
+    ApiRouteGroup {
         prefix: "/skills",
-        capability: "Skills with one trigger, typed inputs, cloning support and manual execution",
+        capability: "Reusable Skills with trigger assignments, typed inputs, cloning support and manual execution",
     },
     ApiRouteGroup {
         prefix: "/event-invocations",
@@ -93,6 +109,10 @@ pub const API_GROUPS: &[ApiRouteGroup] = &[
     ApiRouteGroup {
         prefix: "/chat",
         capability: "sessions, messages, streaming events",
+    },
+    ApiRouteGroup {
+        prefix: "/providers",
+        capability: "shared CLI provider catalog and effective node selection",
     },
     ApiRouteGroup {
         prefix: "/settings",
@@ -108,7 +128,7 @@ pub const API_GROUPS: &[ApiRouteGroup] = &[
     },
     ApiRouteGroup {
         prefix: "/todos",
-        capability: "Reporter-scoped todo lists and items",
+        capability: "legacy Todo compatibility before Project Planning migration",
     },
     ApiRouteGroup {
         prefix: "/nodes",
@@ -235,3 +255,10 @@ mod tests;
 mod work_routes;
 
 pub use http::{HttpRequest, LocalHttpDaemon, WireResponse};
+
+mod hub_routes;
+mod outcome_routes;
+mod planning_routes;
+mod template_routes;
+
+mod hub_host;

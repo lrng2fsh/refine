@@ -75,6 +75,7 @@ async function renderGoalsList() {
     <div id="goals-workflow" class="goals-workflow" data-testid="goals-workflow">
       ${renderWorkflowVisualization({
         counts: {},
+        selectedStatuses: f.status ? [f.status] : [],
         hrefForStatus: (status) => goalsWorkflowStatusHash(status, f),
         className: "goals-workflow-grid",
       })}
@@ -324,6 +325,7 @@ function drawGoalsWorkflowVisualization(filter, counts) {
   if (!root) return;
   renderInto(root, renderWorkflowVisualization({
     counts,
+    selectedStatuses: filter.status ? [filter.status] : [],
     hrefForStatus: (status) => goalsWorkflowStatusHash(status, filter),
     className: "goals-workflow-grid",
   }));
@@ -334,7 +336,7 @@ async function refreshGoalsTable() {
   if (renderNoProjectIfDetached("Goals")) return;
   const nodeGeneration = captureNodeContextGeneration();
   const f = goalsFilterFromHash();
-  const params = new URLSearchParams();
+  const params = new URLSearchParams({exclude_draft: "1"});
   if (f.status) params.set("status", f.status);
   if (f.q) params.set("q", f.q);
   if (f.reporter) params.set("reporter", f.reporter);

@@ -87,7 +87,7 @@ fn run_checked(
         round_idx: Some(ctx.round_idx),
         workflow_revision: Some(ctx.attempt_authority.workflow_revision),
         candidate_commit: ctx.commit.clone(),
-        data: json!({"goal": super::execution::goal_context(&goal), "system": {"node_id": ctx.node_id, "project_root": ctx.target_root, "workspace": cwd, "workflow_step": status.as_str(), "candidate_commit": ctx.commit}, "context": data}),
+        data: json!({"goal": super::execution::goal_context(&goal), "system": {"node_id": ctx.node_id, "project_root": ctx.target_root, "workspace": cwd, "workflow_step": status.as_str(), "candidate_commit": ctx.commit, "refine_executable": std::env::current_exe().ok()}, "context": data}),
         metadata: ctx.workflow_process_metadata(status.as_str(), "EventSkill"),
     };
     // Todo has no implementation checkout yet. Entry reuses the durable occurrence
@@ -144,7 +144,7 @@ fn run_checked(
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
-            evidence.insert(invocation.id.clone(), json!({"source": source, "state": invocation.state, "results": invocation.results, "candidate_commit": ctx.commit}));
+            evidence.insert(invocation.id.clone(), json!({"source": source, "generation": ctx.attempt_authority.generation, "round_idx": ctx.round_idx, "state": invocation.state, "results": invocation.results, "candidate_commit": ctx.commit}));
             ctx.work_items.update_goal_round_evaluation_summary(
                 &ctx.goal_id,
                 ctx.round_idx,
@@ -210,6 +210,16 @@ pub fn exit(ctx: &WorkflowContext<'_>, from: GoalStatus, to: GoalStatus) -> Refi
         )?;
         require_success(&checked.results)?;
     }
+    let success = run_checked(
+        ctx,
+        from.clone(),
+        "success",
+        cwd,
+        json!({"destination": to.as_str(), "candidate_commit": ctx.commit}),
+        "",
+    )?;
+    require_success(&success.results)?;
+    checked.required.extend(success.required);
     let results = run_checked(
         ctx,
         from.clone(),

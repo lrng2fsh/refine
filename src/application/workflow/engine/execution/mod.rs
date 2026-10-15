@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::application::projects::projection::ActiveGoalIndex;
 use crate::application::work_items::FileWorkItemService;
-use crate::application::work_items::WorkflowAttemptAuthority;
+use crate::application::work_items::WorkflowStepAuthority;
 use crate::application::workflow::engine::behaviors::contract::{
     WorkflowAdvanceOutcome, WorkflowBehavior,
 };
@@ -32,7 +31,6 @@ use crate::application::workflow::{
 
 mod admission;
 mod attempt;
-mod retry;
 #[cfg(test)]
 pub(crate) mod test_hooks;
 use attempt::contain;
@@ -49,11 +47,6 @@ impl WorkflowEngine {
     pub fn evaluate_workflow(&self) -> RefineResult<WorkflowPassResult> {
         self.execute_pass(None)
     }
-    pub fn promote(&self) -> RefineResult<usize> {
-        self.ensure_automation_running()?;
-        self.promote_backlog_to_todo()
-    }
-
     pub fn execute_work(&self) -> RefineResult<Vec<WorkflowStepResult>> {
         self.execute_pass(None).map(|pass| pass.steps)
     }
@@ -67,7 +60,6 @@ impl WorkflowEngine {
         &self,
         worker_registry: Option<&std::path::Path>,
     ) -> RefineResult<WorkflowPassResult> {
-        let mut promoted = 0;
         let mut results = Vec::new();
         let mut errors = Vec::new();
         std::thread::scope(|scope| {
@@ -77,6 +69,10 @@ impl WorkflowEngine {
             let mut order = 0usize;
             let mut cycle_failures = 0;
             let mut rescan_required = false;
+            // Suppress repeated preparation faults only for the observed occurrence
+            // within this pass. A later workflow decision is immediately reconsidered.
+            let mut failed = BTreeMap::new();
+            let mut launched_generations = BTreeMap::new();
             loop {
                 // This is the admission controller itself, never a heartbeat helper thread.
                 crate::application::workflow::health::scheduler_tick(
@@ -109,11 +105,12 @@ impl WorkflowEngine {
                     });
                     match outcome {
                         Ok(result) => {
-                            self.clear_retry(&id);
                             results.push((order, result));
                         }
                         Err(error) => {
-                            self.record_retry(&id);
+                            if let Some(generation) = launched_generations.remove(&id) {
+                                failed.insert(id.clone(), generation);
+                            }
                             errors.push(error);
                         }
                     }
@@ -126,7 +123,7 @@ impl WorkflowEngine {
                 {
                     let handle: std::thread::ScopedJoinHandle<
                         '_,
-                        RefineResult<(usize, Vec<(String, super::admission::AdmissionLease)>)>,
+                        RefineResult<Vec<(String, super::admission::AdmissionLease, u64)>>,
                     > = discovery.take().unwrap();
                     let outcome = handle.join().unwrap_or_else(|_| {
                         Err(RefineError::Conflict("workflow discovery panicked".into()))
@@ -140,14 +137,14 @@ impl WorkflowEngine {
                         failure.as_deref(),
                     );
                     match outcome {
-                        Ok((count, ids)) => {
-                            promoted += count;
+                        Ok(ids) => {
                             cycle_failures = 0;
                             let empty = ids.is_empty();
-                            for (id, lease) in ids {
+                            for (id, lease, generation) in ids {
                                 if active.contains_key(&id) {
                                     continue;
                                 }
+                                launched_generations.insert(id.clone(), generation);
                                 let goal_id = id.clone();
                                 active.insert(
                                     id,
@@ -170,9 +167,10 @@ impl WorkflowEngine {
                                                 self,
                                                 &goal_id,
                                                 "delivery",
-                                                WorkflowAttemptAuthority {
+                                                WorkflowStepAuthority {
                                                     round_idx: 0,
                                                     workflow_revision: 0,
+                                                    generation: 0,
                                                 },
                                             )?;
                                             outcome
@@ -193,33 +191,39 @@ impl WorkflowEngine {
                             }
                         }
                     }
-                    next_cycle = if rescan_required {
-                        Instant::now()
-                    } else {
-                        Instant::now() + ACTIVE_WORK_REPLENISH_INTERVAL
-                    };
+                    if rescan_required {
+                        next_cycle = Instant::now();
+                    }
                 }
                 if discovery.is_none() && Instant::now() >= next_cycle {
+                    // The poll budget includes discovery itself. Measuring from its
+                    // completion adds another full interval after capacity becomes free.
+                    next_cycle = Instant::now() + ACTIVE_WORK_REPLENISH_INTERVAL;
                     let ids = active.keys().cloned().collect::<BTreeSet<_>>();
                     // An empty discovery captured before a completion cannot prove the queue
                     // is empty afterward: completion can free capacity or author a recovery Round.
                     rescan_required = false;
+                    let failed = failed.clone();
                     discovery = Some(scope.spawn(move || contain("admission", || {
                         crate::infrastructure::process::supervisor::coordination::with_lock_timeout(Duration::from_millis(200), || {
-                            if self.workflow_paused()? || !self.target_still_attached(worker_registry)? { return Ok((0, Vec::new())); }
+                            if self.workflow_paused()? || !self.target_still_attached(worker_registry)? { return Ok(Vec::new()); }
                             #[cfg(test)]
                             test_hooks::scheduler(self)?;
                             let skills_first = super::admission::skills_first(&self.runtime_root);
                             self.service_pending_skills(usize::from(skills_first));
-                            let promoted = self.promote_backlog_to_todo()?;
                             let mut candidates = Vec::new();
-                            for id in self.launchable_goals(&ids)? {
+                            let mut excluded = ids;
+                            for (id, generation) in &failed {
+                                if self.scheduling_generation(id)? == *generation { excluded.insert(id.clone()); }
+                            }
+                            for id in self.launchable_goals(&excluded)? {
+                                let generation = self.scheduling_generation(&id)?;
                                 if let Some(lease) = self.reserve_goal(&id)? {
-                                    candidates.push((id, lease));
+                                    candidates.push((id, lease, generation));
                                 }
                             }
                             self.service_pending_skills(32);
-                            Ok((promoted, candidates))
+                            Ok(candidates)
                         })
                     })));
                 }
@@ -231,7 +235,6 @@ impl WorkflowEngine {
         }
         results.sort_by_key(|(order, _)| *order);
         Ok(WorkflowPassResult {
-            promoted,
             steps: results.into_iter().map(|(_, result)| result).collect(),
         })
     }

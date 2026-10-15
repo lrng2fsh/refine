@@ -13,12 +13,13 @@ fn workflow_goal_agent_prompt_excludes_interactive_checkout_guidance() {
         spec,
         Path::new("/runtime/processes/goal-agent.signal.json"),
         None,
-    );
+    )
+    .unwrap();
 
     assert!(!prompt.contains("Active Refine executable"));
     assert!(!prompt.contains("checkout-local `./r`"));
     assert!(prompt.contains("/runtime/processes/goal-agent.signal.json"));
-    assert!(prompt.contains("completed|no_change_needed|deviated|rejected|blocked"));
+    assert!(prompt.contains("Use your judgment to decide when to stop"));
     assert!(!prompt.contains("{{"));
     assert_eq!(prompt.matches("# Goal Agent Specification").count(), 1);
     assert_eq!(prompt.matches("LATEST_SENTINEL").count(), 1);
@@ -32,10 +33,12 @@ fn workflow_goal_agent_prompt_excludes_interactive_checkout_guidance() {
 #[test]
 fn every_goal_agent_phase_uses_the_integer_guidance_completion_contract() {
     let signal = Path::new("/runtime/processes/goal-agent.signal.json");
-    let plan = goal_agent_protocol_prompt("PLAN_SENTINEL", signal, Some("plan"));
-    let criticize = goal_agent_protocol_prompt("CRITICIZE_SENTINEL", signal, Some("criticize"));
-    let revise = goal_agent_protocol_prompt("REVISE_SENTINEL", signal, Some("revise"));
-    let implement = goal_agent_protocol_prompt("IMPLEMENT_SENTINEL", signal, Some("implement"));
+    let plan = goal_agent_protocol_prompt("PLAN_SENTINEL", signal, Some("plan")).unwrap();
+    let criticize =
+        goal_agent_protocol_prompt("CRITICIZE_SENTINEL", signal, Some("criticize")).unwrap();
+    let revise = goal_agent_protocol_prompt("REVISE_SENTINEL", signal, Some("revise")).unwrap();
+    let implement =
+        goal_agent_protocol_prompt("IMPLEMENT_SENTINEL", signal, Some("implement")).unwrap();
 
     for prompt in [&plan, &criticize, &revise, &implement] {
         assert!(prompt.contains("zero-based integer Completion Index"));
@@ -44,18 +47,11 @@ fn every_goal_agent_phase_uses_the_integer_guidance_completion_contract() {
         assert!(prompt.contains(signal.to_str().unwrap()));
         assert!(!prompt.contains("{{"));
     }
-    for prompt in [&plan, &criticize, &revise] {
-        assert!(prompt.contains("required `planning_result`"));
-        assert!(prompt.contains("never omitted or quoted as a string"));
-        assert!(!prompt.contains("implementation_evidence"));
+    for prompt in [&plan, &criticize, &revise, &implement] {
+        assert!(prompt.contains("Use your judgment to decide when to stop"));
+        assert!(!prompt.contains("checklist"));
+        assert!(!prompt.contains("required `planning_result`"));
     }
-    assert!(plan.contains("\"checklist\""));
-    assert!(criticize.contains("\"findings\""));
-    assert!(revise.contains("\"criticism_resolutions\""));
-    assert!(revise.contains("\"criticism_id\":\"C1\""));
-    assert!(revise.contains("\"resolution\":\"how the revised plan resolves"));
-    assert!(implement.contains("implementation_evidence"));
-    assert!(!implement.contains("planning_result"));
 }
 
 #[test]
@@ -122,7 +118,7 @@ fn completion_signal_allows_partial_json_only_for_the_write_grace_period() {
 }
 
 #[test]
-fn planning_completion_signals_must_carry_the_planning_result_object() {
+fn completion_decision_does_not_require_a_planning_result() {
     let root = unique_temp_dir("goal-agent-omitted-planning-result");
     fs::create_dir_all(&root).unwrap();
     let signal_path = root.join("goal-agent.signal.json");
@@ -132,17 +128,9 @@ fn planning_completion_signals_must_carry_the_planning_result_object() {
     )
     .unwrap();
 
-    let mut reader = SignalReader::new(Duration::ZERO).requiring_planning_result(true);
-    let SignalRead::InvalidContract(diagnostic) = reader.take(&signal_path).unwrap() else {
-        panic!("a planning completion without planning_result must be rejected");
-    };
-    assert!(diagnostic.contains("omitted the required planning_result object"));
-    // The rejected payload stays on disk for recovery to archive.
-    assert!(signal_path.is_file());
-
-    let mut lenient = SignalReader::new(Duration::ZERO);
+    let mut reader = SignalReader::new(Duration::ZERO);
     assert!(matches!(
-        lenient.take(&signal_path).unwrap(),
+        reader.take(&signal_path).unwrap(),
         SignalRead::Valid(_)
     ));
     fs::remove_dir_all(root).unwrap();
@@ -163,10 +151,9 @@ fn implementation_completion_signal_accepts_no_change_needed_evidence() {
         panic!("no_change_needed must be accepted by the Goal Agent completion schema");
     };
     let implementation_evidence = signal.implementation_evidence.unwrap();
-    let outcome = &implementation_evidence.checklist.first().unwrap().outcome;
     assert_eq!(
-        outcome,
-        &crate::model::goal::ImplementationChecklistOutcome::NoChangeNeeded
+        implementation_evidence["checklist"][0]["outcome"],
+        "no_change_needed"
     );
     assert!(!signal_path.exists());
     fs::remove_dir_all(root).unwrap();
@@ -201,6 +188,7 @@ fn planning_session_returns_the_structured_result_from_its_completion_signal() {
     metadata.insert("implementation_phase".to_string(), json!("plan"));
     let result = run_goal_agent(
         GoalAgentLaunch {
+            refine_dir: None,
             provider_session: None,
             runtime_root,
             cwd: app_root,
@@ -260,6 +248,7 @@ fn goal_agent_hard_cap_terminates_a_session_without_a_completion_signal() {
     let started_at = std::time::Instant::now();
     let error = run_goal_agent(
         GoalAgentLaunch {
+            refine_dir: None,
             provider_session: None,
             runtime_root: runtime_root.clone(),
             cwd: app_root,
@@ -321,6 +310,7 @@ fn goal_agent_idle_timeout_fails_fast_and_preserves_the_transcript() {
     let started_at = std::time::Instant::now();
     let error = run_goal_agent(
         GoalAgentLaunch {
+            refine_dir: None,
             provider_session: None,
             runtime_root: runtime_root.clone(),
             cwd: app_root,
@@ -401,6 +391,7 @@ fn goal_agent_survives_a_deleted_command_channel() {
 
     let result = run_goal_agent(
         GoalAgentLaunch {
+            refine_dir: None,
             provider_session: None,
             runtime_root: runtime_root.clone(),
             cwd: app_root,
@@ -445,7 +436,18 @@ fn workflow_goal_agent_providers_receive_the_same_composed_specification() {
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).unwrap();
     }
+    let state_root = root.join("state");
+    let mut catalog = crate::model::providers::defaults();
+    catalog
+        .providers
+        .push(crate::model::providers::ProviderDefinition::generic(
+            "custom-agent",
+        ));
+    crate::infrastructure::storage::providers::ProviderStore::new(&state_root)
+        .save(catalog)
+        .unwrap();
     let service = HostAgentProviderService {
+        refine_dir: Some(state_root),
         path_override: Some(bin_dir.display().to_string()),
         runtime_root: Some(root.join("run/8082/agents")),
     };
@@ -455,7 +457,8 @@ fn workflow_goal_agent_providers_receive_the_same_composed_specification() {
         spec,
         Path::new("/runtime/processes/goal-agent.signal.json"),
         None,
-    );
+    )
+    .unwrap();
 
     for provider in [
         "claude",
@@ -511,6 +514,7 @@ fn workflow_goal_agent_is_discoverable_and_attachable_while_running() {
         metadata.insert("goal_id".to_string(), json!("GOAL1"));
         run_goal_agent(
             GoalAgentLaunch {
+                refine_dir: None,
                 provider_session: None,
                 runtime_root: runtime_for_thread,
                 cwd: app_for_thread,
@@ -563,6 +567,7 @@ fn workflow_goal_agent_is_discoverable_and_attachable_while_running() {
     duplicate_metadata.insert("goal_id".to_string(), json!("GOAL1"));
     let duplicate = run_goal_agent(
         GoalAgentLaunch {
+            refine_dir: None,
             provider_session: None,
             runtime_root: runtime_root.clone(),
             cwd: app_root.clone(),
@@ -629,6 +634,7 @@ fn workflow_goal_agent_surfaces_needs_input_and_continues_same_session() {
         metadata.insert("goal_id".to_string(), json!("GOAL2"));
         run_goal_agent(
             GoalAgentLaunch {
+                refine_dir: None,
                 provider_session: None,
                 runtime_root: runtime_for_thread,
                 cwd: app_for_thread,
@@ -699,6 +705,7 @@ fn workflow_goal_agent_handoff_survives_dead_process_recovery() {
     metadata.insert("goal_id".to_string(), json!("GOAL-RECOVERY"));
     let result = run_goal_agent_session(
         GoalAgentLaunch {
+            refine_dir: None,
             provider_session: None,
             runtime_root: runtime_root.clone(),
             cwd: app_root,
@@ -746,12 +753,24 @@ fn workflow_goal_agent_handoff_survives_dead_process_recovery() {
             .join(format!("{}.json", result.process_id))
             .exists()
     );
+    let retained: ManagedProcess = serde_json::from_slice(
+        &fs::read(
+            supervisor
+                .process_history_dir()
+                .join(format!("{}.json", result.process_id)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(retained.state, "exited");
+    assert!(retained.stdin_path.is_none());
+    let transcript = Path::new(retained.stdout_path.as_deref().unwrap());
     assert!(
-        !supervisor
-            .processes_dir()
-            .join(format!("{}.stdout.log", result.process_id))
-            .exists()
+        fs::read_to_string(transcript)
+            .unwrap()
+            .contains("transcript survives recovery")
     );
+    assert!(supervisor.list().unwrap().is_empty());
     // The inode remains stable so a waiting consumer cannot lock an unlinked lease.
     let lease = supervisor
         .begin_artifact_handoff(&result.process_id)
@@ -807,6 +826,7 @@ fn workflow_goal_agent_pty_delivers_oversized_prompts_by_file_with_final_environ
     let prompt = format!("{secret}{}", "p".repeat(80_000 - secret.len()));
     let result = run_goal_agent(
         GoalAgentLaunch {
+            refine_dir: None,
             provider_session: None,
             runtime_root,
             cwd: app_root,
@@ -856,6 +876,7 @@ fn workflow_goal_agent_early_exec_failure_preserves_errno_and_cleans_channels() 
 
     let error = run_goal_agent(
         GoalAgentLaunch {
+            refine_dir: None,
             provider_session: None,
             runtime_root: runtime_root.clone(),
             cwd: app_root,
@@ -1077,6 +1098,7 @@ fn goal_agent_survives_transient_pty_eio_while_writing_its_signal_slowly() {
 
     let result = run_goal_agent(
         GoalAgentLaunch {
+            refine_dir: None,
             provider_session: None,
             runtime_root,
             cwd: app_root,
@@ -1141,6 +1163,7 @@ fn goal_agent_ansi_only_output_keeps_the_session_alive() {
 
     let result = run_goal_agent(
         GoalAgentLaunch {
+            refine_dir: None,
             provider_session: None,
             runtime_root,
             cwd: app_root,
@@ -1192,6 +1215,7 @@ fn goal_agent_idle_kill_takes_the_whole_process_group_down() {
     let started_at = std::time::Instant::now();
     let error = run_goal_agent(
         GoalAgentLaunch {
+            refine_dir: None,
             provider_session: None,
             runtime_root,
             cwd: app_root,
@@ -1254,6 +1278,7 @@ fn silent_goal_agent_remains_autonomous_without_requesting_input() {
     let mut attention = Vec::new();
     let result = run_goal_agent(
         GoalAgentLaunch {
+            refine_dir: None,
             provider_session: None,
             runtime_root,
             cwd: app_root,
@@ -1276,5 +1301,25 @@ fn silent_goal_agent_remains_autonomous_without_requesting_input() {
             std::env::remove_var("REFINE_SMOKE_AI_PATH");
         }
     }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn edited_session_template_can_omit_the_completion_contract_entirely() {
+    use crate::application::templates::{TemplateScope, TemplateStore};
+    let root = unique_temp_dir("session-template");
+    fs::create_dir_all(&root).unwrap();
+    let store = TemplateStore::new(Some(&root));
+    store
+        .save("goal-agents-session", 0, "Only {{goal_prompt}}")
+        .unwrap();
+    // An unused completion template must not be evaluated or appended.
+    store.save("goal-completion", 0, "{{diagnostics}}").unwrap();
+    let _scope = TemplateScope::for_root(Some(&root)).unwrap();
+    assert_eq!(
+        goal_agent_protocol_prompt("{{signal_path}}", Path::new("/runtime/signal.json"), None)
+            .unwrap(),
+        "Only {{signal_path}}"
+    );
     fs::remove_dir_all(root).unwrap();
 }

@@ -50,94 +50,6 @@ fn goal_agent_context_pins_governance_and_only_enabled_guidance() {
 }
 
 #[test]
-fn same_turn_guidance_decision_resolves_candidates_without_an_extra_provider() {
-    let context = json!({
-        "version": 1,
-        "guidance_candidates": [
-            {"name": "Architecture", "rule": "Architecture changes", "instructions": "Preserve boundaries."},
-            {"name": "Mobile", "rule": "Mobile changes", "instructions": "Test touch behavior."}
-        ]
-    });
-
-    let decision = guidance_decision(&context, Some(&[0]), false).unwrap();
-
-    assert_eq!(decision["context_version"], 1);
-    assert_eq!(decision["applied"][0]["name"], "Architecture");
-    assert_eq!(decision["skipped"][0]["name"], "Mobile");
-}
-
-#[test]
-fn guidance_candidates_require_an_explicit_valid_completion_selection() {
-    let context = json!({
-        "version": 1,
-        "guidance_candidates": [
-            {"name": "Architecture", "rule": "Architecture changes", "instructions": "Preserve boundaries."}
-        ]
-    });
-
-    assert!(guidance_decision(&context, None, false).is_err());
-    assert!(guidance_decision(&context, Some(&[0, 0]), false).is_err());
-    assert!(guidance_decision(&context, Some(&[1]), false).is_err());
-    assert!(guidance_decision(&context, Some(&[]), false).is_ok());
-}
-
-#[test]
-fn code_file_guidance_cannot_be_skipped_when_code_changed() {
-    let context = json!({
-        "version": 1,
-        "guidance_candidates": [
-            {
-                "name": "Cohesive code files",
-                "rule": CODE_FILE_GUIDANCE_RULE,
-                "instructions": "Keep each code file focused."
-            },
-            {
-                "name": "Mobile",
-                "rule": "Apply to mobile changes.",
-                "instructions": "Test touch behavior."
-            }
-        ]
-    });
-
-    let error = guidance_decision(&context, Some(&[]), true).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("requires it for changed code files")
-    );
-
-    let decision = guidance_decision(&context, Some(&[0]), true).unwrap();
-    assert_eq!(decision["applied"][0]["name"], "Cohesive code files");
-    assert_eq!(decision["skipped"][0]["name"], "Mobile");
-    assert_eq!(decision["code_files_changed"], true);
-}
-
-#[test]
-fn code_file_guidance_may_be_explicitly_skipped_for_no_code_change() {
-    let context = json!({
-        "version": 1,
-        "guidance_candidates": [{
-            "name": "Cohesive code files",
-            "rule": CODE_FILE_GUIDANCE_RULE,
-            "instructions": "Keep each code file focused."
-        }]
-    });
-
-    let decision = guidance_decision(&context, Some(&[]), false).unwrap();
-    assert_eq!(decision["skipped"][0]["name"], "Cohesive code files");
-    assert_eq!(decision["code_files_changed"], false);
-}
-
-#[test]
-fn code_path_detection_fails_safe_for_unlisted_languages() {
-    assert!(is_code_path("src/worker.exs"));
-    assert!(is_code_path("Makefile"));
-    assert!(is_code_path("config/toolchain.toml"));
-    assert!(!is_code_path("docs/intent/01-design.md"));
-    assert!(!is_code_path("website/diagram.png"));
-}
-
-#[test]
 fn exhausted_quality_output_repair_keeps_a_distinct_workflow_failure_category() {
     let error = RefineError::StructuredOutput(
         crate::application::agent_io::structured_output::StructuredOutputError::transport(
@@ -147,4 +59,35 @@ fn exhausted_quality_output_repair_keeps_a_distinct_workflow_failure_category() 
     );
 
     assert_eq!(quality_failure_category(&error), "quality_output_contract");
+}
+
+#[cfg(unix)]
+#[test]
+fn publication_rejects_changed_reviewed_content_without_discarding_governance_edits() {
+    use already_merged_quality_failure::{behavior_test_git as git, behavior_test_temp_dir};
+    let root = behavior_test_temp_dir("governance-edits-publication");
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-b", "main"]);
+    git(&root, &["config", "user.email", "test@example.invalid"]);
+    git(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("app.txt"), "reviewed").unwrap();
+    git(&root, &["add", "app.txt"]);
+    git(&root, &["commit", "-m", "reviewed"]);
+    let reviewed = git(&root, &["rev-parse", "HEAD"]);
+    let service = FileGitWorktreeService::new(&root);
+    verify_reviewed_candidate_before_publication(&service, &reviewed).unwrap();
+    std::fs::write(root.join("app.txt"), "Governance correction").unwrap();
+    assert!(verify_reviewed_candidate_before_publication(&service, &reviewed).is_err());
+    assert_eq!(
+        std::fs::read_to_string(root.join("app.txt")).unwrap(),
+        "Governance correction"
+    );
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]), reviewed);
+    git(&root, &["add", "app.txt"]);
+    assert!(verify_reviewed_candidate_before_publication(&service, &reviewed).is_err());
+    git(&root, &["commit", "-m", "correction"]);
+    assert!(verify_reviewed_candidate_before_publication(&service, &reviewed).is_err());
+    let corrected = git(&root, &["rev-parse", "HEAD"]);
+    verify_reviewed_candidate_before_publication(&service, &corrected).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }

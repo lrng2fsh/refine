@@ -2,6 +2,121 @@
 use super::*;
 
 impl FileProcessSupervisor {
+    /// Explicit Round deletion uses the same exit proof and artifact leases as
+    /// normal retirement, including records whose process has already exited.
+    pub(crate) fn delete_round_process_records(
+        &self,
+        goal_id: &str,
+        round_idx: usize,
+        edit_revision: u64,
+    ) -> RefineResult<()> {
+        let mut records = std::collections::BTreeMap::new();
+        for directory in [self.processes_dir(), self.process_history_dir()] {
+            if !directory.exists() {
+                continue;
+            }
+            for entry in fs::read_dir(directory).map_err(|e| RefineError::Io(e.to_string()))? {
+                let path = entry.map_err(|e| RefineError::Io(e.to_string()))?.path();
+                if path.extension().is_none_or(|ext| ext != "json") {
+                    continue;
+                }
+                let bytes = fs::read(&path).map_err(|e| RefineError::Io(e.to_string()))?;
+                let Ok(process) = serde_json::from_slice::<ManagedProcess>(&bytes) else {
+                    continue;
+                };
+                let metadata = process
+                    .details
+                    .as_deref()
+                    .and_then(|v| serde_json::from_str::<Value>(v).ok())
+                    .unwrap_or(Value::Null);
+                if metadata["goal_id"] == goal_id
+                    && metadata["round_idx"]
+                        .as_u64()
+                        .is_some_and(|index| index >= round_idx as u64)
+                    && metadata["round_edit_revision"].as_u64().unwrap_or(0) < edit_revision
+                {
+                    records.insert(process.id.clone(), process);
+                }
+            }
+        }
+        for group in self.owned_groups()? {
+            let metadata = group
+                .process
+                .details
+                .as_deref()
+                .and_then(|v| serde_json::from_str::<Value>(v).ok())
+                .unwrap_or(Value::Null);
+            if metadata["goal_id"] == goal_id
+                && metadata["round_idx"]
+                    .as_u64()
+                    .is_some_and(|index| index >= round_idx as u64)
+                && metadata["round_edit_revision"].as_u64().unwrap_or(0) < edit_revision
+            {
+                records
+                    .entry(group.process.id.clone())
+                    .or_insert(group.process);
+            }
+        }
+        for mut process in records.into_values() {
+            if self.group_pending(&process)? {
+                return Err(RefineError::Conflict(
+                    "Round still owns running processes".into(),
+                ));
+            }
+            let mut metadata: Value = serde_json::from_str(process.details.as_deref().unwrap())
+                .map_err(|e| RefineError::Serialization(e.to_string()))?;
+            if metadata["round_idx"].as_u64().unwrap() > round_idx as u64 {
+                metadata["round_idx"] = json!(metadata["round_idx"].as_u64().unwrap() - 1);
+                metadata["round_edit_revision"] = json!(edit_revision);
+                process.details = Some(metadata.to_string());
+                let bytes = serde_json::to_vec(&process)
+                    .map_err(|e| RefineError::Serialization(e.to_string()))?;
+                for path in [
+                    self.processes_dir().join(format!("{}.json", process.id)),
+                    self.process_history_path(&process.id),
+                ] {
+                    if path.exists() {
+                        write_json_atomically(&path, &bytes, "Round process indexes")?;
+                    }
+                }
+                let group_path = self.group_path(&process.id);
+                if group_path.exists() {
+                    let mut group: Value = serde_json::from_slice(
+                        &fs::read(&group_path).map_err(|e| RefineError::Io(e.to_string()))?,
+                    )
+                    .map_err(|e| RefineError::Serialization(e.to_string()))?;
+                    group["process"] = serde_json::to_value(&process)
+                        .map_err(|e| RefineError::Serialization(e.to_string()))?;
+                    write_json_atomically(
+                        &group_path,
+                        &serde_json::to_vec(&group)
+                            .map_err(|e| RefineError::Serialization(e.to_string()))?,
+                        "Round group indexes",
+                    )?;
+                }
+                continue;
+            }
+            self.retire_process_artifacts(&process, false)?;
+            if self
+                .processes_dir()
+                .join(format!("{}.json", process.id))
+                .exists()
+                || self.process_history_path(&process.id).exists()
+            {
+                return Err(RefineError::Conflict("Round output is still being consumed; retry deletion after the stopped attempt settles".into()));
+            }
+            remove_file_if_present(&self.group_path(&process.id), "deleted Round group")?;
+            if let Some(proof) = metadata["launch_scope"]["proof_path"]
+                .as_str()
+                .map(PathBuf::from)
+                && proof.parent() == Some(self.runtime_root.join("owned-scopes").as_path())
+            {
+                remove_file_if_present(&proof, "deleted Round exit proof")?;
+            }
+        }
+        Ok(())
+    }
+
     /// Hold transient process artifacts while a workflow-owned consumer finishes reading them.
     ///
     /// The filesystem lock is released automatically if the consumer exits, so later recovery can
@@ -57,6 +172,19 @@ impl FileProcessSupervisor {
     }
 
     pub(super) fn remove_process_artifacts(&self, process: &ManagedProcess) -> RefineResult<()> {
+        let retain_logs = process
+            .details
+            .as_deref()
+            .and_then(|details| serde_json::from_str::<Value>(details).ok())
+            .is_some_and(|details| details["goal_id"].as_str().is_some_and(|id| !id.is_empty()));
+        self.retire_process_artifacts(process, retain_logs)
+    }
+
+    fn retire_process_artifacts(
+        &self,
+        process: &ManagedProcess,
+        retain_logs: bool,
+    ) -> RefineResult<()> {
         if (Self::requires_group_ownership(process) || self.group_path(&process.id).exists())
             && self.group_pending(process).unwrap_or(true)
         {
@@ -68,16 +196,16 @@ impl FileProcessSupervisor {
         if !self.artifacts_may_retire(process)? {
             return Ok(());
         }
-        let removed = self.remove_process_artifacts_locked(process);
-        if removed.is_ok() && process.owner == ProcessOwner::Maintenance {
-            let _ =
-                remove_file_if_present(&self.group_path(&process.id), "completed transient group");
-        }
+        let removed = self.remove_process_artifacts_locked(process, retain_logs);
         FileExt::unlock(&lock).ok();
         removed
     }
 
-    fn remove_process_artifacts_locked(&self, process: &ManagedProcess) -> RefineResult<()> {
+    fn remove_process_artifacts_locked(
+        &self,
+        process: &ManagedProcess,
+        retain_logs: bool,
+    ) -> RefineResult<()> {
         let handoff_path = self.artifact_handoff_path(&process.id);
         // A live workflow consumer owns the transcript through this lease. Reconciliation may
         // already persist a truthful terminal state, but deletion waits until consumption ends.
@@ -106,9 +234,42 @@ impl FileProcessSupervisor {
                 )));
             }
         };
+        if retain_logs {
+            let mut archived = process.clone();
+            // cleanup may carry the pre-stop snapshot. Never reintroduce a
+            // running record after its owned scope has demonstrably exited.
+            if archived.state == "running" {
+                if let Ok(terminal) = self.inspect_terminal(&process.id)
+                    && terminal.pid == process.pid
+                    && terminal.started_at == process.started_at
+                    && terminal.state != "running"
+                {
+                    archived = terminal;
+                } else {
+                    archived.state = "interrupted".into();
+                }
+            }
+            archived.stdin_path = None;
+            fs::create_dir_all(self.process_history_dir())
+                .map_err(|e| RefineError::Io(e.to_string()))?;
+            write_json_atomically(
+                &self.process_history_path(&process.id),
+                &serde_json::to_vec(&archived)
+                    .map_err(|e| RefineError::Serialization(e.to_string()))?,
+                "retained Goal process logs",
+            )?;
+        }
         for path in [
-            process.stdout_path.as_deref(),
-            process.stderr_path.as_deref(),
+            if retain_logs {
+                None
+            } else {
+                process.stdout_path.as_deref()
+            },
+            if retain_logs {
+                None
+            } else {
+                process.stderr_path.as_deref()
+            },
             process.stdin_path.as_deref(),
         ]
         .into_iter()
@@ -147,7 +308,11 @@ impl FileProcessSupervisor {
             }
         }
         let history_path = self.process_history_path(&process.id);
-        match fs::remove_file(&history_path) {
+        match if retain_logs {
+            Ok(())
+        } else {
+            fs::remove_file(&history_path)
+        } {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -167,6 +332,11 @@ impl FileProcessSupervisor {
                     identity_path.display()
                 )));
             }
+        }
+        // A deferred handoff returned before any removal. Retire ownership only
+        // after the process and its artifacts have actually been retired.
+        if process.owner == ProcessOwner::Maintenance {
+            remove_file_if_present(&self.group_path(&process.id), "completed transient group")?;
         }
         Ok(())
     }

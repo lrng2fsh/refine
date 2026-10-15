@@ -21,7 +21,6 @@ use crate::infrastructure::process::subprocess::{
     FileProcessSupervisor, ManagedProcess, ManagedProcessSpec, ProcessOwner, ProcessResourceLimits,
     ProcessSupervisor,
 };
-use crate::model::goal::ImplementationExecutionEvidence;
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const SIGNAL_WRITE_GRACE_PERIOD: Duration = Duration::from_secs(2);
@@ -35,6 +34,7 @@ const MAX_TOOLBAR_ATTACHMENT_ACKS: usize = 32;
 
 #[derive(Clone, Debug)]
 pub struct GoalAgentLaunch {
+    pub refine_dir: Option<PathBuf>,
     pub runtime_root: PathBuf,
     pub cwd: PathBuf,
     pub provider: String,
@@ -58,7 +58,7 @@ pub struct GoalAgentResult {
     pub session_id: String,
     pub process_id: String,
     pub guidance_applied: Option<Vec<usize>>,
-    pub implementation_evidence: Option<ImplementationExecutionEvidence>,
+    pub implementation_evidence: Option<Value>,
     pub planning_result: Option<Value>,
 }
 
@@ -70,7 +70,7 @@ pub struct GoalAgentSettlement {
     pub state: String,
     pub exit_code: Option<i32>,
     pub guidance_applied: Option<Vec<usize>>,
-    pub implementation_evidence: Option<ImplementationExecutionEvidence>,
+    pub implementation_evidence: Option<Value>,
     pub planning_result: Option<Value>,
 }
 
@@ -127,7 +127,7 @@ struct AgentSessionSignal {
     #[serde(default)]
     guidance_applied: Option<Vec<usize>>,
     #[serde(default)]
-    implementation_evidence: Option<ImplementationExecutionEvidence>,
+    implementation_evidence: Option<Value>,
     #[serde(default)]
     planning_result: Option<Value>,
 }

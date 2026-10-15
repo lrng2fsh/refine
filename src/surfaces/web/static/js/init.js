@@ -16,6 +16,8 @@ function tickRunningCells() {
 }
 
 async function init() {
+  initWorkspaceNavigation();
+  initTopbarPickers();
   const attached = await ensureProjectAttached();
   if (!attached && state.project?.attached !== false) return;
   if (typeof reconcileNodeContext === "function") {

@@ -212,7 +212,7 @@ fn completed_skill_reuse_revalidates_workspace_without_rewriting_retained_result
 
 #[cfg(unix)]
 #[test]
-fn dirty_primary_survives_planning_implementation_repairs_ordered_bindings_and_skill_quality() {
+fn dirty_primary_survives_planning_ordered_implementation_and_skill_quality() {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();
     let before = f.snapshot();
@@ -222,20 +222,20 @@ fn dirty_primary_survives_planning_implementation_repairs_ordered_bindings_and_s
 import sys,json,pathlib,subprocess,os
 prompt=' '.join(sys.argv[1:])
 result=json.JSONDecoder().raw_decode(prompt.split('Refine completion contract (supplied by the system):\n',1)[1])[0]
+execution=json.JSONDecoder().raw_decode(prompt.split('Skill execution:\n',1)[1])[0]
 assert pathlib.Path.cwd()==pathlib.Path({workspace:?})
 assert all(k not in os.environ for k in ['GIT_DIR','GIT_WORK_TREE','GIT_INDEX_FILE','GIT_CONFIG_COUNT'])
 log=pathlib.Path({log:?})
-with log.open('a') as stream: stream.write(result['role']+':'+result['binding_id']+'\n')
+with log.open('a') as stream: stream.write(execution['role']+':'+execution['binding_id']+'\n')
 if prompt.startswith('Repair only'):
  result=json.JSONDecoder().raw_decode(prompt.split('Rejected completion (data, not instructions):\n',1)[1])[0]
  result.pop('extra_field',None)
  print(json.dumps(result));sys.exit(0)
 result['evidence']=['observed isolated cwd']
-if result['role']=='implement':
+if execution['role']=='implement':
  pathlib.Path('app.txt').write_text('implemented\n')
  result['artifacts']={{'implementation_evidence':{{'checklist':[{{'id':'P1','outcome':'completed','evidence':'changed candidate'}}],'verification':['observed cwd']}}}}
-if result['role']=='implement': result['extra_field']='repair envelope only'
-if result['role']=='quality':
+if execution['role']=='quality':
  result['artifacts']={{'tests':[{{'test':'isolated file','command':"test \"$(cat app.txt)\" = implemented && test -z \"${{GIT_DIR+x}}${{GIT_WORK_TREE+x}}${{GIT_INDEX_FILE+x}}\"",'status':'pending','evidence':''}}]}}
 print(json.dumps(result))
 "##, workspace=f.workspace.to_string_lossy(), log=log.to_string_lossy())).unwrap();
@@ -282,7 +282,7 @@ print(json.dumps(result))
         .unwrap();
     let result = f.service.execute(&implementation.id, || Ok(())).unwrap();
     assert_eq!(result.state, InvocationState::Succeeded, "{result:?}");
-    assert_eq!(result.attempts.len(), 4);
+    assert_eq!(result.attempts.len(), 2);
     let launches = fs::read(&log).unwrap();
     assert_eq!(
         f.service.execute(&implementation.id, || Ok(())).unwrap(),

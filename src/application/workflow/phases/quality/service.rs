@@ -6,20 +6,15 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::application::agent_io::prompts::{PromptEngine, PromptTemplate, render};
-use crate::application::agent_io::structured_output::Contract;
+use crate::application::agent_io::prompts::{PromptEngine, PromptTemplate};
 use crate::application::fleet::nodes::FileNodeRegistryService;
-use crate::application::work_items::{FileWorkItemService, WorkflowAttemptAuthority};
+use crate::application::work_items::{FileWorkItemService, WorkflowStepAuthority};
 use crate::application::workflow::WorkflowEngine;
 use crate::error::{RefineError, RefineResult};
-use crate::infrastructure::agents::invocation::{HostAgentProviderService, ProviderInvocation};
 use crate::infrastructure::git::with_repository_git_lock;
 use crate::infrastructure::git::worktrees::{FileGitWorktreeService, GitWorktreeService};
 use crate::infrastructure::observability::logs::FileLogService;
-use crate::infrastructure::process::subprocess::{
-    FileProcessSupervisor, ManagedProcessSpec, ProcessOwner, ProcessResourceLimits,
-    write_json_atomically,
-};
+use crate::infrastructure::process::subprocess::write_json_atomically;
 use crate::infrastructure::process::supervisor::config::{ConfigService, FileSettingsService};
 use crate::infrastructure::process::supervisor::operations::{
     FileOperationRegistry, OperationHandle, OperationRegistry, OperationState,
@@ -46,15 +41,12 @@ mod settlement;
 mod skill_checks;
 mod skill_evidence;
 mod summary;
-mod wire;
 
 use cancellation::*;
-pub(crate) use provider_output::parse_quality_provider_output;
 use provider_output::*;
 pub(crate) use provider_output::{is_quality_harness_fault, is_quality_output_contract_fault};
 pub use runner::QualityOperationRunner;
 pub(crate) use summary::{quality_error_summary, quality_failure_summary};
-use wire::*;
 
 pub(crate) const SETTINGS_MIGRATION_VERSION: u32 = 3;
 

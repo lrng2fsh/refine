@@ -2,7 +2,7 @@ use super::already_merged_quality_failure::{
     SmokeAiOverride, behavior_test_git, behavior_test_temp_dir,
 };
 use super::*;
-use crate::application::work_items::{FileWorkItemService, WorkflowAttemptAuthority};
+use crate::application::work_items::{FileWorkItemService, WorkflowStepAuthority};
 use crate::application::workflow::phases::quality::{FileQualityService, QualitySettingsPatch};
 use crate::infrastructure::agents::invocation::smoke_ai_env_lock;
 use std::fs;
@@ -229,7 +229,7 @@ struct QualityResumeFixture {
     base: String,
     candidate: String,
     round_idx: usize,
-    authority: WorkflowAttemptAuthority,
+    authority: WorkflowStepAuthority,
 }
 
 impl QualityResumeFixture {
@@ -272,7 +272,7 @@ count=0
 if test -f "$0.count"; then count=$(sed -n '1p' "$0.count"); fi
 count=$((count + 1))
 printf '%s\n' "$count" > "$0.count"
-printf '%s\n' '{"summary":"The candidate passes.","results":[{"test":"Candidate works","status":"passed","evidence":"Verified.","command":"true"}]}'
+printf '%s\n' '{"ok":true,"summary":"The candidate passes.","results":[{"test":"Candidate works","status":"passed","evidence":"Verified.","command":"true"}]}'
 "#,
         )
         .unwrap();
@@ -318,6 +318,9 @@ printf '%s\n' '{"summary":"The candidate passes.","results":[{"test":"Candidate 
             .unwrap();
         work_items
             .advance_automated_goal_status("GOAL1", GoalStatus::Quality)
+            .unwrap();
+        crate::application::events::FileEventService::new(&refine_dir)
+            .config()
             .unwrap();
         let (round_idx, revision, request) = work_items.authored_goal_commitment("GOAL1").unwrap();
         let authority = work_items

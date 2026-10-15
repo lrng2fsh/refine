@@ -1,6 +1,60 @@
 use super::*;
 
 #[test]
+fn static_rail_new_menu_exposes_shared_creation_commands() {
+    let static_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/surfaces/web/static");
+    let index = fs::read_to_string(static_root.join("index.html")).unwrap();
+    let global = index
+        .split("class=\"rail-global topbar-actions\"")
+        .nth(1)
+        .unwrap();
+    let search = global.find("id=\"btn-command-palette\"").unwrap();
+    let new = global.find("id=\"rail-new-menu\"").unwrap();
+    let node = global.find("data-topbar-picker=\"node\"").unwrap();
+    assert!(search < new && new < node);
+    let menu = global[new..].split("</details>").next().unwrap();
+    assert!(menu.contains("navigation.svg#plus"));
+    assert!(menu.contains(r#"aria-label="New" title="New" aria-haspopup="menu""#));
+    assert!(menu.contains(r#"role="menu" aria-labelledby="rail-new-toggle""#));
+    let toggle = menu.split("</summary>").next().unwrap();
+    assert!(toggle.contains(r#"<span class="nav-context-more" aria-hidden="true"></span>"#));
+    let mut previous = 0;
+    for (command, label, icon) in [
+        ("goal.new", "New Goal", "target"),
+        ("plan.open", "New Plan", "notebook-pen"),
+        ("feature.new", "New Feature", "layers"),
+        ("goal.import", "Import", "download"),
+    ] {
+        let position = menu
+            .find(&format!(r#"data-rail-command="{command}""#))
+            .unwrap();
+        let item = menu[position..].split("</button>").next().unwrap();
+        assert!(item.ends_with(label));
+        assert!(item.contains(&format!(
+            r#"href="/static/vendor/lucide/navigation.svg#{icon}""#
+        )));
+        assert!(item.contains(r#"<svg class="rail-icon" aria-hidden="true" focusable="false""#));
+        assert!(position > previous);
+        previous = position;
+    }
+    assert_eq!(menu.matches(r#"role="menuitem""#).count(), 4);
+    for id in [
+        "rail-new-menu",
+        "rail-new-toggle",
+        "rail-new-options",
+        "btn-new-goal",
+        "btn-new-feature",
+        "btn-import",
+    ] {
+        assert_eq!(
+            index.matches(&format!(r#" id="{id}""#)).count(),
+            1,
+            "unique ID {id}"
+        );
+    }
+}
+
+#[test]
 fn web_server_route_groups_cover_static_web_surface() {
     let groups = API_GROUPS
         .iter()
@@ -94,7 +148,7 @@ fn static_main_nav_consolidates_context_and_controls() {
     let releases = fs::read_to_string(static_root.join("js/features/source_update.js")).unwrap();
 
     let menu_start = index
-        .find(r#"<details class="nav-menu nav-context-menu" id="nav-context-menu">"#)
+        .find(r#"<details class="nav-menu nav-create-menu" id="nav-create-menu">"#)
         .expect("controls menu should exist");
     let menu_end = menu_start
         + index[menu_start..]
@@ -107,21 +161,15 @@ fn static_main_nav_consolidates_context_and_controls() {
         .expect("controls summary should close");
     let summary = &menu[..summary_end];
 
-    assert!(summary.contains(r#"aria-label="Open controls""#));
-    assert!(summary.contains(r#"class="nav-context-icon""#));
-    assert!(summary.contains("<span>Controls</span>"));
-    assert!(summary.contains(r#"class="nav-context-main""#));
-    assert!(summary.contains(r#"class="nav-context-more" aria-hidden="true""#));
-    assert!(!summary.contains("target-app-dot"));
-    assert!(!summary.contains("context-app-name"));
-    assert!(!summary.contains("context-reporter-name"));
+    assert!(summary.contains(r#"aria-label="Open New Goal menu""#));
+    assert!(summary.contains("nav-create-more"));
+    assert!(!index.contains(r#"id="nav-context-menu""#));
+    assert!(menu.contains(r#"id="btn-new-feature""#));
+    assert!(menu.contains(r#"id="btn-import""#));
 
     for control_id in [
         r#"id="target-app-indicator""#,
-        r#"id="global-node""#,
-        r#"id="global-reporter""#,
-        r#"id="agent-status-indicator""#,
-        r#"id="btn-source-update""#,
+        r#"id="workflow-status-indicator""#,
         r#"id="btn-command-palette""#,
         r#"id="btn-refine-issue""#,
         r#"id="btn-theme-toggle""#,
@@ -137,28 +185,30 @@ fn static_main_nav_consolidates_context_and_controls() {
         );
     }
 
-    assert!(menu.contains(r#"class="nav-control-status target-app-state""#));
-    let node_select = menu.find(r#"id="global-node""#).unwrap();
-    let reporter_select = menu.find(r#"id="global-reporter""#).unwrap();
+    assert!(menu.contains("<span>Target application status</span>"));
+    assert!(menu.contains("<span>Workflow status</span>"));
     assert!(
-        node_select < reporter_select,
-        "Node should be immediately before Reporter"
+        menu.find(r#"id="workflow-status-indicator""#).unwrap()
+            < menu.find(r#"id="target-app-indicator""#).unwrap()
     );
-    assert!(menu[node_select..reporter_select].contains(r#"aria-label="Node""#));
-    assert!(menu[node_select..reporter_select].contains(r#"data-testid="global-node""#));
+    assert!(index.find(r#"id="global-reporter""#).unwrap() < menu_start);
+    assert!(!menu.contains(r#"id="global-reporter""#));
+    assert!(!menu.contains(r#"id="btn-source-update""#));
+    assert!(index.find(r#"id="global-node""#).unwrap() < menu_start);
+    assert!(!menu.contains(r#"id="global-node""#));
+    assert!(index.contains(r#"aria-label="Node""#));
+    assert!(index.contains(r#"data-testid="global-node""#));
     assert!(node_context.contains("function reconcileNodeContext"));
     assert!(
         node_context.contains(r#"api("GET", "/api/project/status", undefined, { cache: false })"#)
     );
     assert!(node_context.contains(r#"api("GET", "/api/nodes", undefined, { cache: false })"#));
-    assert!(menu.contains(r#"class="nav-control-status agent-status-label""#));
-    assert!(menu.contains(r#"class="nav-control-status nav-source-update-status""#));
+    assert!(!menu.contains(r#"id="agent-status-indicator""#));
     assert!(menu.contains(r#"class="nav-control-status nav-theme-status""#));
-    assert!(menu.contains("<span>Report a bug to Refine Devs</span>"));
+    assert!(menu.contains("<span>Contact Refine Devs</span>"));
     assert!(!menu.contains("<span>Report a bug</span>"));
-    assert!(menu.contains(
-        r##"<a class="nav-menu-item nav-management-item" href="#/settings/processes" data-route="settings">"##
-    ));
+    assert!(index.contains(r#"data-testid="nav-settings">Settings</a>"#));
+    assert!(!menu.contains("<span>Settings</span>"));
     assert!(menu.contains(r#"aria-pressed="false""#));
     assert!(theme.contains(r#"const STORAGE_KEY = "refine_color_theme""#));
     assert!(theme.contains(r#"new CustomEvent("refine-theme-change""#));
@@ -195,17 +245,17 @@ html[data-theme="dark"] .brand-logo-dark {
         "theme bootstrap should run before styles paint"
     );
     let management_start = menu
-        .find(r#">Management</div>"#)
+        .find(r#">Tools and Support</div>"#)
         .expect("management section should exist");
-    let source_update_start = menu
-        .find(r#"id="btn-source-update""#)
+    let first_tool_start = menu
+        .find(r#"id="btn-command-palette""#)
         .expect("source update control should exist");
     let guide_start = menu
         .find(r#"id="nav-guide-open""#)
         .expect("guide management control should exist");
     assert!(
-        management_start < source_update_start && source_update_start < guide_start,
-        "source update should be the first management control"
+        management_start < first_tool_start && first_tool_start < guide_start,
+        "command palette should be the first tool"
     );
     assert!(menu.contains(
         r#"class="nav-menu-item nav-control-item nav-management-item nav-command-button""#
@@ -280,15 +330,15 @@ fn static_system_log_exposes_sources_and_diagnostic_details() {
     assert!(commands.contains(r#"details: { operation_id: response.operation.id }"#));
     assert!(toolbar.contains("details: payload?.details ?? null"));
     assert!(toolbar.contains("function systemOperationDetailEntries"));
-    assert!(toolbar.contains(r#"data-testid="system-log-status""#));
-    assert!(toolbar.contains(r#"data-testid="system-log-category""#));
-    assert!(toolbar.contains(r#"data-testid="system-log-details""#));
-    assert!(toolbar.contains(r#"data-testid="system-log-detail""#));
+    assert!(toolbar.contains(r#"class="goal-log-severity""#));
+    assert!(toolbar.contains(r#"class="goal-log-category""#));
+    assert!(toolbar.contains(r#"class="log-inline-details""#));
+    assert!(toolbar.contains("function highlightLogText"));
     assert!(toolbar.contains("existing.category !== item.category"));
     assert!(toolbar.contains("formatSystemOperationDetails(existing.details) !== itemDetails"));
-    assert!(toolbar_css.contains(".system-log-status"));
-    assert!(toolbar_css.contains(".system-log-category"));
-    assert!(toolbar_css.contains(".system-log-detail dd"));
+    assert!(toolbar_css.contains(".goal-log-severity"));
+    assert!(toolbar_css.contains(".goal-log-category"));
+    assert!(toolbar_css.contains(".log-inline-details"));
 }
 
 #[test]
@@ -480,13 +530,10 @@ fn web_server_accepts_static_ui_bulk_api_aliases() {
         })),
     });
     assert_eq!(bulk_cancel.status, 200);
-    assert_eq!(bulk_cancel.body["updated"], 1);
-    assert_eq!(bulk_cancel.body["ids"], json!(["GOAL3"]));
-    assert_eq!(bulk_cancel.body["skipped"], 1);
-    assert_eq!(
-        bulk_cancel.body["skipped_details"][0],
-        json!({"id": "GOAL1", "reason": "status:done"})
-    );
+    assert_eq!(bulk_cancel.body["updated"], 2);
+    assert_eq!(bulk_cancel.body["ids"], json!(["GOAL1", "GOAL3"]));
+    assert_eq!(bulk_cancel.body["skipped"], 0);
+    assert_eq!(bulk_cancel.body["failed"], 0);
     assert_eq!(
         FileWorkItemService::new(&refine_dir)
             .show_goal_summary("GOAL3")

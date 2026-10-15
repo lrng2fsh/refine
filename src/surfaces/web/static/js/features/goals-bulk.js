@@ -9,6 +9,10 @@ const BULK_STATUS_OPTIONS = [
   { value: "__last_workflow_state", label: "(Last workflow state)" },
   { value: "backlog", label: "backlog" },
   { value: "todo", label: "todo" },
+  { value: "plan", label: "plan" },
+  { value: "implement", label: "implement" },
+  { value: "quality", label: "quality" },
+  { value: "governance", label: "governance" },
   { value: "review", label: "review" },
   { value: "done", label: "done" },
   { value: "failed", label: "failed" },
@@ -25,7 +29,7 @@ async function submitGoalsBulkAction(payload) {
 
 function goalsBulkFilterFromHash() {
   const f = goalsFilterFromHash();
-  const filter = {};
+  const filter = {exclude_draft: true};
   for (const key of ["status", "q", "reporter", "assignee", "feature", "node"]) {
     if (f[key]) filter[key] = f[key];
   }
@@ -73,11 +77,9 @@ async function openBulkModal(field) {
         ${BULK_STATUS_OPTIONS.map((s) => `<option value="${s.value}">${htmlEscape(s.label)}</option>`).join("")}
       </select>
       <p class="muted small" style="margin-top:6px">
-        Last workflow state sends failed Quality attempts back to quality, failed integration
-        attempts back to governance, other failed Goals back to todo, and leaves active
-        automation and Review alone. Cancelled intentionally stops selected active,
-        failed, or Review Goals; Done remains protected. Decline Review by submitting
-        a new round when the work should continue.
+        Selecting a workflow step stops current agent work and moves every selected Goal
+        to that step, overriding normal workflow restrictions. Done changes status only;
+        it does not merge code. Last workflow state retains its automatic retry behavior.
       </p>`;
   } else if (field === "reporter") {
     const opts = (state.reporters || [])
@@ -716,9 +718,14 @@ async function withButtonBusy(btn, busyLabel, fn) {
   if (!btn) return await fn();
   const wasDisabled = btn.disabled;
   const orig = btn.textContent;
-  const operationLabel = String(orig || busyLabel || "Operation").trim() || "Operation";
+  const iconOnly = btn.classList?.contains("process-action-icon");
+  const originalLabel = btn.getAttribute?.("aria-label");
+  const operationLabel = String(originalLabel || orig || busyLabel || "Operation").trim() || "Operation";
   btn.disabled = true;
-  btn.textContent = busyLabel;
+  if (iconOnly) {
+    btn.setAttribute("aria-busy", "true");
+    btn.setAttribute("aria-label", busyLabel);
+  } else btn.textContent = busyLabel;
   recordUiNotice(`${operationLabel} started`, {
     kind: "start",
     source: "ui-operation",
@@ -740,6 +747,9 @@ async function withButtonBusy(btn, busyLabel, fn) {
     // The button may have been re-rendered by the awaited work (e.g., a
     // reload of the view); setting properties on a detached node is a no-op.
     btn.disabled = wasDisabled;
-    btn.textContent = orig;
+    if (iconOnly) {
+      btn.removeAttribute("aria-busy");
+      btn.setAttribute("aria-label", originalLabel);
+    } else btn.textContent = orig;
   }
 }

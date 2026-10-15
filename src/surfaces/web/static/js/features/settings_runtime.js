@@ -1,8 +1,8 @@
 // ---- System / Runtime -------------------------------------------------------
 
-function renderNodeRuntimeConfigSections(s, activeNodeLabel, cli) {
+function renderNodeRuntimeConfigSections(s, activeNodeLabel, cli, providers = {}) {
   const cliOption = (value, label) =>
-    `<option value="${value}" ${cli === value ? "selected" : ""}>${htmlEscape(label)}</option>`;
+    `<option value="${htmlEscape(value)}" ${cli === value ? "selected" : ""}>${htmlEscape(label)}</option>`;
   const optionLabel = (options, value) => {
     const match = options.find(([v]) => String(v) === String(value));
     return match?.[1] || String(value || "none");
@@ -22,16 +22,6 @@ function renderNodeRuntimeConfigSections(s, activeNodeLabel, cli) {
     ["60",    "1 minute"],
     ["3600",  "1 hour"],
     ["10800", "3 hours"],
-  ];
-  const backlogOptions = [
-    ["-1",    "Never"],
-    ["0",     "Instant"],
-    ["300",   "5 minutes"],
-    ["1800",  "30 minutes"],
-    ["3600",  "1 hour"],
-    ["10800", "3 hours"],
-    ["21600", "6 hours"],
-    ["86400", "24 hours"],
   ];
   const worktreeCleanupOptions = [
     ["-1",    "Manual only"],
@@ -71,28 +61,20 @@ function renderNodeRuntimeConfigSections(s, activeNodeLabel, cli) {
     ["on",  "On — an agent merges both intents before any authority fallback"],
     ["off", "Off — contested merges fail closed immediately"],
   ];
-  const conflictResolutionOptions = [
-    ["on",  "On — an agent resolves the conflicted refresh in place"],
-    ["off", "Off — a conflicted refresh aborts and queues a recovery Round"],
-  ];
   const providerOptions = [
-    ["claude", "Claude Code (default)"],
-    ["codex", "OpenAI Codex"],
-    ["gemini", "Gemini"],
-    ["copilot", "GitHub Copilot"],
-    ["smoke-ai", "Smoke AI (deterministic testing)"],
+    ["", `Use system default (${providers.catalog?.providers?.find(p => p.id === providers.catalog.default_provider)?.name || s.agent_cli || ""})`],
+    ...(providers.catalog?.providers || []).map(p => [p.id, p.name]),
+    ...(cli && !(providers.catalog?.providers || []).some(p => p.id === cli) ? [[cli, `${cli} (not configured)`]] : []),
   ];
   const workerCpuPriority = String(s.worker_cpu_priority ?? "low");
   const resourceIsolation = String(s.resource_isolation_mode ?? "auto");
   const agentLimitPause = String(s.agent_limit_pause_seconds ?? "60");
-  const backlogPromote = String(s.backlog_promote_after_seconds ?? "3600");
   const worktreeCleanup = String(s.worktree_cleanup_after_seconds ?? "0");
   const stateDebounce = String(s.state_sync_debounce_seconds ?? "5");
   const remoteFetchInterval = String(s.project_update_pulse_interval_seconds ?? "300");
   const staleThreshold = String(s.state_sync_stale_threshold_seconds ?? "900");
   const autoRecovery = String(s.state_sync_auto_recovery ?? "remote");
   const agentResolution = String(s.state_sync_agent_resolution ?? "on");
-  const conflictResolution = String(s.workflow_conflict_resolution ?? "on");
   const parallelRunCap = String(s.parallel_run_cap ?? "").trim();
   const automaticResourceBudgetPercent = String(
     s.automatic_agent_resource_budget_percent ?? "70",
@@ -131,8 +113,8 @@ function renderNodeRuntimeConfigSections(s, activeNodeLabel, cli) {
         control: `<input type="text" id="s-pattern" data-testid="runtime-branch-name-pattern" value="${htmlEscape(s.branch_name_pattern || "refine/{goal_id}")}">`,
       })}
       ${renderSettingsEditableField({
-        id: "s-round-retries", label: "Automatic recovery Round limit", valueLabel: s.max_automatic_round_retries ?? 5,
-        control: `<input type="number" id="s-round-retries" min="0" max="100" value="${htmlEscape(s.max_automatic_round_retries ?? 5)}">`,
+        id: "s-error-timeout", label: "Error handling timeout (seconds)", valueLabel: s.workflow_error_timeout_seconds ?? 600,
+        control: `<input type="number" id="s-error-timeout" min="1" max="86400" value="${htmlEscape(s.workflow_error_timeout_seconds ?? 600)}">`,
       })}
       ${renderSettingsEditableField({
         id: "s-idle",
@@ -205,16 +187,6 @@ function renderNodeRuntimeConfigSections(s, activeNodeLabel, cli) {
         control: `<input type="number" id="s-chat-idle" data-testid="runtime-chat-idle-timeout" value="${s.chat_idle_timeout_seconds || 300}">`,
       })}
       ${renderSettingsEditableField({
-        id: "s-backlog-promote",
-        label: "Auto-promote backlog → todo",
-        guideItemId: "runtime-backlog-promote",
-        description: "how long a Goal may sit in backlog before the Workflow Engine moves it to todo. Default 1 hour.",
-        valueLabel: optionLabel(backlogOptions, backlogPromote),
-        control: `<select id="s-backlog-promote" data-testid="runtime-backlog-promote">
-          ${backlogOptions.map(([v, lbl]) => `<option value="${v}" ${backlogPromote === v ? "selected" : ""}>${lbl}</option>`).join("")}
-        </select>`,
-      })}
-      ${renderSettingsEditableField({
         id: "s-worktree-cleanup-delay",
         label: "Inactive worktree retention",
         guideItemId: "runtime-worktree-cleanup",
@@ -275,16 +247,6 @@ function renderNodeRuntimeConfigSections(s, activeNodeLabel, cli) {
         </select>`,
       })}
       ${renderSettingsEditableField({
-        id: "s-workflow-conflict-resolution",
-        label: "Candidate refresh agent resolution",
-        guideItemId: "runtime-project-update-pulse",
-        description: "when a Goal's candidate no longer rebases onto the target it will merge into, let the installed agent resolve the conflicted refresh in place; turning it off aborts the refresh and queues the fenced integration recovery Round instead.",
-        valueLabel: optionLabel(conflictResolutionOptions, conflictResolution),
-        control: `<select id="s-workflow-conflict-resolution" data-testid="runtime-workflow-conflict-resolution">
-          ${conflictResolutionOptions.map(([v, lbl]) => `<option value="${v}" ${conflictResolution === v ? "selected" : ""}>${lbl}</option>`).join("")}
-        </select>`,
-      })}
-      ${renderSettingsEditableField({
         id: "s-file-browser-ignore",
         label: "File browser ignore patterns",
         guideItemId: "runtime-file-browser-ignore",
@@ -298,9 +260,10 @@ function renderNodeRuntimeConfigSections(s, activeNodeLabel, cli) {
 
     <section class="settings-section">
       <h3>AI Provider</h3>
+      ${providers.selection_error ? `<p role="alert">${htmlEscape(providers.selection_error)}</p>` : ""}
       ${renderSettingsEditableField({
         id: "s-cli",
-        label: "Which AI provider refine drives",
+        label: "AI provider for this node",
         guideItemId: "runtime-ai-provider",
         description: "used for Goal agent runs, conflict resolution, chat, import extraction, target-app actions, and pre-flight.",
         valueLabel: optionLabel(providerOptions, cli),
@@ -316,7 +279,7 @@ function renderNodeRuntimeConfigSections(s, activeNodeLabel, cli) {
       </p>
       <p class="muted" style="margin-top:14px">The selected provider's auth lives on the host. Use Re-check to re-run the pre-flight after running the relevant login command (<code>claude login</code> / <code>codex login</code> / <code>gemini auth login</code> / <code>copilot login</code>), or after setting <code>REFINE_SMOKE_AI_PATH</code> for Smoke AI.</p>
       <button id="s-recheck" data-testid="runtime-recheck-auth">Re-check auth</button>
-    </section>`;
+    </section>${renderProviderCatalog(providers)}`;
 }
 
 function renderRuntimeUpgradeBanner(upgrade) {
@@ -431,12 +394,12 @@ async function refreshRuntimeUpgradeBanner() {
 }
 
 async function autosaveSettingsRuntime(options = {}) {
-  const chosen = $("#s-cli").value;
+
   await api("PATCH", "/api/settings", {
     parallel_run_cap: $("#s-cap").value,
     automatic_agent_resource_budget_percent: $("#s-automatic-resource-budget-percent").value,
     branch_name_pattern: $("#s-pattern").value,
-    max_automatic_round_retries: $("#s-round-retries").value,
+    workflow_error_timeout_seconds: $("#s-error-timeout").value,
     agent_idle_timeout_seconds: $("#s-idle").value,
     agent_hard_cap_seconds: $("#s-hard").value,
     worker_memory_limit_mb: $("#s-worker-memory").value,
@@ -445,35 +408,36 @@ async function autosaveSettingsRuntime(options = {}) {
     resource_isolation_mode: $("#s-resource-isolation").value,
     agent_limit_pause_seconds: $("#s-agent-limit-pause").value,
     chat_idle_timeout_seconds: $("#s-chat-idle").value,
-    backlog_promote_after_seconds: $("#s-backlog-promote").value,
     worktree_cleanup_after_seconds: $("#s-worktree-cleanup-delay").value,
     state_sync_debounce_seconds: $("#s-state-sync-debounce").value,
     project_update_pulse_interval_seconds: $("#s-project-update-pulse").value,
     state_sync_stale_threshold_seconds: $("#s-state-sync-stale-threshold").value,
     state_sync_auto_recovery: $("#s-state-sync-auto-recovery").value,
     state_sync_agent_resolution: $("#s-state-sync-agent-resolution").value,
-    workflow_conflict_resolution: $("#s-workflow-conflict-resolution").value,
     file_browser_ignore_patterns: $("#s-file-browser-ignore").value,
-    agent_cli: chosen,
   });
   if (options.refresh) {
     await refreshSettingsTab(options.refreshTab || readSettingsTab(), { force: true });
   }
 }
 
-function bindNodeRuntimeConfigControls() {
+function bindNodeRuntimeConfigControls(providers = {}) {
+  bindProviderCatalog(providers);
   bindCommand("#s-runtime-copy-node", "settings.runtime.copy_node");
   const root = document.querySelector('[data-tab-pane="runtime"]');
   const autosaveRuntime = bindSettingsAutosave(
     root,
-    "#s-cap, #s-automatic-resource-budget-percent, #s-pattern, #s-round-retries, #s-idle, #s-hard, #s-worker-memory, #s-ui-memory, #s-worker-cpu-priority, #s-resource-isolation, #s-agent-limit-pause, #s-chat-idle, #s-backlog-promote, #s-worktree-cleanup-delay, #s-state-sync-debounce, #s-project-update-pulse, #s-state-sync-stale-threshold, #s-state-sync-auto-recovery, #s-state-sync-agent-resolution, #s-workflow-conflict-resolution, #s-file-browser-ignore",
+    "#s-cap, #s-automatic-resource-budget-percent, #s-pattern, #s-error-timeout, #s-idle, #s-hard, #s-worker-memory, #s-ui-memory, #s-worker-cpu-priority, #s-resource-isolation, #s-agent-limit-pause, #s-chat-idle, #s-worktree-cleanup-delay, #s-state-sync-debounce, #s-project-update-pulse, #s-state-sync-stale-threshold, #s-state-sync-auto-recovery, #s-state-sync-agent-resolution, #s-file-browser-ignore",
     autosaveSettingsRuntime,
     { event: "settings-editable-commit" },
   );
   bindSettingsAutosave(
     root,
     "#s-cli",
-    () => autosaveSettingsRuntime({ refresh: true, refreshTab: "runtime" }),
+    async () => {
+      await api("PATCH", "/api/settings", {agent_cli: $("#s-cli").value || null});
+      await refreshSettingsTab("runtime", {force: true});
+    },
     { event: "settings-editable-commit" },
   );
   bindCommand("#s-recheck", "runtime.recheck_auth");

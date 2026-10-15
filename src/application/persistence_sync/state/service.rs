@@ -248,6 +248,9 @@ impl FileGitSyncService {
         // deep in the ladder. Cached, so this costs nothing per pass.
         ensure_supported_git()?;
         let live_refine = prepare_refine_dir(&self.target_root)?;
+        // Preserve legacy executable selections as catalog definitions before
+        // deciding whether this node has only pristine bootstrap state.
+        crate::infrastructure::storage::providers::ProviderStore::new(&live_refine).load()?;
         self.ensure_local_state_excluded()?;
         self.retire_legacy_baseline()?;
         let remote = self.configured_remote(&live_refine)?;
@@ -282,6 +285,7 @@ impl FileGitSyncService {
         // a commit; a record the daemon advances after this point is simply
         // the next pass's delta. (A decision-settled join re-reads once after
         // its own authorized hydration, below.)
+        crate::application::events::migration::retire_settings(&live_refine)?;
         let mut live = durable_state_map(&live_refine)?;
 
         // Joining an existing fleet: the remote branch exists but this node
@@ -1318,7 +1322,15 @@ impl FileGitSyncService {
             .into_iter()
             .filter(|relative| !is_excluded_from_durable_state(relative))
             .collect::<Vec<_>>();
-        ordered.sort_by_key(|relative| (!is_bootstrap_state_path(relative), relative.clone()));
+        // Definitions must arrive before nodes that reference them. Otherwise a
+        // concurrent settings read can mistake a new ID for a legacy executable.
+        ordered.sort_by_key(|relative| {
+            (
+                relative != std::path::Path::new("providers.json"),
+                !is_bootstrap_state_path(relative),
+                relative.clone(),
+            )
+        });
         let mut concurrent_change = false;
         for relative in ordered {
             let target_bytes = self.state_bytes_at(
@@ -1339,7 +1351,10 @@ impl FileGitSyncService {
                 continue;
             }
             let destination = live_root.join(&relative);
-            let key = record_lock_key(&destination);
+            let key = (relative == std::path::Path::new("providers.json"))
+                .then(|| record_lock_key(&live_root.join("nodes.json")))
+                .or_else(|| crate::application::hub::synchronization_lock_key(&relative))
+                .unwrap_or_else(|| record_lock_key(&destination));
             with_record_lock(live_root, &key, || {
                 let current = live_path_fingerprint(&destination)?;
                 let before = original.get(&relative).copied();
@@ -1350,6 +1365,13 @@ impl FileGitSyncService {
                 if current != before {
                     concurrent_change = true;
                     return Ok(());
+                }
+                if is_goal_record(&relative) {
+                    ActiveGoalIndex::prepare_goal_write(
+                        live_root,
+                        &destination,
+                        target_bytes.as_deref(),
+                    )?;
                 }
                 if let Some(bytes) = &target_bytes {
                     replace_file_durably(&destination, bytes)?;
@@ -1436,6 +1458,9 @@ fn reconcile_hydrated_index(
     destination: &std::path::Path,
     desired: Option<u64>,
 ) {
+    if relative.starts_with("hub") {
+        crate::application::hub::query::invalidate(live_root);
+    }
     if desired.is_some() {
         record_synchronized_goal(live_root, relative, destination);
     } else {

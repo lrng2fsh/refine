@@ -169,7 +169,7 @@ pub(crate) fn prepare_prompt_with_environment(
         artifact.path(),
         artifact.inner.metadata.utf8_bytes,
         &artifact.inner.metadata.sha256,
-    );
+    )?;
     let bootstrap_args = inline_args(&bootstrap);
     if !invocation_fits(&bootstrap_args, environment)? {
         return Err(RefineError::Degraded(
@@ -414,7 +414,7 @@ fn transport_metadata(
     }
 }
 
-fn render_file_bootstrap(path: &Path, bytes: usize, digest: &str) -> String {
+fn render_file_bootstrap(path: &Path, bytes: usize, digest: &str) -> RefineResult<String> {
     let path = path.display().to_string();
     let bytes = bytes.to_string();
     render(
@@ -561,9 +561,10 @@ mod tests {
         );
         let large_environment = EffectiveLaunchEnvironment::assemble(
             &ProcessOwner::Agent,
-            &(0..32)
-                .map(|index| (format!("REFINE_LARGE_{index}"), "x".repeat(64 * 1024)))
-                .collect::<Vec<_>>(),
+            &crate::infrastructure::process::launch_environment::padded_agent_environment_for_test(
+                Vec::new(),
+                0,
+            ),
         )
         .unwrap();
         assert!(!large_environment.launch_fits("provider", &[]).unwrap());
@@ -609,6 +610,7 @@ mod tests {
                 prepared.metadata.utf8_bytes,
                 &prepared.metadata.sha256
             )
+            .unwrap()
         );
         fs::write(artifact.path(), "changed").unwrap_err();
         fs::set_permissions(artifact.path(), fs::Permissions::from_mode(0o600)).unwrap();

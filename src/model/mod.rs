@@ -13,3 +13,7 @@ pub mod workflow;
 
 pub type Timestamp = String;
 pub type JsonObject = serde_json::Map<String, serde_json::Value>;
+
+pub mod hub;
+
+pub mod providers;

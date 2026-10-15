@@ -1,5 +1,4 @@
 //! Pure evidence assessment. Execution status does not decide workflow permission.
-use crate::application::agent_io::contracts::skill_result::validate_artifacts;
 use crate::application::events::execution::PinnedBinding;
 use crate::application::events::{EventInvocation, InvocationState};
 use crate::error::{RefineError, RefineResult};
@@ -30,7 +29,6 @@ impl EventInvocation {
         result
             .validate(&self.id, &pinned.binding.id, &pinned.skill.role)
             .map_err(invalid)?;
-        validate_artifacts(result).map_err(|error| invalid(error.to_string()))?;
         Ok(result)
     }
 
@@ -67,7 +65,7 @@ impl EventInvocation {
             );
             return Err(
                 if matches!(self.execution_error(), RefineError::Serialization(_)) {
-                    RefineError::Serialization(message)
+                    RefineError::Serialization(format!("Skill output contract failed: {message}"))
                 } else {
                     RefineError::Degraded(message)
                 },

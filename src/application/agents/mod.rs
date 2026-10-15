@@ -2,3 +2,7 @@
 
 pub mod provider_selection;
 pub mod sessions;
+
+pub mod prompt_history;
+
+pub mod providers;

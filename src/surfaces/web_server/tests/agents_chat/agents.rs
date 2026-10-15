@@ -272,17 +272,12 @@ fn web_server_reports_provider_diagnostics_for_agents_and_recheck() {
         path: "/api/agents/configured-generic-agent/diagnostics".to_string(),
         body: None,
     });
-    assert_eq!(generic.status, 200);
-    assert_eq!(generic.body["provider"], "configured-generic-agent");
+    assert_eq!(generic.status, 400);
     assert!(
-        generic.body["diagnostics"]
-            .as_array()
+        generic.body["error"]["message"]
+            .as_str()
             .unwrap()
-            .iter()
-            .any(|entry| entry
-                .as_str()
-                .unwrap_or("")
-                .contains("configured-generic-agent CLI not found"))
+            .contains("not configured")
     );
 
     let recheck = server.handle(ApiRequest {
@@ -321,24 +316,24 @@ fn toolbar_agent_prompts_are_node_first_and_route_changes_through_refine_workflo
     for (profile, prompt) in [("agent", &agent_prompt), ("plan", &plan_prompt)] {
         for required in [
             "Begin with the existing Refine Node",
-            "investigating and managing the current Node",
-            "answering the user's questions",
+            "Investigate and manage the current Node",
+            "answer directly",
             "answer directly when no repository change is needed",
-            "do not modify the repository ad hoc in this session",
-            "new complete Goal",
+            "or modify the repository ad hoc",
+            "complete Goal with metadata",
             "actionable Round",
-            "make it eligible for workflow execution",
-            "without requiring the user to recite lifecycle commands",
-            "continues a failed Goal",
-            "preserve its recorded attempt and retained work",
-            "evidence-preserving recovery Round",
-            "return the Goal to an eligible workflow state",
-            "Honor Refine's confirmation and audit boundaries",
-            "never directly edit durable Goal state",
+            "make it eligible for execution",
+            "do not require the user to recite lifecycle commands",
+            "For failed work",
+            "Preserve earlier attempts and work",
+            "retry the existing Round, redirect, or create a new Round as appropriate",
+            "Never create a Round merely to bypass stale bookkeeping",
+            "Honor confirmation and audit boundaries",
+            "Do not directly edit durable Goal state",
             "conceal failures",
             "approve or merge on the user's behalf",
-            "destructively discard retained work",
-            "begin ongoing supervision unless the user requests it",
+            "discard retained work",
+            "begin ongoing supervision unless requested",
         ] {
             assert!(
                 prompt.contains(required),
@@ -369,9 +364,7 @@ fn toolbar_agent_prompts_are_node_first_and_route_changes_through_refine_workflo
         assert!(
             cli_agent_prompt.contains("Treat Refine as the execution path for repository changes")
         );
-        assert!(
-            cli_agent_prompt.contains("continuing work after an unsuccessful recorded attempt")
-        );
+        assert!(cli_agent_prompt.contains("For failed work"));
         assert!(!cli_agent_prompt.contains("Begin with the existing Refine Node"));
 
         let cli_plan_prompt = crate::surfaces::web_server::work_routes::terminal_profile_prompt(

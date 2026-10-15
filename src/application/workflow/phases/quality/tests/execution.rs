@@ -16,38 +16,30 @@ fn quality_operation_settles_parsing_failure_and_persists_the_same_goal_evidence
     assert!(
         error
             .to_string()
-            .contains("invalid structured Quality evaluation JSON"),
+            .contains("invalid structured Skill completion report"),
         "error: {error}"
     );
     let operation = FileOperationRegistry::new(&fixture.runtime_root)
         .recover()
         .unwrap()
-        .pop()
+        .into_iter()
+        .find(|op| op.owner.starts_with("quality:"))
         .unwrap();
     assert_eq!(operation.state, OperationState::Failed);
-    let (logs, _, _) = FileOperationRegistry::new(&fixture.runtime_root)
-        .page_logs(&operation.id, 50, 0)
-        .unwrap();
-    let attempts = logs
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .details
-                .as_ref()
-                .and_then(|details| details.get("provider_attempt"))
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(attempts.len(), 3);
+    let invocation = quality_invocation(&fixture.refine_dir);
+    assert_eq!(invocation.attempts.len(), 1);
+    assert_eq!(invocation.attempts[0]["raw_output"], "not json");
     assert!(
-        attempts
-            .iter()
-            .all(|attempt| { attempt["raw_output"] == "not json" && attempt["accepted"] == false })
+        invocation.attempts[0]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("invalid JSON")
     );
     assert!(
         operation.error.unwrap()["message"]
             .as_str()
             .unwrap()
-            .contains("invalid structured Quality evaluation JSON")
+            .contains("invalid structured Skill completion report")
     );
     let detail = FileWorkItemService::new(&fixture.refine_dir)
         .show_goal_detail("GOAL1")
@@ -60,14 +52,14 @@ fn quality_operation_settles_parsing_failure_and_persists_the_same_goal_evidence
         detail["rounds"][0]["quality_message"]
             .as_str()
             .unwrap()
-            .contains("invalid structured Quality evaluation JSON")
+            .contains("invalid structured Skill completion report")
     );
     restore_smoke_ai(previous);
     fs::remove_dir_all(fixture.temp_root).unwrap();
 }
 
 #[test]
-fn quality_repairs_one_invalid_response_and_retains_both_attempts() {
+fn quality_invalid_response_fails_once_and_retains_the_original_output() {
     let fixture = goal_quality_fixture(
         "quality-output-repair",
         "if test ! -e \"$0.attempted\"; then : > \"$0.attempted\"; printf 'not json\\n'; else printf '%s\\n' '{\"summary\":\"repaired\",\"results\":[{\"test\":\"Outcome works\",\"status\":\"passed\",\"evidence\":\"repaired plan\",\"command\":\"printf ok\"}]}'; fi",
@@ -78,35 +70,44 @@ fn quality_repairs_one_invalid_response_and_retains_both_attempts() {
     let previous = std::env::var_os("REFINE_SMOKE_AI_PATH");
     unsafe { std::env::set_var("REFINE_SMOKE_AI_PATH", &fixture.smoke_ai) };
 
-    let operation = fixture
-        .runner()
-        .run_goal_checks("GOAL1", "smoke-ai", Default::default())
-        .unwrap();
-    assert!(operation.result.ok, "{:#?}", operation.result);
-    assert_eq!(operation.result.provider_attempts.len(), 2);
-    assert!(!operation.result.provider_attempts[0].accepted);
-    assert_eq!(operation.result.provider_attempts[0].raw_output, "not json");
-    assert!(operation.result.provider_attempts[1].accepted);
-
+    assert!(
+        fixture
+            .runner()
+            .run_goal_checks("GOAL1", "smoke-ai", Default::default())
+            .is_err()
+    );
     let detail = FileWorkItemService::new(&fixture.refine_dir)
         .show_goal_detail("GOAL1")
         .unwrap();
-    let quality = &detail["rounds"][0]["quality_details"];
-    assert_eq!(quality["provider_attempts"].as_array().unwrap().len(), 2);
-    assert_eq!(quality["quality_proof"]["goal_id"], "GOAL1");
-    assert_eq!(quality["quality_proof"]["round_idx"], 0);
-    assert_eq!(quality["quality_proof"]["state"], "passed");
+    assert_eq!(
+        detail["rounds"][0]["quality_state"],
+        "output_contract_fault"
+    );
+    let registry = FileOperationRegistry::new(&fixture.runtime_root);
+    let operation = registry
+        .recover()
+        .unwrap()
+        .into_iter()
+        .find(|op| op.owner.starts_with("quality:"))
+        .unwrap();
+    assert_eq!(operation.state, OperationState::Failed);
+    let invocation = quality_invocation(&fixture.refine_dir);
+    assert_eq!(invocation.attempts.len(), 1);
+    assert_eq!(invocation.attempts[0]["raw_output"], "not json");
+    assert!(
+        invocation.attempts[0]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("invalid JSON")
+    );
 
     restore_smoke_ai(previous);
     fs::remove_dir_all(fixture.temp_root).unwrap();
 }
 
 #[test]
-fn quality_cancellation_during_repair_prevents_further_attempts() {
-    let fixture = goal_quality_fixture(
-        "quality-output-repair-cancel",
-        "if test ! -e \"$0.attempted\"; then : > \"$0.attempted\"; printf 'not json\\n'; else exec sleep 30; fi",
-    );
+fn quality_cancellation_during_provider_work_prevents_further_attempts() {
+    let fixture = goal_quality_fixture("quality-output-repair-cancel", "exec sleep 30");
     let _guard = smoke_ai_env_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -118,19 +119,6 @@ fn quality_cancellation_during_repair_prevents_further_attempts() {
         .start_goal_checks("GOAL1", "smoke-ai", Default::default())
         .unwrap();
     let registry = FileOperationRegistry::new(&fixture.runtime_root);
-    for _ in 0..100 {
-        let (logs, _, _) = registry.page_logs(&operation.id, 50, 0).unwrap();
-        if logs.iter().any(|entry| {
-            entry
-                .details
-                .as_ref()
-                .and_then(|details| details.get("provider_attempt"))
-                .is_some()
-        }) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
     wait_for_operation_process(&fixture.runtime_root, &operation.id);
     registry
         .cancel_supervised(&operation.id, &|| Ok(()))
@@ -151,7 +139,7 @@ fn quality_cancellation_during_repair_prevents_further_attempts() {
                     .is_some()
             })
             .count(),
-        1
+        0
     );
     let detail = FileWorkItemService::new(&fixture.refine_dir)
         .show_goal_detail("GOAL1")
@@ -199,6 +187,10 @@ fn workflow_quality_authority_loss_prevents_provider_launch() {
         Some(round_idx),
     );
     metadata.insert("workflow_revision".to_string(), json!(workflow_revision));
+    metadata.insert(
+        "workflow_step_generation".to_string(),
+        work_items.show_goal_detail("GOAL1").unwrap()["event_generation"].clone(),
+    );
     let runner = fixture.runner();
     let (operation, request) = runner
         .register_goal_checks("GOAL1", "smoke-ai", metadata)
@@ -235,7 +227,8 @@ fn quality_operation_preserves_provider_failure_and_settles_terminally() {
     let operation = FileOperationRegistry::new(&fixture.runtime_root)
         .recover()
         .unwrap()
-        .pop()
+        .into_iter()
+        .find(|op| op.owner.starts_with("quality:"))
         .unwrap();
     assert_eq!(operation.state, OperationState::Failed);
     assert!(
@@ -350,20 +343,11 @@ fn quality_cancellation_before_provider_launch_records_cancelled_evidence() {
 }
 
 #[test]
-fn quality_cancellation_between_commands_prevents_later_work() {
+fn quality_cancellation_stops_the_agent_before_its_next_action() {
     let fixture = goal_quality_fixture(
-        "quality-cancel-between-commands",
-        "printf '%s\\n' '{\"ok\":true,\"results\":[{\"test\":\"First outcome\",\"status\":\"passed\",\"evidence\":\"planned\",\"command\":\"printf started > first-started; while [ ! -f release-first ]; do sleep 1; done\"},{\"test\":\"Second outcome\",\"status\":\"passed\",\"evidence\":\"planned\",\"command\":\"printf second > second-ran\"}]}'",
+        "quality-cancel-between-agent-actions",
+        "printf started > first-started; while [ ! -f release-first ]; do sleep 1; done; printf second > second-ran",
     );
-    FileQualityService::new(&fixture.refine_dir)
-        .save_settings(QualitySettingsPatch {
-            tests: Some(vec![
-                "First outcome".to_string(),
-                "Second outcome".to_string(),
-            ]),
-            ..QualitySettingsPatch::default()
-        })
-        .unwrap();
     let _guard = smoke_ai_env_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -789,12 +773,7 @@ fn legacy_post_build_and_reconciliation_use_isolated_source_with_dirty_primary()
             },
             "printf provider-must-not-launch > provider-launched",
         );
-        FileQualityService::new(&fixture.refine_dir)
-            .save_settings(QualitySettingsPatch {
-                tests: Some(Vec::new()),
-                ..QualitySettingsPatch::default()
-            })
-            .unwrap();
+        disable_quality_skill(&fixture.refine_dir);
         let work_items = FileWorkItemService::new(&fixture.refine_dir);
         let detail = work_items.show_goal_detail("GOAL1").unwrap();
         let candidate = detail["candidate_commit"].as_str().unwrap().to_string();
@@ -868,4 +847,48 @@ fn legacy_post_build_and_reconciliation_use_isolated_source_with_dirty_primary()
         assert!(!fixture.candidate_root.join("provider-launched").exists());
         fs::remove_dir_all(fixture.temp_root).unwrap();
     }
+}
+
+#[test]
+fn absent_quality_skill_passes_without_running_legacy_checks_or_erasing_settings() {
+    let fixture = goal_quality_fixture(
+        "quality-no-skill",
+        "printf launched > provider-launched; exit 99",
+    );
+    let config_path = fixture.refine_dir.join("automation/config.json");
+    // Test both an absent Skills configuration and an explicitly empty Quality trigger.
+    let config = fs::read(&config_path).unwrap();
+    let legacy_path = fixture.refine_dir.join("quality/settings.json");
+    fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+    let legacy = br#"{"tests":["false"],"instructions":"Old settings must not dispatch work"}"#;
+    fs::write(&legacy_path, legacy).unwrap();
+    fs::remove_file(&config_path).unwrap();
+    let result = fixture
+        .runner()
+        .run_goal_checks("GOAL1", "missing-provider", Default::default())
+        .unwrap();
+    assert!(result.result.ok);
+    assert!(result.result.results.is_empty());
+    assert!(result.result.provider_attempts.is_empty());
+    assert_eq!(fs::read(&legacy_path).unwrap(), legacy);
+    assert!(!fixture.candidate_root.join("provider-launched").exists());
+    let mut config: Value = serde_json::from_slice(&config).unwrap();
+    config["skills"]
+        .as_object_mut()
+        .unwrap()
+        .remove("default-quality");
+    for event in config["events"].as_object_mut().unwrap().values_mut() {
+        event["bindings"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|binding| binding["skill_id"] != "default-quality");
+    }
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let result = fixture
+        .runner()
+        .run_goal_checks("GOAL1", "missing-provider", Default::default())
+        .unwrap();
+    assert!(result.result.ok);
+    assert!(result.result.results.is_empty());
+    assert!(!fixture.candidate_root.join("provider-launched").exists());
 }

@@ -4,7 +4,7 @@
 // one-click toggle, so typical users can't take the app down by
 // accident). Green/running links to the configured App URL when present;
 // every other state links to Node, where the Start / Stop controls live.
-// The visible label names the active project.
+// The tooltip names the active project.
 
 let _targetAppSnapshot = null;
 let _agentStatusRefreshTimer = null;
@@ -65,8 +65,7 @@ function scheduleAgentStatusRefresh() {
 
 async function refreshAgentStatusIndicator() {
   const nodeGeneration = captureNodeContextGeneration();
-  const indicator = document.getElementById("agent-status-indicator");
-  if (!indicator) return;
+  if (!document.getElementById("workflow-status-indicator") && !document.getElementById("agent-status-indicator")) return;
   if (!hasAttachedProject()) {
     applyAgentStatusSnapshot({
       runner_reachable: false,
@@ -91,7 +90,22 @@ async function refreshAgentStatusIndicator() {
   }
 }
 
+function applyWorkflowStatusSnapshot(snap) {
+  if (typeof renderQuickWorkflowActions === "function") renderQuickWorkflowActions(snap);
+  const indicator = document.getElementById("workflow-status-indicator");
+  if (!indicator) return;
+  const health = snap.workflow_health;
+  const status = snap.error ? "unknown" : health?.healthy === false ? "down"
+    : health?.state === "paused" || snap.paused === true ? "paused"
+    : health?.healthy === true ? "running" : "unknown";
+  indicator.dataset.state = status;
+  const label = health?.state || status;
+  indicator.title = `Workflow: ${label}${health?.reason ? ` — ${health.reason}` : snap.error ? ` — ${snap.error}` : ""}`;
+  indicator.setAttribute("aria-label", `${indicator.title}; click to view processes`);
+}
+
 function applyAgentStatusSnapshot(snap) {
+  applyWorkflowStatusSnapshot(snap);
   const indicator = document.getElementById("agent-status-indicator");
   if (!indicator) return;
   const processes = Array.isArray(snap.processes) ? snap.processes : [];
@@ -104,7 +118,7 @@ function applyAgentStatusSnapshot(snap) {
       ? "paused"
       : "running";
   indicator.dataset.state = status;
-  indicator.href = "#/settings/processes";
+  indicator.href = "#/control";
   indicator.removeAttribute("target");
   indicator.removeAttribute("rel");
   const label = `Agents (${agentCount})`;
@@ -121,6 +135,7 @@ function applyAgentStatusSnapshot(snap) {
 
 function applyTargetAppSnapshot(snap) {
   _targetAppSnapshot = snap;
+  if (typeof renderQuickTargetActions === "function") renderQuickTargetActions(snap);
   const indicator = document.getElementById("target-app-indicator");
   if (!indicator) return;
   const appState = snap.state === "running" && snap.has_status_checks === false
@@ -144,7 +159,7 @@ function applyTargetAppSnapshot(snap) {
   const checkOk = "last_check_ok" in snap ? snap.last_check_ok : snap.last_health_ok;
   const appUrl = (snap.app_url || "").trim();
   const opensApp = appState === "running" && appUrl;
-  indicator.href = opensApp ? appUrl : "#/settings/processes";
+  indicator.href = opensApp ? appUrl : "#/control";
   if (opensApp) {
     indicator.target = "_blank";
     indicator.rel = "noopener noreferrer";
@@ -159,16 +174,17 @@ function applyTargetAppSnapshot(snap) {
         ? ` · last check ${checkOk ? "OK" : "FAIL"} at ${fmtTime(checkAt)}`
         : "")
     + (snap.last_error ? ` · ${snap.last_error}` : "")
-    + (opensApp ? " — open target application" : " — click to manage in Node");
+    + (opensApp ? " — open target application" : " — click to manage in Control");
   const lbl = indicator.querySelector(".target-app-label");
   if (lbl) lbl.textContent = projectLabel;
   // Repaint the Node process block (and the start/stop button) whenever it is visible.
-  if (state.currentRoute === "node" && typeof readSettingsTab === "function" && readSettingsTab() === "processes") {
+  if (state.currentRoute === "control" && typeof readSettingsTab === "function" && readSettingsTab() === "processes") {
     drawTargetAppStatusBlock(snap);
   }
 }
 
 async function runTargetAppAction(action) {
+  const nodeGeneration = captureNodeContextGeneration();
   // action is "start", "stop", or "build". Called from the buttons on System.
   const snap = _targetAppSnapshot || {};
   const hasPrompt = action === "start"
@@ -195,7 +211,7 @@ async function runTargetAppAction(action) {
       okLabel: isStop ? "Stop" : (isBuild ? "Build" : "Start"),
       danger: isStop },
   );
-  if (!ok) return;
+  if (!ok || !isNodeContextGenerationCurrent(nodeGeneration)) return;
   // Optimistic UI flip so the dot transitions immediately.
   applyTargetAppSnapshot({
     ..._targetAppSnapshot,

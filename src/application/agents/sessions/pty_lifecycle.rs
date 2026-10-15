@@ -162,7 +162,6 @@ pub(super) struct StartedSession {
     pub artifact_handoff: fs::File,
     pub completion_timeout: Option<Duration>,
     pub idle_timeout: Option<Duration>,
-    pub requires_planning_result: bool,
 }
 
 pub(super) fn launch_session(launch: GoalAgentLaunch) -> RefineResult<StartedSession> {
@@ -248,15 +247,14 @@ pub(super) fn launch_session(launch: GoalAgentLaunch) -> RefineResult<StartedSes
         )));
     }
 
-    let provider_service = HostAgentProviderService::with_runtime_root(&launch.runtime_root);
+    let mut provider_service = HostAgentProviderService::with_runtime_root(&launch.runtime_root);
+    provider_service.refine_dir = launch.refine_dir.clone();
     let implementation_phase = launch
         .metadata
         .get("implementation_phase")
         .and_then(Value::as_str);
-    let requires_planning_result =
-        matches!(implementation_phase, Some("plan" | "criticize" | "revise"));
     let protocol_prompt =
-        goal_agent_protocol_prompt(&launch.prompt, &signal_path, implementation_phase);
+        goal_agent_protocol_prompt(&launch.prompt, &signal_path, implementation_phase)?;
     let launch_env_overrides = vec![
         ("TERM".to_string(), "xterm-256color".to_string()),
         ("COLORTERM".to_string(), "truecolor".to_string()),
@@ -289,6 +287,7 @@ pub(super) fn launch_session(launch: GoalAgentLaunch) -> RefineResult<StartedSes
     let completion_timeout = launch.completion_timeout;
     let idle_timeout = launch.idle_timeout;
     let mut metadata = launch.metadata;
+    metadata.insert("rendered_prompt".into(), json!(protocol_prompt));
     if let Ok(token) = std::env::var("REFINE_WORKFLOW_INCARNATION") {
         metadata.insert("workflow_incarnation".into(), json!(token));
     }
@@ -478,6 +477,5 @@ pub(super) fn launch_session(launch: GoalAgentLaunch) -> RefineResult<StartedSes
         artifact_handoff,
         completion_timeout,
         idle_timeout,
-        requires_planning_result,
     })
 }

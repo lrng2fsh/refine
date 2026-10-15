@@ -82,6 +82,20 @@ function setAutomationStatusBusy() {
   });
 }
 
+function bindAutomationRows(root, selector, open) {
+  root.querySelectorAll(selector).forEach(row => {
+    row.onclick = event => {
+      if (!event.target.closest("button, a, input, select, textarea, summary, [contenteditable]")) open(row);
+    };
+    row.onkeydown = event => {
+      if (event.target === row && ["Enter", " "].includes(event.key)) {
+        event.preventDefault();
+        open(row);
+      }
+    };
+  });
+}
+
 function automationModal(title, content) {
   const priorFocus = document.activeElement;
   const root = document.createElement("div");
@@ -95,7 +109,7 @@ function automationModal(title, content) {
     if (!root.contains(event.target)) return;
     if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); }
     if (event.key === "Tab") {
-      const controls = [...root.querySelectorAll("button:not([disabled]):not([hidden]), input:not([disabled]), textarea, select, [tabindex='0']")].filter(e => e.getClientRects().length);
+      const controls = [...root.querySelectorAll("button:not([disabled]):not([hidden]), input:not([disabled]), textarea, select, [tabindex='0']")].filter(e => e.tabIndex >= 0 && e.getClientRects().length);
       const first = controls[0], last = controls.at(-1);
       if (event.shiftKey && (document.activeElement === first || !controls.includes(document.activeElement))) { event.preventDefault(); last?.focus(); }
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
@@ -161,8 +175,8 @@ function readParameters(root) {
 function skillTriggerLabel(source) {
   if (source === "custom") return "Custom";
   if (source === "node.startup.ready") return "Node starts";
-  const match = source?.match(/^workflow\.(.+)\.(enter|exit)$/);
-  return match ? `${match[1][0].toUpperCase() + match[1].slice(1)} ${match[2] === "enter" ? "starts" : "ends"}` : "Unconfigured";
+  const match = source?.match(/^workflow\.(.+)\.(enter|exit|error|success)$/);
+  return match ? `${match[1] === "draft" && state.currentRoute !== "planning" ? "Project Planning" : match[1][0].toUpperCase() + match[1].slice(1)} ${({enter:"starts",exit:"exits",error:"error",success:"success"})[match[2]]}` : source ? source.split(/[._-]/).map(word => word[0]?.toUpperCase() + word.slice(1)).join(" ") : "Unconfigured";
 }
 
 let skillIdSequence = 0;
@@ -178,7 +192,7 @@ function newSkillId() {
   return `skill-${Date.now().toString(36)}-${(++skillIdSequence).toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
-async function openSkillEditor(original = null, clone = false) {
+async function openSkillEditor(original = null, clone = false, defaults = {}) {
   if (automationEditor || automationEditorOpening) return;
   automationEditorOpening = true;
   const generation = captureNodeContextGeneration();
@@ -190,15 +204,20 @@ async function openSkillEditor(original = null, clone = false) {
       api("GET", original ? `/api/skills/${encodeURIComponent(original.id)}` : "/api/skills"),
     ]);
     if (!isNodeContextGenerationCurrent(generation)) return;
-    sources = catalog.sources; revision = current.revision;
+    sources = catalog.sources.filter(source => state.currentRoute === "planning" || !source.startsWith("workflow.draft.") || source === current.trigger?.source); revision = current.revision;
     item = original ? structuredClone(current.item) : {id: newSkillId(), name: "", prompt: "", enabled: true, scope: {node_id: null}, parameters: []};
-    trigger = current.trigger || {source: "custom", mode: "blocking", order: 0, inputs: {}};
+    trigger = current.trigger || {source: defaults.source || "custom", mode: "blocking", order: 0, inputs: {}, planning: defaults.planning || null};
     if (clone) { item.id = newSkillId(); item.name += " copy"; trigger = {...trigger, id: undefined}; }
   } catch (error) { showActionError(error); return; }
   finally { automationEditorOpening = false; }
   const root = automationModal(editing ? `${item.name} — Edit Skill` : "New Skill", `<form data-automation-form novalidate>
-    <div class="automation-instructions">${renderSettingsMarkdownField({id: "automation-prompt", title: "Instructions", value: item.prompt, rows: 16})}</div>
-    <details class="automation-skill-settings" data-skill-settings><summary>Skill settings</summary>
+    <div class="settings-tabs-row"><nav class="settings-tabs" role="tablist" aria-label="Skill editor">
+      <button type="button" class="settings-tab active" role="tab" id="automation-tab-instructions" data-skill-tab="instructions" aria-controls="automation-panel-instructions" aria-selected="true" tabindex="0">Instructions</button>
+      <button type="button" class="settings-tab" role="tab" id="automation-tab-settings" data-skill-tab="settings" aria-controls="automation-panel-settings" aria-selected="false" tabindex="-1">Settings</button>
+    </nav></div>
+    <div class="settings-pane active automation-instructions" role="tabpanel" id="automation-panel-instructions" aria-labelledby="automation-tab-instructions" data-skill-panel="instructions">${renderSettingsMarkdownField({id: "automation-prompt", title: "Instructions", value: item.prompt, rows: 16})}</div>
+    <div class="settings-pane" role="tabpanel" id="automation-panel-settings" aria-labelledby="automation-tab-settings" data-skill-panel="settings" hidden>
+    <div class="form-row" data-planning-filters><label>Board filter<input data-planning-board-filter value="${htmlEscape(trigger.planning?.board_id || "")}" placeholder="All boards"></label><label>Lane filter<input data-planning-lane-filter value="${htmlEscape(trigger.planning?.lane_id || "")}" placeholder="All lanes"></label></div>
     <div class="form-row"><label for="automation-name">Name</label><input type="text" id="automation-name" required value="${htmlEscape(item.name)}"></div>
     <div class="automation-fields"><div class="form-row"><label for="automation-trigger">Trigger</label><select id="automation-trigger" data-trigger-source required>${[["Manual", sources.filter(source => source === "custom")], ["Automatic", sources.filter(source => source !== "custom")]].map(([label, values]) => `<optgroup label="${label}">${values.map(source => `<option value="${htmlEscape(source)}" ${source === trigger.source ? "selected" : ""}>${htmlEscape(skillTriggerLabel(source))}</option>`).join("")}</optgroup>`).join("")}</select></div>
     ${automationScopeControl("data-scope", item.scope)}<div class="form-row"><label>Status</label>${automationChoices("data-enabled", "Status", [["true", "Enabled"], ["false", "Disabled"]], item.enabled)}</div></div>
@@ -206,9 +225,32 @@ async function openSkillEditor(original = null, clone = false) {
     <section class="automation-section"><h3>Parameters <span class="muted small">— optional inputs</span></h3><div class="automation-table-scroll"><table class="table automation-parameters" data-parameters><thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Default</th><th></th></tr></thead>${parameterRows(item.parameters)}</table></div><button type="button" class="secondary" data-add-parameter>Add parameter</button></section>
     <section class="automation-section" data-automatic-options><h3>Workflow options</h3><div class="form-row"><label>How it runs</label>${automationChoices("data-mode", "How it runs", [["blocking", "Required"], ["background", "Background"], ["context", "Context only"]], trigger.mode)}<span class="muted small">Required work must succeed before the workflow moves on. Context only adds instructions to other agents.</span></div><div class="form-row"><label for="automation-order">Order</label><input id="automation-order" type="number" data-order required min="-2147483648" max="2147483647" step="1" value="${trigger.order || 0}"><span class="muted small">Lower numbers run first when several Skills use this trigger.</span></div></section>
     <section class="automation-section" data-context-options><h3>Parameter context <span class="muted small">— optional</span></h3><p class="muted small">Fill an input from Goal or system context. Leave it blank to use its default or ask when run manually.</p><div data-context-inputs></div><datalist id="skill-context-sources"><option value="goal.id"><option value="goal.name"><option value="system.node_id"><option value="system.project_root"></datalist></section>
-    </details>
+    </div>
   </form>`);
   automationEditor = root;
+  function selectEditorTab(name, focus = false) {
+    root.querySelectorAll('[data-skill-tab]').forEach(tab => {
+      const selected = tab.dataset.skillTab === name;
+      tab.classList.toggle('active', selected);
+      tab.setAttribute('aria-selected', String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+      if (selected && focus) tab.focus();
+    });
+    root.querySelectorAll('[data-skill-panel]').forEach(panel => {
+      const selected = panel.dataset.skillPanel === name;
+      panel.hidden = !selected;
+      panel.classList.toggle('active', selected);
+    });
+  }
+  root.querySelectorAll('[data-skill-tab]').forEach(tab => {
+    tab.onclick = () => selectEditorTab(tab.dataset.skillTab);
+    tab.onkeydown = event => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const name = event.key === 'Home' ? 'instructions' : event.key === 'End' ? 'settings' : tab.dataset.skillTab === 'instructions' ? 'settings' : 'instructions';
+      selectEditorTab(name, true);
+    };
+  });
   const instructionField = root.querySelector("[data-settings-markdown-field]");
   const instructionEditor = root.querySelector("#automation-prompt");
   instructionEditor.dataset.prompt = "";
@@ -228,13 +270,14 @@ async function openSkillEditor(original = null, clone = false) {
   const readInputs = () => Object.fromEntries([...root.querySelectorAll("[data-input-name]")].filter(input => input.value.trim()).map(input => [input.dataset.inputName, input.value.trim()]));
   function drawContext(inputs = readInputs()) {
     const names = [...root.querySelectorAll("[data-parameter] [data-name]")].map(input => input.value.trim()).filter(Boolean);
-    root.querySelector("[data-context-options]").hidden = !names.length;
+    root.querySelector("[data-context-options]").hidden = editing || !names.length;
     root.querySelector("[data-context-inputs]").innerHTML = names.map(name => `<div class="form-row"><label>${htmlEscape(name)}</label><input type="text" aria-label="${htmlEscape(name)} context source" data-input-name="${htmlEscape(name)}" value="${htmlEscape(inputs[name] || "")}" list="skill-context-sources" placeholder="Use default or ask when run"></div>`).join("");
   }
   function updateTrigger() {
     const source = root.querySelector("[data-trigger-source]").value;
     root.querySelector("[data-automatic-options]").hidden = source === "custom";
-    root.querySelector("[data-trigger-help]").textContent = source === "custom" ? "Run from Controls → Skills or the CLI. Web runs open in an agent tab." : "Runs automatically at this point. Refine supplies the context and expected result.";
+    root.querySelector("[data-planning-filters]").hidden = editing || !source.startsWith("planning.lane.");
+    root.querySelector("[data-trigger-help]").textContent = source === "custom" ? "Run from New Goal → Skills or the CLI. Web runs open in an agent tab." : "Runs automatically at this point. Refine supplies the context and expected result.";
   }
   root.querySelector("[data-add-parameter]").onclick = () => {
     dirty(); root.querySelector("[data-parameters]").insertAdjacentHTML("beforeend", parameterRows([{}]));
@@ -263,6 +306,12 @@ async function openSkillEditor(original = null, clone = false) {
     if (event.target.matches("[data-trigger-source]")) updateTrigger();
   });
   drawContext(trigger.inputs); updateTrigger();
+  if (editing) {
+    root.querySelector('[data-trigger-source]').closest('.form-row').hidden = true;
+    root.querySelector('[data-trigger-help]').textContent = 'Shared instructions apply to every assignment. Manage triggers and their settings in Workflow.';
+    root.querySelector('[data-automatic-options]').hidden = true;
+    root.querySelector('[data-context-options]').hidden = true;
+  }
   let saving = false;
   async function save(remove = false) {
     if (saving) return;
@@ -276,16 +325,17 @@ async function openSkillEditor(original = null, clone = false) {
         root.querySelector("#automation-name").value = root.querySelector("#automation-name").value.trim();
         const invalid = form.querySelector(":invalid");
         if (invalid) {
+          selectEditorTab(invalid === instructionEditor ? 'instructions' : 'settings');
           if (invalid === instructionEditor) editSettingsMarkdownField(instructionField);
-          else root.querySelector("[data-skill-settings]").open = true;
           invalid.focus(); form.reportValidity(); return;
         }
         const scope = readAutomationScope(root.querySelector("[data-scope]"));
         const source = root.querySelector("[data-trigger-source]").value;
         const edited = {id: item.id, name: root.querySelector("#automation-name").value.trim(), prompt: root.querySelector("[data-prompt]").value, enabled: root.querySelector("[data-enabled]").dataset.value === "true", scope, parameters: readParameters(root), provenance: item.provenance || null};
-        await api("PUT", path, {revision, item: edited, trigger: {id: trigger.id, source, mode: source === "custom" ? "blocking" : root.querySelector("[data-mode]").dataset.value, order: Number(root.querySelector("[data-order]").value), inputs: readInputs()}});
+        await api("PUT", path, {revision, item: edited, ...(!editing ? {trigger: {id: trigger.id, source, mode: source === "custom" ? "blocking" : root.querySelector("[data-mode]").dataset.value, order: Number(root.querySelector("[data-order]").value), inputs: readInputs(), planning: source.startsWith("planning.") ? {board_id:root.querySelector("[data-planning-board-filter]").value.trim()||null,lane_id:root.querySelector("[data-planning-lane-filter]").value.trim()||null} : null}} : {})});
       }
       root._close(); await refreshSettings({force: true}); await refreshManualSkills();
+      if (!remove && defaults.onSaved) await defaults.onSaved(item.id);
     } catch (e) {
       error(e);
       if (e.status === 409) { await refreshSettings({force: true}); root.querySelector("[data-automation-error]").textContent = "Configuration changed. Your draft is retained here; close and reopen the Skill before saving."; }
@@ -294,7 +344,7 @@ async function openSkillEditor(original = null, clone = false) {
   root.querySelector("[data-save]").onclick = () => save();
   root.querySelector("form").onsubmit = event => { event.preventDefault(); save(); };
   if (editing) {
-    root.querySelector("[data-delete]").hidden = false;
+    root.querySelector("[data-delete]").hidden = item.removable === false;
     root.querySelector("[data-delete]").onclick = () => save(true);
     const copy = document.createElement("button"); copy.type = "button"; copy.className = "secondary"; copy.dataset.cloneSkill = ""; copy.textContent = "Clone Skill";
     copy.onclick = () => { root._close(); openSkillEditor(original, true); };
@@ -308,9 +358,9 @@ async function refreshManualSkills() {
   const root = document.getElementById("nav-manual-skills");
   if (!root) return;
   const draw = skills => {
-    renderInto(root, `<div class="nav-menu-label nav-context-section-label">Skills</div>${skills.map(e => `<button class="nav-menu-item nav-control-item nav-management-item" type="button" data-manual-skill="${htmlEscape(e.id)}"><svg class="nav-menu-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7Z"></path></svg><span>${htmlEscape(e.name)}</span></button>`).join("")}<button class="nav-menu-item nav-control-item nav-management-item" type="button" data-add-skill><svg class="nav-menu-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"></path></svg><span>Add skill...</span></button>`);
-    root.querySelectorAll("[data-manual-skill]").forEach(button => button.onclick = () => { root.closest("details")?.removeAttribute("open"); triggerManualSkill(button.dataset.manualSkill); });
-    root.querySelector("[data-add-skill]").onclick = () => { root.closest("details")?.removeAttribute("open"); openSkillEditor(); };
+    renderInto(root, `${skills.map(e => `<button class="rail-row nav-menu-item nav-control-item nav-management-item" type="button" data-manual-skill="${htmlEscape(e.id)}" aria-label="${htmlEscape(e.name)}" title="${htmlEscape(e.name)}"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#play"></use></svg><span class="rail-copy">${htmlEscape(e.name)}</span></button>`).join("")}<button class="rail-row nav-menu-item nav-control-item nav-management-item" type="button" data-add-skill aria-label="Add Skill" title="Add Skill"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#plus"></use></svg><span class="rail-copy">Add skill...</span></button><a class="rail-row" href="#/settings/skills" data-route="settings" data-testid="rail-manage-skills" aria-label="Manage Skills" title="Manage Skills"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#settings"></use></svg><span class="rail-copy">Manage Skills</span></a>`);
+    root.querySelectorAll("[data-manual-skill]").forEach(button => button.onclick = () => { if (typeof closeMobileNavigation === "function") closeMobileNavigation(); triggerManualSkill(button.dataset.manualSkill); });
+    root.querySelector("[data-add-skill]").onclick = () => { if (typeof closeMobileNavigation === "function") closeMobileNavigation(); openSkillEditor(); };
   };
   try {
     const data = await api("GET", `/api/skills?node_id=${encodeURIComponent(nodeContextActiveNodeId())}`, undefined, {recordError: false});
@@ -324,7 +374,7 @@ async function refreshManualSkills() {
   }
 }
 
-async function triggerManualSkill(id) {
+async function triggerManualSkill(id, hubId = null) {
   if (manualSkillOpening || document.querySelector(".automation-modal")) return;
   manualSkillOpening = true;
   const generation = captureNodeContextGeneration();
@@ -333,7 +383,7 @@ async function triggerManualSkill(id) {
     if (!isNodeContextGenerationCurrent(generation)) return;
     const launch = async parameters => {
       if (!isNodeContextGenerationCurrent(generation)) throw new Error("Project or node changed; launch the Skill again from its new context.");
-      return createToolbarTab("skill", {label: definition.item.name, skillLaunch: {id, parameters}});
+      return createToolbarTab("skill", {label: definition.item.name, skillLaunch: {id, parameters, hubId}});
     };
     if (!schema.parameters.length) { await launch({}); return; }
     const root = automationModal(`Run ${definition.item.name}`, `<form data-event-inputs>${schema.parameters.map((p, index) => `<div class="form-row"><label for="event-parameter-${index}">${htmlEscape(p.name)}${p.required ? " *" : ""}</label>
@@ -364,12 +414,12 @@ async function openEventHistory(id = null, offset = 0, goalId = null) {
     const generation = captureNodeContextGeneration();
     const data = await api("GET", id ? `/api/event-invocations/${encodeURIComponent(id)}` : `/api/event-invocations?offset=${offset}&limit=30${goalId ? `&goal_id=${encodeURIComponent(goalId)}` : ""}`);
     if (!isNodeContextGenerationCurrent(generation)) return;
-    const root = automationModal(id ? data.event.name : goalId ? `Skill runs · ${goalId}` : "Skill history", id ? `<p><strong>${htmlEscape(skillRunStatus(data))}</strong></p>${data.context?.goal_id && data.gate ? `<p>Workflow gate: ${htmlEscape(data.gate)}</p>` : ""}${data.execution_state && data.execution_state !== data.state ? `<p>Originally recorded as ${htmlEscape(data.state)}; status above includes every executed Skill.</p>` : ""}${data.error ? `<p role="alert">${htmlEscape(data.error)}</p>` : ""}${Object.values(data.results).map(r => `<section><h3>${htmlEscape(r.binding_id)} · ${htmlEscape(r.outcome)}</h3><p>${htmlEscape(r.summary)}</p><pre style="white-space:pre-wrap">${htmlEscape((r.evidence || []).join("\n"))}</pre><details><summary>Result artifacts</summary><pre style="white-space:pre-wrap">${htmlEscape(JSON.stringify(r.artifacts, null, 2))}</pre></details></section>`).join("")}${(data.attempts || []).length ? `<details><summary>Execution attempts and process evidence</summary>${data.attempts.map(a => `<p>${htmlEscape(a.binding_id)} · ${a.purpose === "completion_repair" ? "Report repair" : "Work"}${a.started_at && a.received_at ? ` · ${Math.max(0, Math.round((Date.parse(a.received_at) - Date.parse(a.started_at)) / 1000))}s` : ""} · Process ${htmlEscape(a.process_id || "unavailable")}</p><pre style="white-space:pre-wrap">${htmlEscape(a.diagnostic || "")}${htmlEscape(a.raw_output || "")}</pre>`).join("")}<a href="#/settings/processes">Open Processes</a></details>` : ""}` : `<table class="table"><thead><tr><th>Run</th><th>State</th><th>Created</th></tr></thead><tbody>${data.items.map(run => `<tr><td><button class="secondary" data-open-run="${run.id}">${htmlEscape(run.event.name)}</button></td><td>${htmlEscape(skillRunStatus(run))}</td><td>${htmlEscape(run.created_at)}</td></tr>`).join("")}</tbody></table><div class="automation-pagination"><button class="secondary" data-previous ${offset ? "" : "disabled"}>Previous</button><button class="secondary" data-next ${offset + data.items.length < data.total ? "" : "disabled"}>Next</button></div>`);
+    const root = automationModal(id ? data.event.name : goalId ? `Skill runs · ${goalId}` : "Skill history", id ? `<p><strong>${htmlEscape(skillRunStatus(data))}</strong></p>${data.context?.goal_id && data.gate ? `<p>Workflow gate: ${htmlEscape(data.gate)}</p>` : ""}${data.execution_state && data.execution_state !== data.state ? `<p>Originally recorded as ${htmlEscape(data.state)}; status above includes every executed Skill.</p>` : ""}${data.error ? `<p role="alert">${htmlEscape(data.error)}</p>` : ""}${Object.values(data.results).map(r => `<section><h3>${htmlEscape(r.binding_id)} · ${htmlEscape(r.outcome)}</h3><p>${htmlEscape(r.summary)}</p><pre style="white-space:pre-wrap">${htmlEscape((r.evidence || []).join("\n"))}</pre><details><summary>Result artifacts</summary><pre style="white-space:pre-wrap">${htmlEscape(JSON.stringify(r.artifacts, null, 2))}</pre></details></section>`).join("")}${(data.attempts || []).length ? `<details><summary>Execution attempts and process evidence</summary>${data.attempts.map(a => `<p>${htmlEscape(a.binding_id)} · ${a.purpose === "completion_repair" ? "Report repair" : "Work"}${a.started_at && a.received_at ? ` · ${Math.max(0, Math.round((Date.parse(a.received_at) - Date.parse(a.started_at)) / 1000))}s` : ""} · Process ${htmlEscape(a.process_id || "unavailable")}</p><pre style="white-space:pre-wrap">${htmlEscape(a.diagnostic || "")}${htmlEscape(a.raw_output || "")}</pre>`).join("")}<a href="#/control">Open Control</a></details>` : ""}` : `<table class="table"><thead><tr><th>Run</th><th>State</th><th>Created</th></tr></thead><tbody>${data.items.map(run => `<tr data-open-run="${htmlEscape(run.id)}" tabindex="0" aria-label="Open ${htmlEscape(run.event.name)}"><td>${htmlEscape(run.event.name)}</td><td>${htmlEscape(skillRunStatus(run))}</td><td>${htmlEscape(run.created_at)}</td></tr>`).join("")}</tbody></table><div class="automation-pagination"><button class="secondary" data-previous ${offset ? "" : "disabled"}>Previous</button><button class="secondary" data-next ${offset + data.items.length < data.total ? "" : "disabled"}>Next</button></div>`);
     automationHistory = root;
     root.querySelector("[data-close]").textContent = "Close";
     root.querySelector("[data-save]").textContent = "Refresh";
     root.querySelector("[data-save]").onclick = () => { root._close(); openEventHistory(id, offset, goalId); };
-    root.querySelectorAll("[data-open-run]").forEach(button => button.onclick = () => { root._close(); openEventHistory(button.dataset.openRun); });
+    bindAutomationRows(root, "[data-open-run]", row => { root._close(); openEventHistory(row.dataset.openRun); });
     root.querySelector("[data-previous]")?.addEventListener("click", () => { root._close(); openEventHistory(null, Math.max(0, offset - 30), goalId); });
     root.querySelector("[data-next]")?.addEventListener("click", () => { root._close(); openEventHistory(null, offset + 30, goalId); });
     if (id && ["pending", "running"].includes(data.state)) { const button = root.querySelector("[data-delete]"); button.hidden = false; button.textContent = "Cancel run"; button.onclick = async () => { if (!isNodeContextGenerationCurrent(generation)) return; try { await api("POST", `/api/event-invocations/${id}/cancel`, {}); root._close(); await openEventHistory(id); } catch (e) { root.querySelector("[data-automation-error]").textContent = e.message; } }; }
@@ -377,5 +427,5 @@ async function openEventHistory(id = null, offset = 0, goalId = null) {
   finally { automationHistoryOpening = false; }
 }
 
-document.getElementById("nav-context-menu")?.addEventListener("toggle", event => { if (event.target.open) refreshManualSkills(); });
+document.getElementById("rail-skills-section")?.addEventListener("toggle", event => { if (event.target.open) refreshManualSkills(); });
 window.addEventListener("load", () => refreshManualSkills());

@@ -13,10 +13,6 @@ pub(super) fn migrate(root: &Path) -> RefineResult<AutomationConfig> {
             originals.insert(name.into(), read_json::<Value>(&path)?);
         }
     }
-    let governance = originals
-        .get("governance.json")
-        .cloned()
-        .unwrap_or(Value::Null);
     let quality_settings =
         crate::application::workflow::phases::quality::FileQualityService::new(root)
             .load_settings()?;
@@ -24,6 +20,7 @@ pub(super) fn migrate(root: &Path) -> RefineResult<AutomationConfig> {
         .map_err(|e| RefineError::Serialization(e.to_string()))?;
     let mut config = build_config(&originals, &quality);
     single_trigger_skills(&mut config)?;
+    super::hub_skill::install(&mut config);
     // The source snapshot is written first. A crash retries deterministic conversion; once
     // config.json is installed the legacy files never regain configuration authority.
     let archive = root.join("automation/migration-v1.json");
@@ -32,13 +29,6 @@ pub(super) fn migrate(root: &Path) -> RefineResult<AutomationConfig> {
             &archive,
             &json!({"schema_version": 1, "sources": originals, "quality_prompt_hash": super::execution::stable_id(&config.skills["default-quality"].prompt), "quality_commands": quality_settings.legacy_commands}),
         )?;
-    }
-    if let Some(limit) = governance
-        .get("max_automatic_round_retries")
-        .and_then(Value::as_u64)
-    {
-        crate::infrastructure::process::supervisor::config::FileSettingsService::new(root)
-            .update(&json!({"max_automatic_round_retries": limit.to_string()}))?;
     }
     config.validate().map_err(RefineError::InvalidInput)?;
     Ok(config)
@@ -64,11 +54,12 @@ fn build_config(originals: &serde_json::Map<String, Value>, quality: &Value) -> 
         .cloned()
         .unwrap_or(Value::Null);
     for (role, prompt) in [
-        ("plan", "Produce a complete, concise implementation plan for the current Goal Round. Inspect the repository and applicable context, resolve assumptions, consider alternatives and critique your proposed solution before finalizing it. Choose the planning method appropriate to the work. For a scoped finding recovery Round, focus the plan on the requested correction against the retained candidate. Do not change repository files. Return an actionable plan with stable checklist IDs and meaningful verification.".to_string()),
-        ("implement", "Implement the current Goal Round using every accepted plan and attached Skill. Inspect existing code, make the complete change, run appropriate verification, and report evidence for each checklist item. Preserve unrelated changes and historical evidence. Refine owns candidate commits, workflow advancement, Quality, Governance and integration.".to_string()),
-        ("quality", format!("Independently review the finalized plans and candidate implementation. Select or add meaningful tests, correct defects when needed, and run the relevant checks. Report actual commands, results and findings. Refine verifies the exact candidate and supervises evaluation commands.\n\nProject Quality instructions and tests:\n{}", serde_json::to_string_pretty(&quality).unwrap_or_default())),
-        ("governance", format!("Review the exact candidate against the project's stated intent and attached Skills. Read the accepted plans, implementation and Quality evidence and actual diff. Report actual violations with evidence, not hypothetical risks or preferences. Do not edit files, merge, push or change Goal state. A finding must include an actionable recovery request.\n\nProject intent and rules:\n{}", serde_json::to_string_pretty(&governance).unwrap_or_default())),
+        ("plan", "Produce a complete, concise implementation plan for the current Goal Round. Inspect the repository and applicable context, resolve assumptions, consider alternatives and critique your proposed solution before finalizing it. Choose the planning method appropriate to the work. For a scoped finding recovery Round, focus the plan on the requested correction against the retained candidate. Use your judgment to decide when planning is complete and share useful context with the implementation agent.".to_string()),
+        ("implement", "Implement the current Goal Round using the available planning context and attached Skills. Inspect existing code, make the complete change, use your judgment to decide when the work is complete. Preserve unrelated changes and historical evidence. Use supported Refine controls for workflow changes, candidate publication, and integration. Follow current user authorization and preserve confirmation boundaries.".to_string()),
+        ("quality", format!("Independently review the finalized plans and candidate implementation. Follow the project instructions, investigate and correct defects as appropriate, and use your judgment to decide the outcome.\n\nProject Quality instructions and tests:\n{}", serde_json::to_string_pretty(&quality).unwrap_or_default())),
+        ("governance", format!("Review the exact candidate against the project's stated intent and attached Skills. Read the accepted plans, implementation and Quality evidence and actual diff. Use context to distinguish actual problems from hypothetical risks or preferences. Follow the Skill instructions and current user authorization; use supported Refine commands for workflow changes. Use your judgment to decide the outcome; share any useful context for subsequent work.\n\nProject intent and rules:\n{}", serde_json::to_string_pretty(&governance).unwrap_or_default())),
     ] {
+        let prompt = format!("{prompt}\n\n{{{{templates.purpose}}}}\n\n{{{{templates.architecture}}}}");
         let id = format!("default-{role}");
         config.skills.insert(id.clone(), Skill { id, name: title(role), prompt, role: role.into(), enabled: true, scope: Scope::default(), parameters: Vec::new(), provenance: Some("refine-default-v1".into()) });
     }
@@ -81,6 +72,7 @@ fn build_config(originals: &serde_json::Map<String, Value>, quality: &Value) -> 
             role.filter(|r| ["plan", "implement", "quality", "governance"].contains(r))
         {
             bindings.push(Binding {
+                planning: None,
                 id: format!("default-{role}"),
                 skill_id: format!("default-{role}"),
                 enabled: true,
@@ -153,6 +145,7 @@ fn build_config(originals: &serde_json::Map<String, Value>, quality: &Value) -> 
                 .expect("default Event")
                 .bindings
                 .push(Binding {
+                    planning: None,
                     id: id.clone(),
                     skill_id: id.clone(),
                     enabled: true,
@@ -172,8 +165,10 @@ fn build_config(originals: &serde_json::Map<String, Value>, quality: &Value) -> 
 pub(crate) fn pristine_config_bytes() -> Vec<u8> {
     use crate::application::agent_io::prompts::{PromptEngine, PromptTemplate};
     let quality = json!({"configured":false,"business_requirements":"","instructions":PromptEngine::load(PromptTemplate::QualityDefaultInstructions),"tests":[],"legacy_commands":[],"enabled":"1"});
-    serde_json::to_vec_pretty(&build_config(&Default::default(), &quality))
-        .expect("static defaults are serializable")
+    let mut config = build_config(&Default::default(), &quality);
+    single_trigger_skills(&mut config).expect("pristine Skills are valid");
+    super::hub_skill::install(&mut config);
+    serde_json::to_vec_pretty(&config).expect("static defaults are serializable")
 }
 
 /// Split authored assignments without changing binding identities, ordering,
@@ -249,4 +244,75 @@ pub(super) fn single_trigger_skills(config: &mut AutomationConfig) -> RefineResu
     }
     config.schema_version = SCHEMA_VERSION;
     config.validate().map_err(RefineError::InvalidInput)
+}
+
+/// Retire configuration only after Skills have been durably installed. Keep exact
+/// source text in content-addressed archives, including files reintroduced by an
+/// older node. Archives are evidence, never configuration inputs.
+pub(crate) fn retire_settings(root: &Path) -> RefineResult<Vec<String>> {
+    const SOURCES: [&str; 4] = [
+        "governance.json",
+        "guidance.json",
+        "quality/settings.json",
+        "quality/legacy-command-transition.json",
+    ];
+    if !root.join("automation/config.json").exists()
+        || !SOURCES.iter().any(|name| root.join(name).exists())
+    {
+        return Ok(Vec::new());
+    }
+    crate::infrastructure::process::supervisor::coordination::with_record_lock(
+        root,
+        "automation-config",
+        || {
+            use sha2::{Digest, Sha256};
+            // A corrupt or incomplete Skills document must never authorize deletion.
+            crate::infrastructure::storage::automation::AutomationStore::new(root).load()?;
+            let mut removed = Vec::new();
+            for name in SOURCES {
+                let path = root.join(name);
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(content) => content,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(RefineError::Io(error.to_string())),
+                };
+                let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
+                let archive = root
+                    .join("automation/retired-settings")
+                    .join(name)
+                    .join(format!("{digest}.json"));
+                let snapshot = json!({"schema_version": 1, "source": name, "content": content});
+                if archive.exists() {
+                    if read_json::<Value>(&archive)? != snapshot {
+                        return Err(RefineError::Conflict(format!(
+                            "Retired settings archive differs: {}",
+                            archive.display()
+                        )));
+                    }
+                } else {
+                    write_json(&archive, &snapshot)?;
+                }
+                // Do not discard a write made while the archive was being installed.
+                if std::fs::read_to_string(&path).map_err(|e| RefineError::Io(e.to_string()))?
+                    != content
+                {
+                    return Err(RefineError::Conflict(format!(
+                        "Legacy settings changed during retirement: {name}"
+                    )));
+                }
+                std::fs::remove_file(&path).map_err(|e| RefineError::Io(e.to_string()))?;
+                removed.push(name.to_string());
+            }
+            match std::fs::remove_dir(root.join("quality")) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(error) => return Err(RefineError::Io(error.to_string())),
+            }
+            Ok(removed)
+        },
+    )
 }

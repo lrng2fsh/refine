@@ -20,7 +20,7 @@ impl WorkflowEngine {
     fn settle_attempt_outcome(
         &self,
         goal_id: &str,
-        authority: Option<WorkflowAttemptAuthority>,
+        authority: Option<WorkflowStepAuthority>,
         stage: &str,
         outcome: RefineResult<WorkflowStepResult>,
     ) -> RefineResult<WorkflowStepResult> {
@@ -37,7 +37,7 @@ impl WorkflowEngine {
     fn prepare_goal<'a>(
         &'a self,
         goal_id: &str,
-        claimed_authority: &mut Option<WorkflowAttemptAuthority>,
+        claimed_authority: &mut Option<WorkflowStepAuthority>,
     ) -> Result<PreparedGoal<'a>, PreparedGoalError> {
         let unclaimed = |error| PreparedGoalError { error };
         let target_root = self
@@ -57,16 +57,37 @@ impl WorkflowEngine {
         );
         let policy = self.policy().map_err(unclaimed)?;
         let summary = work_items.show_goal_summary(goal_id).map_err(unclaimed)?;
-        if work_items
-            .show_goal_detail(goal_id)
+        let detail = work_items.show_goal_detail(goal_id).map_err(unclaimed)?;
+        let index = ActiveGoalIndex::load_or_rebuild(&refine_dir).map_err(unclaimed)?;
+        let eligibility = SchedulingEligibility::new(index.goals());
+        if let Some(reason) = self
+            .workflow_blocking_reason(&summary.goal, &detail, &eligibility, &policy.active_node_id)
             .map_err(unclaimed)?
-            .get("pending_event_transition")
-            .is_some_and(|p| p["state"] == "pending")
         {
-            return Err(unclaimed(RefineError::Conflict(format!(
-                "{} {goal_id}",
-                crate::application::events::transitions::PENDING
-            ))));
+            return Err(unclaimed(RefineError::Conflict(reason)));
+        }
+        if detail["workflow_integration_control"]["state"] == "pending" {
+            let integration = crate::application::workflow::governance::integration::FileGovernanceIntegrationService::with_target_root(
+                &self.runtime_root, &refine_dir, target_root,
+            ).resume_pending_control(goal_id).map_err(unclaimed)?;
+            let current = work_items.show_goal_detail(goal_id).map_err(unclaimed)?;
+            return Ok(PreparedGoal::Completed(Box::new(WorkflowStepResult {
+                goal_id: goal_id.to_string(),
+                provider: policy.provider,
+                branch: detail["branch_name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                commit: detail["candidate_commit"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                merge: integration.as_ref().and_then(|result| {
+                    serde_json::from_value(result["integration"]["merge"].clone()).ok()
+                }),
+                final_status: current["status"].as_str().unwrap_or_default().to_string(),
+                provider_output: "Reconciled the pending explicit integration decision".into(),
+            })));
         }
         let node_id = summary
             .goal
@@ -99,9 +120,10 @@ impl WorkflowEngine {
             self,
             goal_id,
             "before_claim",
-            WorkflowAttemptAuthority {
+            WorkflowStepAuthority {
                 round_idx,
                 workflow_revision: authored_revision,
+                generation: 0,
             },
         )
         .map_err(unclaimed)?;
@@ -133,7 +155,11 @@ impl WorkflowEngine {
             work_items,
         );
         match summary.goal.status {
-            GoalStatus::Todo => match WorkflowTodo.advance(&mut ctx).map_err(claimed)? {
+            GoalStatus::Todo => match {
+                let outcome = WorkflowTodo.advance(&mut ctx);
+                *claimed_authority = Some(ctx.attempt_authority);
+                outcome.map_err(claimed)?
+            } {
                 WorkflowAdvanceOutcome::Transition {
                     to: GoalStatus::Plan,
                     ..
@@ -151,16 +177,16 @@ impl WorkflowEngine {
                 outcome => Err(claimed(RefineError::Conflict(outcome_reason(outcome)))),
             },
             GoalStatus::Plan | GoalStatus::Implement => {
-                let start_status = summary.goal.status.clone();
                 let pattern =
                     setting_string(&ctx.settings, "branch_name_pattern", "refine/{goal_id}");
                 let target = setting_string(&ctx.settings, "merge_target_branch", "main");
                 hydrate_plan_or_implement_context(&mut ctx, &pattern, &target).map_err(claimed)?;
-                ctx.start_status = start_status;
+                *claimed_authority = Some(ctx.attempt_authority);
                 Ok(PreparedGoal::Execute(Box::new(ctx)))
             }
             current => {
                 hydrate_retry_context(&mut ctx, current).map_err(claimed)?;
+                *claimed_authority = Some(ctx.attempt_authority);
                 Ok(PreparedGoal::Execute(Box::new(ctx)))
             }
         }
@@ -171,6 +197,7 @@ impl WorkflowEngine {
         mut ctx: WorkflowContext<'_>,
     ) -> RefineResult<WorkflowStepResult> {
         let goal_id = ctx.goal_id.clone();
+        #[cfg(test)]
         let authority = ctx.attempt_authority;
         let outcome = contain(&goal_id, || {
             #[cfg(test)]
@@ -180,9 +207,12 @@ impl WorkflowEngine {
         });
         match outcome {
             Ok(()) => self.complete_goal_result(ctx),
-            Err(error) => {
-                self.settle_attempt_outcome(&goal_id, Some(authority), "workflow", Err(error))
-            }
+            Err(error) => self.settle_attempt_outcome(
+                &goal_id,
+                Some(ctx.attempt_authority),
+                "workflow",
+                Err(error),
+            ),
         }
     }
 

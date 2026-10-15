@@ -18,6 +18,54 @@ fn fixture() -> (PathBuf, PathBuf, FileWorkItemService) {
         .unwrap();
     (root, target, items)
 }
+
+#[test]
+fn damaged_goal_does_not_stop_admission_health_or_restart_of_valid_siblings() {
+    let (root, target, items) = fixture();
+    items
+        .create_goal_summary("Damaged Goal", Some("GOAL2"))
+        .unwrap();
+    items
+        .append_goal_round_summary("GOAL2", "Reporter", "Retain authored request")
+        .unwrap();
+    items
+        .transition_goal_status("GOAL2", GoalStatus::Todo)
+        .unwrap();
+    let damaged = items
+        .refine_dir
+        .join(items.show_goal_summary("GOAL2").unwrap().goal.json_path);
+    let original = std::fs::read(&damaged).unwrap();
+    std::fs::write(&damaged, "{damaged source").unwrap();
+    let engine = WorkflowEngine::with_target_root(&root, &target);
+
+    // A previously valid index can still name a source damaged afterward.
+    assert_eq!(
+        engine.launchable_goals(&BTreeSet::new()).unwrap(),
+        vec!["GOAL1"]
+    );
+    assert_eq!(
+        engine
+            .recover_interrupted_goals("storage recovered")
+            .unwrap(),
+        0
+    );
+    let now = chrono::Utc::now().timestamp_millis();
+    let snapshot = sample_admission(&root, &target, None, now).unwrap();
+    assert!(snapshot.eligible_since_ms.contains_key("GOAL1"));
+    assert!(snapshot.blocked_goals["GOAL2"].contains("needs recovery"));
+
+    // Rebuilding must retain the same diagnostic even after dropping the
+    // malformed projection; repairing the source restores discovery next pass.
+    std::fs::write(ActiveGoalIndex::path(&items.refine_dir), "{bad index").unwrap();
+    let snapshot = sample_admission(&root, &target, None, now + 1000).unwrap();
+    assert!(snapshot.eligible_since_ms.contains_key("GOAL1"));
+    assert!(snapshot.blocked_goals["GOAL2"].contains("needs recovery"));
+    std::fs::write(&damaged, original).unwrap();
+    let snapshot = sample_admission(&root, &target, None, now + 2000).unwrap();
+    assert!(snapshot.eligible_since_ms.contains_key("GOAL2"));
+    assert!(!snapshot.blocked_goals.contains_key("GOAL2"));
+    std::fs::remove_dir_all(root).unwrap();
+}
 #[test]
 fn continuous_eligibility_requires_fresh_observation_and_resets_for_pause_and_missing_skills() {
     let (root, target, items) = fixture();
@@ -114,13 +162,257 @@ fn feature_order_and_gaps_do_not_look_like_stalled_admission() {
         .unwrap();
     let now = chrono::Utc::now().timestamp_millis();
     let snapshot = sample_admission(&root, &target, None, now).unwrap();
-    assert!(snapshot.eligible_since_ms.is_empty());
-    assert_eq!(snapshot.cause, "scope or ordering blocks");
+    assert!(snapshot.eligible_since_ms.contains_key("GOAL1"));
+    assert!(!snapshot.eligible_since_ms.contains_key("GOAL2"));
+    assert_eq!(
+        snapshot.blocked_goals["GOAL2"],
+        "Feature ordering blocks this Goal"
+    );
     items.cancel_goal_summary("GOAL1").unwrap();
     let first = sample_admission(&root, &target, None, now).unwrap();
     assert!(first.eligible_since_ms.contains_key("GOAL2"));
     let after_gap = sample_admission(&root, &target, Some(&first), now + 31_000).unwrap();
     assert_eq!(after_gap.waiting_count(now + 31_000), 0);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retained_failure_claim_and_legacy_fence_cannot_veto_new_round_in_health_or_admission() {
+    let (root, target, items) = fixture();
+    let engine = WorkflowEngine::with_target_root(&root, &target);
+    let (round, revision, prompt) = items.authored_goal_commitment("GOAL1").unwrap();
+    let authority = items
+        .claim_workflow_attempt("GOAL1", GoalStatus::Todo, round, revision, &prompt)
+        .unwrap();
+    items
+        .settle_workflow_attempt_failure(
+            "GOAL1",
+            authority,
+            "implementation",
+            "Retained failure",
+            "2026-09-11T00:00:00Z",
+        )
+        .unwrap();
+    let failed_round = items.show_goal_detail("GOAL1").unwrap()["rounds"][0].clone();
+    use sha2::{Digest, Sha256};
+    let key = format!("{}:GOAL1", target.display());
+    let directory = root.join("workflow-failure-fences");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("{:x}.json", Sha256::digest(key.as_bytes())));
+    let legacy = serde_json::json!({"round_idx":0,"workflow_revision":revision});
+    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    items
+        .append_goal_round_summary("GOAL1", "Reporter", "Recover using the retained work")
+        .unwrap();
+    for restart in [false, true] {
+        let replacement = WorkflowEngine::with_target_root(&root, &target);
+        if restart {
+            assert_eq!(replacement.recover_interrupted_goals("restart").unwrap(), 0);
+        }
+        let snapshot =
+            sample_admission(&root, &target, None, chrono::Utc::now().timestamp_millis()).unwrap();
+        assert!(snapshot.eligible_since_ms.contains_key("GOAL1"));
+        assert!(snapshot.blocked_goals.is_empty());
+        assert_eq!(
+            replacement.launchable_goals(&BTreeSet::new()).unwrap(),
+            vec!["GOAL1"]
+        );
+    }
+    assert_eq!(
+        items.show_goal_detail("GOAL1").unwrap()["rounds"][0],
+        failed_round
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(path).unwrap()).unwrap(),
+        legacy
+    );
+    assert!(
+        engine
+            .unresolved_workflow_outcome("GOAL1", &items.show_goal_detail("GOAL1").unwrap())
+            .unwrap()
+            .is_none()
+    );
+    // A damaged historical marker is diagnostic evidence, not authority to stop
+    // the newly authorized Round or prevent health from describing it.
+    let damaged = directory.join(format!("{:x}.json", Sha256::digest(key.as_bytes())));
+    std::fs::write(&damaged, b"{damaged historical marker").unwrap();
+    let replacement = WorkflowEngine::with_target_root(&root, &target);
+    assert_eq!(replacement.recover_interrupted_goals("restart").unwrap(), 0);
+    assert_eq!(
+        replacement.launchable_goals(&BTreeSet::new()).unwrap(),
+        vec!["GOAL1"]
+    );
+    assert!(
+        sample_admission(&root, &target, None, chrono::Utc::now().timestamp_millis())
+            .unwrap()
+            .eligible_since_ms
+            .contains_key("GOAL1")
+    );
+    assert_eq!(
+        std::fs::read(&damaged).unwrap(),
+        b"{damaged historical marker"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn health_and_admission_expose_the_same_unpersisted_outcome_until_superseded() {
+    let (root, target, items) = fixture();
+    let engine = WorkflowEngine::with_target_root(&root, &target);
+    let goal = items.show_goal_detail("GOAL1").unwrap();
+    let directory = root.join("workflow-failures");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("unpersisted.json");
+    let evidence = serde_json::json!({"goal_id":"GOAL1", "target_root":target, "round_idx":0,
+        "generation":goal["event_generation"], "original_error":"Provider completion failed",
+        "settlement":{"unpersisted_evidence":"Goal filesystem unavailable"}});
+    std::fs::write(&path, serde_json::to_vec(&evidence).unwrap()).unwrap();
+    let snapshot =
+        sample_admission(&root, &target, None, chrono::Utc::now().timestamp_millis()).unwrap();
+    assert!(snapshot.eligible_since_ms.is_empty());
+    assert_eq!(
+        snapshot.blocked_goals["GOAL1"],
+        engine
+            .unresolved_workflow_outcome("GOAL1", &goal)
+            .unwrap()
+            .unwrap()
+    );
+    assert!(
+        engine
+            .launchable_goals(&BTreeSet::new())
+            .unwrap()
+            .is_empty()
+    );
+    items.cancel_goal_summary("GOAL1").unwrap();
+    items.undo_goal_summary("GOAL1").unwrap();
+    let snapshot =
+        sample_admission(&root, &target, None, chrono::Utc::now().timestamp_millis()).unwrap();
+    assert!(snapshot.eligible_since_ms.contains_key("GOAL1"));
+    assert_eq!(
+        engine.launchable_goals(&BTreeSet::new()).unwrap(),
+        vec!["GOAL1"]
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(path).unwrap()).unwrap(),
+        evidence
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn restoring_a_legacy_marker_after_same_round_reassignment_cannot_resurrect_its_restriction() {
+    let (root, target, items) = fixture();
+    let engine = WorkflowEngine::with_target_root(&root, &target);
+    let (round, revision, prompt) = items.authored_goal_commitment("GOAL1").unwrap();
+    items
+        .claim_workflow_attempt("GOAL1", GoalStatus::Todo, round, revision, &prompt)
+        .unwrap();
+    use sha2::{Digest, Sha256};
+    let path = root.join("workflow-failure-fences").join(format!(
+        "{:x}.json",
+        Sha256::digest(format!("{}:GOAL1", target.display()).as_bytes())
+    ));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let bytes =
+        serde_json::to_vec(&serde_json::json!({"round_idx":round,"workflow_revision":revision}))
+            .unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let before = items.show_goal_detail("GOAL1").unwrap();
+    assert!(
+        engine
+            .unresolved_workflow_outcome("GOAL1", &before)
+            .unwrap()
+            .is_some()
+    );
+    items
+        .control_workflow(
+            "GOAL1",
+            &crate::application::work_items::WorkflowControl {
+                to: GoalStatus::Plan,
+                reason: "Explicit different-step reassignment".into(),
+                context: String::new(),
+                expected_revision: before["workflow_revision"].as_u64().unwrap(),
+                request_id: "reassign-once".into(),
+                actor: "Operator".into(),
+                force: false,
+                invocation_id: None,
+            },
+        )
+        .unwrap();
+    // Simulate copying an old runtime backup after the new workflow decision.
+    std::fs::write(&path, &bytes).unwrap();
+    let replacement = WorkflowEngine::with_target_root(&root, &target);
+    assert_eq!(
+        replacement
+            .recover_interrupted_goals("restart after restore")
+            .unwrap(),
+        0
+    );
+    assert!(
+        replacement
+            .unresolved_workflow_outcome("GOAL1", &items.show_goal_detail("GOAL1").unwrap())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        replacement.launchable_goals(&BTreeSet::new()).unwrap(),
+        vec!["GOAL1"]
+    );
+    assert_eq!(
+        items.show_goal_detail("GOAL1").unwrap()["rounds"][0]["workflow_attempt_authority"],
+        before["rounds"][0]["workflow_attempt_authority"]
+    );
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn late_legacy_failure_cannot_veto_a_superseding_node_decision_after_restart() {
+    let (root, target, items) = fixture();
+    let (round, revision, prompt) = items.authored_goal_commitment("GOAL1").unwrap();
+    items
+        .claim_workflow_attempt("GOAL1", GoalStatus::Todo, round, revision, &prompt)
+        .unwrap();
+    let directory = root.join("workflow-failures");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("legacy-late.json");
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "goal_id":"GOAL1", "round_idx":round, "workflow_revision":revision,
+        "failure_at":"2099-01-01T00:00:00Z", "original_error":"Late legacy worker failure",
+        "settlement":{"unpersisted_evidence":"Goal write failed"}
+    }))
+    .unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let engine = WorkflowEngine::with_target_root(&root, &target);
+    assert!(
+        engine
+            .launchable_goals(&BTreeSet::new())
+            .unwrap()
+            .is_empty()
+    );
+    crate::application::fleet::nodes::FileNodeRegistryService::new(&items.refine_dir)
+        .create("worker")
+        .unwrap();
+    items.transfer_goal_to_node("worker", "GOAL1").unwrap();
+    FileWorkItemService::for_node(&items.refine_dir, "worker")
+        .transfer_goal_to_node("default", "GOAL1")
+        .unwrap();
+    // Restoring or receiving legacy evidence after the decision cannot make its
+    // late timestamp outrank the workflow's recorded revision and occurrence.
+    std::fs::write(&path, &bytes).unwrap();
+    let replacement = WorkflowEngine::with_target_root(&root, &target);
+    assert_eq!(replacement.recover_interrupted_goals("restart").unwrap(), 0);
+    assert_eq!(
+        replacement.launchable_goals(&BTreeSet::new()).unwrap(),
+        vec!["GOAL1"]
+    );
+    assert!(
+        sample_admission(&root, &target, None, chrono::Utc::now().timestamp_millis())
+            .unwrap()
+            .eligible_since_ms
+            .contains_key("GOAL1")
+    );
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -160,6 +452,8 @@ fn exited_worker_snapshot_cannot_keep_ghost_capacity_after_replacement() {
         node_id: Some("default".into()),
         sequence: 1,
         tick_ms: now,
+        tick_monotonic_ms: None,
+        completed_cycle_monotonic_ms: None,
         completed_cycle_ms: Some(now),
         active_attempts: BTreeSet::from(["GOAL1".into()]),
         failure: None,
@@ -219,5 +513,129 @@ fn admission_uses_the_pinned_occurrence_requirement_after_configuration_changes(
             .unwrap_or(0),
         generation
     );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn every_executable_step_is_monitored_for_missing_execution_ownership() {
+    for status in [
+        GoalStatus::Todo,
+        GoalStatus::Plan,
+        GoalStatus::Implement,
+        GoalStatus::Quality,
+        GoalStatus::Governance,
+    ] {
+        let (root, target, items) = fixture();
+        for step in [
+            GoalStatus::Plan,
+            GoalStatus::Implement,
+            GoalStatus::Quality,
+            GoalStatus::Governance,
+        ] {
+            if items.show_goal_detail("GOAL1").unwrap()["status"] == status.as_str() {
+                break;
+            }
+            items.advance_automated_goal_status("GOAL1", step).unwrap();
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let first = sample_admission(&root, &target, None, now).unwrap();
+        assert!(
+            first.eligible_since_ms.contains_key("GOAL1"),
+            "{status:?}: {first:?}"
+        );
+        let mut observed = first;
+        for tick in 1..=31 {
+            observed =
+                sample_admission(&root, &target, Some(&observed), now + tick * 1000).unwrap();
+        }
+        assert_eq!(observed.waiting_count(now + 31_000), 1, "{status:?}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn supervisor_reconciles_unowned_work_even_when_scheduler_ticks_are_fresh() {
+    use crate::infrastructure::process::subprocess::{
+        ManagedProcessSpec, ProcessOwner, ProcessSupervisor,
+    };
+    let (root, target, _) = fixture();
+    let supervisor = FileProcessSupervisor::new(&root);
+    let token = uuid::Uuid::new_v4().to_string();
+    let worker = supervisor
+        .launch(ManagedProcessSpec {
+            owner: ProcessOwner::Runner,
+            command: "/bin/sleep".into(),
+            args: vec!["60".into()],
+            cwd: None,
+            env: Vec::new(),
+            stdin: None,
+            limits: None,
+            authorization_command: None,
+            sensitive: false,
+            metadata: serde_json::from_value(serde_json::json!({"worker_kind":"workflow",
+            "workflow_incarnation":token, "isolated_process_group":true}))
+            .unwrap(),
+        })
+        .unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    SchedulerObservation {
+        runtime_root: root.canonicalize().unwrap(),
+        process_id: worker.id.clone(),
+        pid: worker.pid.unwrap(),
+        os_identity: current_os_identity(worker.pid.unwrap()).unwrap().unwrap(),
+        incarnation: token,
+        target_root: Some(target.clone()),
+        node_id: Some("default".into()),
+        sequence: 1,
+        tick_ms: now,
+        tick_monotonic_ms: None,
+        completed_cycle_monotonic_ms: None,
+        completed_cycle_ms: Some(now),
+        active_attempts: BTreeSet::new(),
+        failure: None,
+        retry_delays: Default::default(),
+    }
+    .write(&root)
+    .unwrap();
+
+    let registry =
+        crate::application::projects::registry::FileProjectRegistryService::new(&root, None);
+    let mut apps = registry.load().unwrap();
+    apps.active_app = Some(target.display().to_string());
+    registry.save(&apps).unwrap();
+    let mut admission = sample_admission(&root, &target, None, now).unwrap();
+    admission
+        .eligible_since_ms
+        .insert("GOAL1".into(), now - 31_000);
+    std::fs::write(
+        root.join("workflow-admission.json"),
+        serde_json::to_vec(&admission).unwrap(),
+    )
+    .unwrap();
+    let health = super::super::assess_worker(&root, &worker, Some(&target));
+    assert_eq!(health.state, "admission_stalled", "{health:?}");
+    // A stale observation from an older scheduler must not condemn its replacement.
+    admission.scheduler_incarnation = Some("previous-incarnation".into());
+    std::fs::write(
+        root.join("workflow-admission.json"),
+        serde_json::to_vec(&admission).unwrap(),
+    )
+    .unwrap();
+    assert!(super::super::assess_worker(&root, &worker, Some(&target)).healthy);
+    admission.scheduler_incarnation = workflow_incarnation(&worker);
+    std::fs::write(
+        root.join("workflow-admission.json"),
+        serde_json::to_vec(&admission).unwrap(),
+    )
+    .unwrap();
+    let service = crate::application::workers::FileRunnerWorkerService::new(&root);
+    assert!(service.ensure_background_worker("workflow").is_err());
+    let recovery: Value =
+        serde_json::from_slice(&std::fs::read(root.join("workflow-recovery.json")).unwrap())
+            .unwrap();
+    assert_eq!(recovery["worker"]["id"], worker.id);
+    assert_eq!(recovery["stopped"], true);
+    assert!(!FileProcessSupervisor::process_is_alive(&worker).unwrap());
     std::fs::remove_dir_all(root).unwrap();
 }

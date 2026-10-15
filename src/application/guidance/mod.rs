@@ -124,7 +124,7 @@ impl FileNextActionsService {
                     &mut suggestions,
                     "inspect-workflow-health",
                     &format!(
-                        "{}; {waiting} continuously eligible Todo Goals waiting over 30 seconds; last scheduler tick {last_tick}",
+                        "{}; {waiting} continuously eligible Goals waiting over 30 seconds; last scheduler tick {last_tick}",
                         health.reason
                     ),
                     &health.remedy,
@@ -156,6 +156,19 @@ impl FileNextActionsService {
                 "Todo work exists, but local workflow runtime evidence is unavailable",
                 "refine system status",
             );
+        }
+        if let Some(admission) = workflow_health
+            .as_ref()
+            .and_then(|health| health.admission.as_ref())
+        {
+            for (id, reason) in &admission.blocked_goals {
+                suggest(
+                    &mut suggestions,
+                    &format!("workflow-blocked-{id}"),
+                    &format!("Goal {id}: {reason}"),
+                    &format!("refine goal show {id}"),
+                );
+            }
         }
         if goals.is_empty() {
             suggest(

@@ -6,6 +6,7 @@ use super::*;
 /// stall budget, and transcript handling are all inherited rather than
 /// reimplemented. The `agent_idle_timeout_seconds` convention bounds it.
 pub struct InstalledAgentResolver {
+    pub refine_dir: PathBuf,
     pub provider: String,
     /// The port-scoped agents runtime root (`<runtime>/agents`), matching the
     /// workflow's `ctx.runtime_root.join("agents")` convention.
@@ -28,7 +29,7 @@ impl InstalledAgentResolver {
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|provider| !provider.is_empty())
-            .unwrap_or("claude")
+            .unwrap_or_default()
             .to_string();
         let stall_timeout_seconds = settings
             .get("agent_idle_timeout_seconds")
@@ -37,6 +38,7 @@ impl InstalledAgentResolver {
             .filter(|seconds| *seconds > 0)
             .unwrap_or(900);
         Self {
+            refine_dir: refine_dir.into(),
             provider,
             agents_runtime_root: runtime_root.join("agents"),
             stall_timeout_seconds: Some(stall_timeout_seconds),
@@ -48,7 +50,12 @@ impl InstalledAgentResolver {
 
 impl ConflictResolver for InstalledAgentResolver {
     fn resolve(&self, request: &ResolutionRequest<'_>) -> RefineResult<ResolverOutcome> {
-        let service = HostAgentProviderService::with_runtime_root(&self.agents_runtime_root);
+        let _templates = crate::application::templates::TemplateScope::for_workspace(Some(
+            request.workspace_dir,
+        ))?;
+        let service = HostAgentProviderService::with_runtime_root(&self.agents_runtime_root)
+            .with_refine_dir(&self.refine_dir);
+        service.selected_provider_id(&self.provider)?;
         // Not installed means unavailable, never failed: the caller falls
         // back exactly to pre-agent behavior.
         if service.authenticate(&self.provider).is_err() {
@@ -70,7 +77,7 @@ impl ConflictResolver for InstalledAgentResolver {
         };
         let invocation = ProviderInvocation {
             provider: self.provider.clone(),
-            prompt: resolution_prompt(request),
+            prompt: resolution_prompt(request)?,
             session_id: None,
             cwd: Some(cwd.display().to_string()),
             stall_timeout_seconds: self.stall_timeout_seconds,
@@ -89,16 +96,27 @@ impl ConflictResolver for InstalledAgentResolver {
 /// Everything the request carries that the agent cannot read off the
 /// workspace: the caller's domain context, how the two lines relate, and why
 /// a previous attempt was rejected.
-pub(super) fn resolution_prompt(request: &ResolutionRequest<'_>) -> String {
-    let mut prompt = request.context.trim_end().to_string();
-    let ancestry = request.ancestry.trim();
-    if !ancestry.is_empty() {
-        prompt.push_str(&format!("\n\nHow the two lines relate: {ancestry}."));
-    }
-    if let Some(feedback) = request.feedback {
-        prompt.push_str(&format!(
-            "\n\nYour previous attempt was rejected: {feedback}\nEdit the conflicted files again and correct this."
-        ));
-    }
-    prompt
+pub(super) fn resolution_prompt(request: &ResolutionRequest<'_>) -> RefineResult<String> {
+    use crate::application::agent_io::prompts::{PromptTemplate, render};
+    let ancestry = if request.ancestry.trim().is_empty() {
+        String::new()
+    } else {
+        render(
+            PromptTemplate::ConflictAncestry,
+            &[("ancestry", request.ancestry.trim())],
+        )?
+    };
+    let feedback = if let Some(feedback) = request.feedback {
+        render(PromptTemplate::ConflictFeedback, &[("feedback", feedback)])?
+    } else {
+        String::new()
+    };
+    render(
+        PromptTemplate::ConflictResolution,
+        &[
+            ("context", request.context),
+            ("ancestry_context", &ancestry),
+            ("feedback_context", &feedback),
+        ],
+    )
 }

@@ -1,5 +1,7 @@
 use super::*;
-use crate::application::workflow::health::{assess_worker, assess_workflow_health};
+use crate::application::workflow::health::{
+    assess_worker_with_clock as assess_worker, assess_workflow_health,
+};
 use crate::infrastructure::process::subprocess::scheduler_observation::{
     SchedulerObservation, current_os_identity,
 };
@@ -31,10 +33,54 @@ fn wait_tick(root: &Path, process: &ManagedProcess) -> SchedulerObservation {
 fn stop_all(root: &Path) {
     let supervisor = FileProcessSupervisor::new(root);
     for group in supervisor.owned_groups().unwrap() {
-        supervisor
-            .stop_owned_group(&group, Duration::from_secs(2))
-            .unwrap();
+        assert!(
+            supervisor
+                .stop_owned_group(&group, Duration::from_secs(2))
+                .unwrap()
+                .confirmed_exit
+        );
+        wait_for_fixture_retirement(&supervisor, &group.process);
     }
+}
+
+fn wait_for_fixture_retirement(
+    supervisor: &FileProcessSupervisor,
+    process: &ManagedProcess,
+) -> ManagedProcess {
+    // Scope exit precedes asynchronous archival. Registration removal follows
+    // the reaper's writes, so observe it before removing the fixture directory.
+    let registration = supervisor
+        .processes_dir()
+        .join(format!("{}.json", process.id));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match std::fs::metadata(&registration) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => panic!("could not observe fixture retirement: {error}"),
+            Ok(_) => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture reaper did not retire registration {}",
+            process.id
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let terminal: ManagedProcess = serde_json::from_slice(
+        &std::fs::read(
+            supervisor
+                .process_history_dir()
+                .join(format!("{}.json", process.id)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(terminal.id, process.id);
+    assert_eq!(terminal.pid, process.pid);
+    assert_eq!(terminal.started_at, process.started_at);
+    assert_eq!(terminal.owner, process.owner);
+    assert_ne!(terminal.state, "running");
+    terminal
 }
 fn launch(root: &Path, token: &str, command: &str, args: &[&str], worker: bool) -> ManagedProcess {
     FileProcessSupervisor::new(root).launch(ManagedProcessSpec { owner: if worker { ProcessOwner::Runner } else { ProcessOwner::Maintenance },
@@ -53,6 +99,8 @@ fn observation(root: &Path, process: &ManagedProcess) -> SchedulerObservation {
         node_id: None,
         sequence: 1,
         tick_ms: now,
+        tick_monotonic_ms: None,
+        completed_cycle_monotonic_ms: None,
         completed_cycle_ms: Some(now),
         active_attempts: Default::default(),
         failure: None,
@@ -84,14 +132,15 @@ fn actual_non_ticking_worker_is_stopped_before_replacement_tick_is_accepted() {
         0
     );
     tick.tick_ms -= 60_000;
+    tick.tick_monotonic_ms = tick.tick_monotonic_ms.map(|tick| tick - 60_000);
+    tick.completed_cycle_monotonic_ms = tick.tick_monotonic_ms;
     tick.completed_cycle_ms = Some(tick.tick_ms);
     tick.write(&root).unwrap();
     assert!(!assess_workflow_health(&root).healthy);
     assert!(service.ensure_background_worker(WORKFLOW_RUNNER).is_err());
     assert!(!FileProcessSupervisor::process_is_alive(&old).unwrap());
-    // The bounded backoff cannot launch another process immediately.
-    assert!(service.ensure_background_worker(WORKFLOW_RUNNER).is_err());
-    thread::sleep(Duration::from_millis(1100));
+    // Complete exit permits replacement on the next tick, without carrying
+    // forward the failed-stop backoff.
     let BackgroundWorkerEnsure::Running(replacement) =
         service.ensure_background_worker(WORKFLOW_RUNNER).unwrap()
     else {
@@ -105,7 +154,12 @@ fn actual_non_ticking_worker_is_stopped_before_replacement_tick_is_accepted() {
     wait_tick(&root, &replacement);
     service.ensure_background_worker(WORKFLOW_RUNNER).unwrap();
     assert!(assess_workflow_health(&root).healthy);
-    assert!(root.join("workflow-recovery.json").exists());
+    let recovered: WorkflowRecovery =
+        serde_json::from_slice(&std::fs::read(root.join("workflow-recovery.json")).unwrap())
+            .unwrap();
+    assert!(!recovered.pending);
+    assert_eq!(recovered.attempts, 0);
+    assert_eq!(recovered.retry_after_ms, 0);
     stop_all(&root);
     std::fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
 }
@@ -117,10 +171,10 @@ fn ownership_pid_reuse_and_duplicate_workers_fail_closed() {
     let worker = launch(&root, &token, "/bin/sleep", &["60"], true);
     let mut tick = observation(&root, &worker);
     tick.write(&root).unwrap();
-    assert!(assess_worker(&root, &worker, None, tick.tick_ms).healthy);
+    assert!(assess_worker(&root, &worker, None, || tick.tick_ms).healthy);
     tick.process_id = "another-registration".into();
     tick.write(&root).unwrap();
-    assert!(!assess_worker(&root, &worker, None, tick.tick_ms).healthy);
+    assert!(!assess_worker(&root, &worker, None, || tick.tick_ms).healthy);
     let supervisor = FileProcessSupervisor::new(&root);
     let mut group = supervisor.owned_groups().unwrap().remove(0);
     group
@@ -152,36 +206,65 @@ fn ownership_pid_reuse_and_duplicate_workers_fail_closed() {
 }
 
 #[test]
+fn health_reads_the_scheduler_observation_before_sampling_time() {
+    let root = root("workflow-health-clock-order");
+    let token = uuid::Uuid::new_v4().to_string();
+    let worker = launch(&root, &token, "/bin/sleep", &["60"], true);
+    let mut tick = observation(&root, &worker);
+    tick.write(&root).unwrap();
+    let now = tick.tick_ms;
+    // Publish a later observation exactly when the assessor samples its clock.
+    // Sampling before reading would consume this later tick and falsely stop a
+    // healthy worker. Sampling after reading assesses the earlier snapshot.
+    let health = assess_worker(&root, &worker, None, || {
+        tick.tick_ms = now + 1;
+        tick.completed_cycle_ms = Some(now + 1);
+        tick.write(&root).unwrap();
+        now
+    });
+    assert!(health.healthy, "{health:?}");
+    assert_eq!(health.observation.unwrap().tick_ms, now);
+    // A timestamp genuinely ahead of the assessment clock remains invalid.
+    assert!(!assess_worker(&root, &worker, None, || now).healthy);
+    assert!(assess_worker(&root, &worker, None, || now + 1).healthy);
+    stop_all(&root);
+    std::fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
+}
+
+#[test]
 fn stale_ticks_missing_corrupt_target_changed_and_long_work_are_distinct() {
     let root = root("workflow-health-cases");
     let token = uuid::Uuid::new_v4().to_string();
     let worker = launch(&root, &token, "/bin/sleep", &["60"], true);
     let now = chrono::Utc::now().timestamp_millis();
-    assert_eq!(assess_worker(&root, &worker, None, now).state, "starting");
-    assert!(!assess_worker(&root, &worker, None, now + 31_000).healthy);
+    assert_eq!(
+        assess_worker(&root, &worker, None, || now).state,
+        "starting"
+    );
+    assert!(!assess_worker(&root, &worker, None, || now + 31_000).healthy);
     let mut tick = observation(&root, &worker);
     tick.node_id = Some("foreign-node".into());
     tick.write(&root).unwrap();
     assert_eq!(
-        assess_worker(&root, &worker, None, now).state,
+        assess_worker(&root, &worker, None, || now).state,
         "unavailable"
     );
     tick.node_id = None;
     tick.active_attempts.insert("LONG-GOAL".into());
     tick.write(&root).unwrap();
-    assert!(assess_worker(&root, &worker, None, tick.tick_ms + 29_999).healthy);
+    assert!(assess_worker(&root, &worker, None, || tick.tick_ms + 29_999).healthy);
     assert_eq!(
-        assess_worker(&root, &worker, None, tick.tick_ms + 30_000).state,
+        assess_worker(&root, &worker, None, || tick.tick_ms + 30_000).state,
         "stalled"
     );
     assert_eq!(
-        assess_worker(&root, &worker, Some(&root), tick.tick_ms).state,
+        assess_worker(&root, &worker, Some(&root), || tick.tick_ms).state,
         "draining"
     );
     tick.active_attempts.clear();
     tick.write(&root).unwrap();
     assert_eq!(
-        assess_worker(&root, &worker, Some(&root), tick.tick_ms).state,
+        assess_worker(&root, &worker, Some(&root), || tick.tick_ms).state,
         "target_changed"
     );
     FileProcessSupervisor::new(&root)
@@ -276,6 +359,8 @@ fn termination_failure_and_launch_contention_preserve_worker_and_evidence() {
     let worker = supervisor.launch(spec).unwrap();
     let mut tick = observation(&root, &worker);
     tick.tick_ms -= 60_000;
+    tick.tick_monotonic_ms = tick.tick_monotonic_ms.map(|tick| tick - 60_000);
+    tick.completed_cycle_monotonic_ms = tick.tick_monotonic_ms;
     tick.completed_cycle_ms = Some(tick.tick_ms);
     tick.write(&root).unwrap();
     let lock = std::fs::OpenOptions::new()
@@ -315,9 +400,14 @@ fn termination_failure_and_launch_contention_preserve_worker_and_evidence() {
         serde_json::from_str(group.process.details.as_deref().unwrap()).unwrap();
     details["test_termination_failure"] = json!(false);
     group.process.details = Some(details.to_string());
-    supervisor
-        .stop_owned_group(&group, Duration::from_secs(2))
-        .unwrap();
+    assert!(
+        supervisor
+            .stop_owned_group(&group, Duration::from_secs(2))
+            .unwrap()
+            .confirmed_exit
+    );
+    let terminal = wait_for_fixture_retirement(&supervisor, &worker);
+    assert_eq!(terminal.state, "failed");
     std::fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
 }
 
@@ -372,6 +462,8 @@ fn recovery_checks_unobserved_descendants_after_parent_reaping_and_registration_
             }
             let mut tick = observation(&root, &worker);
             tick.tick_ms -= 60_000;
+            tick.tick_monotonic_ms = tick.tick_monotonic_ms.map(|tick| tick - 60_000);
+            tick.completed_cycle_monotonic_ms = tick.tick_monotonic_ms;
             tick.completed_cycle_ms = Some(tick.tick_ms);
             tick.write(&root).unwrap();
             let service = FileRunnerWorkerService::new(&root);
@@ -421,6 +513,7 @@ fn recovery_checks_unobserved_descendants_after_parent_reaping_and_registration_
                 assert_eq!(operations.status(&operation.id).unwrap(), operation);
             }
             drop(fixture);
+            wait_for_fixture_retirement(&supervisor, &worker);
             std::fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
         }
     }
@@ -480,6 +573,7 @@ fn ticking_worker_with_stalled_admission_cycle_enters_bounded_recovery() {
     assert_eq!(record["stopped"], true);
     assert_eq!(record["pending"], true);
     assert!(!FileProcessSupervisor::process_is_alive(&worker).unwrap());
+    stop_all(&root);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -507,5 +601,79 @@ fn missing_group_evidence_cannot_authorize_replacement_after_leader_exit() {
     assert!(health.reason.contains("evidence is missing"));
     assert!(health.remedy.contains("system doctor"));
     drop(fixture);
+    std::fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
+}
+
+#[test]
+fn complete_exit_receipt_recovers_lost_group_before_launching_a_replacement_worker() {
+    use crate::infrastructure::process::subprocess::owned_groups::test_fixture::UnobservedChild;
+    let root = root("lost-group-complete-proof");
+    let owner = FileProcessSupervisor::new(root.join("agents"));
+    let fixture = UnobservedChild::launch(
+        &owner,
+        true,
+        json!({"workflow_incarnation": "old-worker", "goal_id": "GOAL1"}),
+    );
+    let mut process = fixture.group.process.clone();
+    // Drop kills and reaps the escaped child and waits for the launching reaper.
+    drop(fixture);
+    process.state = "exited".into();
+    std::fs::write(
+        owner.processes_dir().join(format!("{}.json", process.id)),
+        serde_json::to_vec(&process).unwrap(),
+    )
+    .unwrap();
+    std::fs::remove_file(
+        root.join("agents/owned-groups")
+            .join(format!("{}.json", process.id)),
+    )
+    .unwrap();
+    let service = FileRunnerWorkerService::new(&root);
+    let BackgroundWorkerEnsure::Running(replacement) =
+        service.ensure_background_worker(WORKFLOW_RUNNER).unwrap()
+    else {
+        panic!("replacement was not launched")
+    };
+    assert!(!owner.group_pending(&process).unwrap());
+    wait_tick(&root, &replacement);
+    service.ensure_background_worker(WORKFLOW_RUNNER).unwrap();
+    assert!(assess_workflow_health(&root).healthy);
+    assert!(
+        root.join("agents/owned-groups")
+            .join(format!("{}.json", process.id))
+            .exists()
+    );
+    stop_all(&root);
+    std::fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
+}
+
+#[test]
+fn monotonic_freshness_survives_wall_clock_correction_and_still_detects_stalls() {
+    use crate::infrastructure::process::subprocess::scheduler_observation::monotonic_millis;
+    let Some(monotonic) = monotonic_millis() else {
+        return;
+    };
+    let root = root("workflow-monotonic");
+    let worker = launch(
+        &root,
+        &uuid::Uuid::new_v4().to_string(),
+        "/bin/sleep",
+        &["60"],
+        true,
+    );
+    let mut tick = observation(&root, &worker);
+    tick.tick_monotonic_ms = Some(monotonic);
+    tick.completed_cycle_monotonic_ms = Some(monotonic);
+    tick.write(&root).unwrap();
+    for correction in [-60_000, -614, 60_000] {
+        assert!(assess_worker(&root, &worker, None, || tick.tick_ms + correction).healthy);
+    }
+    tick.completed_cycle_monotonic_ms = Some(monotonic - 60_000);
+    tick.write(&root).unwrap();
+    assert_eq!(
+        assess_worker(&root, &worker, None, || tick.tick_ms).state,
+        "stalled"
+    );
+    stop_all(&root);
     std::fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
 }

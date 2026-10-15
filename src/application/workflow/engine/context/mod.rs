@@ -2,11 +2,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::application::work_items::{FileWorkItemService, WorkflowAttemptAuthority};
+use crate::application::work_items::{FileWorkItemService, WorkflowStepAuthority};
 use crate::application::workflow::phases::quality::QualityCheckRequest;
 use crate::error::{RefineError, RefineResult};
 use crate::infrastructure::git::worktrees::MergeResult;
-use crate::infrastructure::observability::logs::FileLogService;
 use crate::infrastructure::process::subprocess::workflow_subprocess_metadata;
 use crate::model::JsonObject;
 use crate::model::goal::RoundIntegration;
@@ -14,6 +13,7 @@ use crate::model::log::LogEntry;
 use crate::model::workflow::GoalStatus;
 
 pub(crate) mod execution;
+pub(crate) mod preparation;
 mod workspace;
 use crate::application::workflow::{json_object, now_timestamp};
 pub(crate) use workspace::validate_round_workspace_branch;
@@ -25,7 +25,7 @@ pub struct WorkflowContext<'a> {
     pub node_id: String,
     pub provider: String,
     pub round_idx: usize,
-    pub(crate) attempt_authority: WorkflowAttemptAuthority,
+    pub(crate) attempt_authority: WorkflowStepAuthority,
     pub settings: JsonObject,
     pub work_items: FileWorkItemService,
     pub branch: Option<String>,
@@ -69,10 +69,11 @@ impl<'a> WorkflowContext<'a> {
         node_id: String,
         provider: String,
         round_idx: usize,
-        attempt_authority: WorkflowAttemptAuthority,
+        attempt_authority: WorkflowStepAuthority,
         settings: JsonObject,
-        work_items: FileWorkItemService,
+        mut work_items: FileWorkItemService,
     ) -> Self {
+        work_items.bind_workflow_occurrence(&goal_id, attempt_authority);
         Self {
             runtime_root,
             target_root,
@@ -127,12 +128,14 @@ impl<'a> WorkflowContext<'a> {
                 to.as_str()
             )));
         }
-        self.work_items.advance_claimed_goal_status(
+        self.attempt_authority = self.work_items.advance_claimed_goal_status(
             &self.goal_id,
             self.attempt_authority,
             from.clone(),
             to.clone(),
         )?;
+        self.work_items
+            .bind_workflow_occurrence(&self.goal_id, self.attempt_authority);
         self.log(
             "state",
             &format!(
@@ -154,9 +157,10 @@ impl<'a> WorkflowContext<'a> {
         details
             .entry("node_id".to_string())
             .or_insert_with(|| json!(&self.node_id));
-        FileLogService::new(self.refine_dir()).append_round_log(
+        self.work_items.append_workflow_round_log(
             &self.goal_id,
             self.round_idx,
+            self.attempt_authority.workflow_revision,
             LogEntry {
                 datetime: now_timestamp(),
                 severity: "info".to_string(),
@@ -195,6 +199,10 @@ impl<'a> WorkflowContext<'a> {
         );
         metadata.insert("node_id".to_string(), json!(&self.node_id));
         metadata.insert("provider".to_string(), json!(&self.provider));
+        metadata.insert(
+            "workflow_step_generation".to_string(),
+            json!(self.attempt_authority.generation),
+        );
         metadata.insert(
             "workflow_revision".to_string(),
             json!(self.attempt_authority.workflow_revision),

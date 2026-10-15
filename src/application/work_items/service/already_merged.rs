@@ -2,11 +2,12 @@ use super::*;
 use crate::model::goal::{QUALITY_PROOF_SCHEMA_VERSION, QualityProof, RoundIntegration};
 use serde_json::json;
 
-use super::workflow_attempts::{goal_status, require_current_attempt};
+use super::workflow_attempts::{goal_status, require_current_step};
+use crate::application::workflow::governance::integration::recorded_integration_is_applicable;
 
 #[derive(Clone, Debug)]
 pub(crate) struct AlreadyMergedResolutionSnapshot {
-    pub(crate) authority: WorkflowAttemptAuthority,
+    pub(crate) authority: WorkflowStepAuthority,
     pub(crate) candidate_commit: String,
     pub(crate) integration: Option<RoundIntegration>,
     pub(crate) gate_evidence: Value,
@@ -86,6 +87,7 @@ impl FileWorkItemService {
                     round_idx + 1
                 ))
             })?;
+        require_applicable_integration(goal_id, round)?;
         if let Some(evidence) = terminal_reconciliation(round, "resolved")
             && summary.goal.status == GoalStatus::Review
         {
@@ -113,7 +115,11 @@ impl FileWorkItemService {
             )));
         }
 
-        let authority = workflow_attempt_authority(goal_id, round, round_idx)?;
+        let authority = WorkflowStepAuthority {
+            round_idx,
+            workflow_revision: workflow_revision(&detail),
+            generation: detail["event_generation"].as_u64().unwrap_or(0),
+        };
         let candidate_commit = detail
             .get("candidate_commit")
             .and_then(Value::as_str)
@@ -169,12 +175,13 @@ impl FileWorkItemService {
                 "Goal {goal_id} left quality before exact-candidate proof regeneration"
             )));
         }
-        require_current_attempt(goal_id, object, snapshot.authority)?;
+        require_current_step(goal_id, object, snapshot.authority)?;
         let current_round = object
             .get("rounds")
             .and_then(Value::as_array)
             .and_then(|rounds| rounds.get(snapshot.authority.round_idx))
             .ok_or_else(|| RefineError::Conflict(format!("Goal {goal_id} Round changed")))?;
+        require_applicable_integration(goal_id, current_round)?;
         if resolution_gate_evidence(&Value::Object(object.clone()), current_round)
             != snapshot.gate_evidence
         {
@@ -252,12 +259,13 @@ impl FileWorkItemService {
                 observed_status.as_str()
             )));
         }
-        require_current_attempt(goal_id, object, snapshot.authority)?;
+        require_current_step(goal_id, object, snapshot.authority)?;
         let current_round = object
             .get("rounds")
             .and_then(Value::as_array)
             .and_then(|rounds| rounds.get(snapshot.authority.round_idx))
             .ok_or_else(|| RefineError::Conflict(format!("Goal {goal_id} Round changed")))?;
+        require_applicable_integration(goal_id, current_round)?;
         let current_gate_evidence =
             resolution_gate_evidence(&Value::Object(object.clone()), current_round);
         if current_gate_evidence != snapshot.gate_evidence {
@@ -299,7 +307,6 @@ impl FileWorkItemService {
             }
         };
         round.insert("workflow_reconciliation".to_string(), evidence.clone());
-        round.insert("workflow_attempt_authority".to_string(), Value::Null);
         round.insert("updated".to_string(), json!(now));
         object.insert("status".to_string(), json!(status.as_str()));
         object.insert("updated".to_string(), json!(now));
@@ -313,34 +320,13 @@ impl FileWorkItemService {
     }
 }
 
-fn workflow_attempt_authority(
-    goal_id: &str,
-    round: &Value,
-    round_idx: usize,
-) -> RefineResult<WorkflowAttemptAuthority> {
-    let attempt = round
-        .get("workflow_attempt_authority")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            RefineError::Conflict(format!(
-                "Goal {goal_id} has no current workflow attempt authority for already-merged resolution"
-            ))
-        })?;
-    let recorded_round = attempt
-        .get("round_idx")
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok());
-    let workflow_revision = attempt.get("workflow_revision").and_then(Value::as_u64);
-    if recorded_round != Some(round_idx) || workflow_revision.is_none() {
+fn require_applicable_integration(goal_id: &str, round: &Value) -> RefineResult<()> {
+    if !recorded_integration_is_applicable(round) {
         return Err(RefineError::Conflict(format!(
-            "Goal {goal_id} has mismatched workflow attempt authority for Round {}",
-            round_idx + 1
+            "Goal {goal_id} recorded integration was reverted; candidate ancestry cannot resolve it"
         )));
     }
-    Ok(WorkflowAttemptAuthority {
-        round_idx,
-        workflow_revision: workflow_revision.unwrap_or_default(),
-    })
+    Ok(())
 }
 
 fn resolution_gate_evidence(detail: &Value, round: &Value) -> Value {
@@ -359,9 +345,6 @@ fn resolution_gate_evidence(detail: &Value, round: &Value) -> Value {
         "quality_details",
         "quality_checked_at",
         "rule_state",
-        "meta_rule_state",
-        "product_state",
-        "constitution_state",
         "governance_candidate_commit",
         "governance_checked_at",
     ] {
@@ -379,6 +362,9 @@ fn validate_resolution_gates(
     integration: Option<&RoundIntegration>,
     round: &Value,
 ) -> Option<String> {
+    if let Err(error) = require_applicable_integration(goal_id, round) {
+        return Some(error.to_string());
+    }
     if candidate.is_empty() {
         return Some(format!("Goal {goal_id} has no exact candidate commit"));
     }
@@ -404,14 +390,7 @@ fn validate_resolution_gates(
             "Goal {goal_id} has incomplete or unsuccessful current-Round integration evidence"
         ));
     }
-    if [
-        "rule_state",
-        "meta_rule_state",
-        "product_state",
-        "constitution_state",
-    ]
-    .into_iter()
-    .any(|key| round.get(key).and_then(Value::as_str) != Some("passed"))
+    if round.get("rule_state").and_then(Value::as_str) != Some("passed")
         || round
             .get("governance_candidate_commit")
             .and_then(Value::as_str)
@@ -498,14 +477,10 @@ fn normalize_quality_proof(
         || details.get("evaluation_scope").and_then(Value::as_str) != Some("isolated_candidate")
         || operation_id.is_none()
         || checked_at.is_none()
-        || results.is_none()
     {
         return unavailable();
     }
     let results = results.cloned().unwrap_or_default();
-    if !quality_results_are_passed(&results) {
-        return unavailable();
-    }
     let proof = QualityProof {
         schema_version: QUALITY_PROOF_SCHEMA_VERSION,
         goal_id: goal_id.to_string(),
@@ -556,16 +531,8 @@ fn valid_quality_proof(
             == Some(proof.source_candidate_commit.as_str())
         && details.get("evaluation_scope").and_then(Value::as_str)
             == Some(proof.evaluation_scope.as_str())
-        && details.get("results").and_then(Value::as_array) == Some(&proof.results)
         && round.get("quality_checked_at").and_then(Value::as_str)
             == Some(proof.checked_at.as_str())
-        && quality_results_are_passed(&proof.results)
-}
-
-fn quality_results_are_passed(results: &[Value]) -> bool {
-    results
-        .iter()
-        .all(|result| result.get("status").and_then(Value::as_str) == Some("passed"))
 }
 
 fn nonempty_round_string(round: &Value, key: &str) -> bool {
@@ -588,4 +555,43 @@ fn terminal_reconciliation_object<'a>(
     round
         .get("workflow_reconciliation")
         .filter(|evidence| evidence.get("state").and_then(Value::as_str) == Some(state))
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+
+    #[test]
+    fn retained_quality_decision_uses_candidate_identity_without_grading_optional_details() {
+        let mut round = json!({
+            "quality_state":"passed", "quality_candidate_commit":"candidate",
+            "quality_checked_at":"2026-09-11T00:00:00Z",
+            "quality_details":{
+                "operation_id":"review", "candidate_commit":"candidate",
+                "source_candidate_commit":"candidate", "evaluation_scope":"isolated_candidate"
+            }
+        });
+        let (proof, _, _) = normalize_quality_proof("GOAL", 0, "candidate", &round);
+        let proof = proof.unwrap();
+        assert!(proof.results.is_empty());
+        round["quality_details"]["quality_proof"] = json!(proof);
+        round["quality_details"]["results"] =
+            json!([{"status":"failed","evidence":"Historical detail; final decision is passed"}]);
+        assert!(
+            normalize_quality_proof("GOAL", 0, "candidate", &round)
+                .0
+                .is_some()
+        );
+        assert!(
+            normalize_quality_proof("GOAL", 0, "different", &round)
+                .0
+                .is_none()
+        );
+        round["quality_state"] = json!("failed");
+        assert!(
+            normalize_quality_proof("GOAL", 0, "candidate", &round)
+                .0
+                .is_none()
+        );
+    }
 }

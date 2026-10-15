@@ -32,11 +32,18 @@ fn pty_failure_admits_followup_within_poll_only_after_scope_release() {
         test_hooks::install(
             &workflow.runtime_root,
             Arc::new(move |engine, goal, stage, _| {
+                // Admission is durable before workspace preparation and execution.
+                if goal == "GOAL3" && stage == "claimed" {
+                    let elapsed = clock.lock().unwrap().unwrap().elapsed();
+                    assert!(
+                        elapsed < Duration::from_secs(1),
+                        "Followup admission took {elapsed:?} after scope release"
+                    );
+                }
                 if stage != "executing" {
                     return Ok(());
                 }
                 if goal == "GOAL3" {
-                    assert!(clock.lock().unwrap().unwrap().elapsed() < Duration::from_secs(1));
                     next.fetch_add(1, Ordering::SeqCst);
                     return Err(RefineError::Conflict("followup admitted".into()));
                 }
@@ -51,7 +58,7 @@ fn pty_failure_admits_followup_within_poll_only_after_scope_release() {
                 let root = engine.runtime_root.join("agents");
                 let cwd = engine.target_root.as_ref().unwrap().clone();
                 let supervisor = FileProcessSupervisor::new(&root);
-                let result = run_goal_agent(GoalAgentLaunch { runtime_root: root.clone(), cwd: cwd.clone(), provider: "smoke-ai".into(), prompt: "fail the PTY workload".into(), metadata: serde_json::from_value(json!({"goal_id":goal,"workflow_incarnation":"pty-runner", "test_termination_failure":uncertain})).unwrap(), completion_timeout: Some(Duration::from_secs(2)), idle_timeout: None, provider_session: None }, |_| {});
+                let result = run_goal_agent(GoalAgentLaunch { refine_dir: None, runtime_root: root.clone(), cwd: cwd.clone(), provider: "smoke-ai".into(), prompt: "fail the PTY workload".into(), metadata: serde_json::from_value(json!({"goal_id":goal,"workflow_incarnation":"pty-runner", "test_termination_failure":uncertain})).unwrap(), completion_timeout: Some(Duration::from_secs(2)), idle_timeout: None, provider_session: None }, |_| {});
                 let error = result.unwrap_err();
                 let group = supervisor.owned_groups()?.remove(0);
                 let child: u32 = fs::read_to_string(cwd.join("child.pid"))

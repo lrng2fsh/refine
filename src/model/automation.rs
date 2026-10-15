@@ -6,10 +6,11 @@ use serde_json::Value;
 
 use super::workflow::GoalStatus;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 4;
 pub const MAX_CONFIG_BYTES: usize = 16 * 1024 * 1024;
 pub const CUSTOM_EVENT_ID: &str = "custom";
-pub const WORKFLOW_STEPS: [&str; 10] = [
+pub const WORKFLOW_STEPS: [&str; 11] = [
+    "draft",
     "backlog",
     "todo",
     "plan",
@@ -111,9 +112,20 @@ pub enum BindingMode {
     Context,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanningFilter {
+    #[serde(default)]
+    pub board_id: Option<String>,
+    #[serde(default)]
+    pub lane_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning: Option<PlanningFilter>,
     pub id: String,
     pub skill_id: String,
     #[serde(default = "enabled")]
@@ -206,9 +218,15 @@ pub fn system_catalog() -> Vec<String> {
             [
                 format!("workflow.{step}.enter"),
                 format!("workflow.{step}.exit"),
+                format!("workflow.{step}.error"),
+                format!("workflow.{step}.success"),
             ]
         })
-        .chain(std::iter::once("node.startup.ready".into()))
+        .chain([
+            "planning.lane.enter".into(),
+            "planning.lane.exit".into(),
+            "node.startup.ready".into(),
+        ])
         .collect()
 }
 
@@ -249,7 +267,7 @@ impl AutomationConfig {
         {
             return Err("Events/Skills configuration exceeds 16 MiB".into());
         }
-        if ![1, SCHEMA_VERSION].contains(&self.schema_version) {
+        if ![1, 2, 3, SCHEMA_VERSION].contains(&self.schema_version) {
             return Err("unsupported Events/Skills schema".into());
         }
         if self.events.len() > 1024 || self.skills.len() > 1024 {
@@ -273,7 +291,6 @@ impl AutomationConfig {
             validate_parameters(&skill.parameters)?;
         }
         let catalog = system_catalog();
-        let mut assigned_skills = BTreeSet::new();
         for (id, event) in &self.events {
             if id != &event.id || !valid_id(id) || event.name.trim().is_empty() {
                 return Err(format!("invalid Event {id}"));
@@ -304,13 +321,27 @@ impl AutomationConfig {
             }
             let mut ids = BTreeSet::new();
             for binding in &event.bindings {
-                if self.schema_version >= 2 && !assigned_skills.insert(&binding.skill_id) {
-                    return Err("A Skill has one trigger. Clone the Skill to use it at another trigger point.".into());
-                }
                 if !valid_id(&binding.id) || !ids.insert(&binding.id) {
                     return Err("invalid or repeated binding ID".into());
                 }
                 validate_scope(&binding.scope)?;
+                if let Some(filter) = &binding.planning {
+                    if !event
+                        .source
+                        .as_deref()
+                        .is_some_and(|s| s.starts_with("planning.lane."))
+                    {
+                        return Err("planning filters require a lane trigger".into());
+                    }
+                    if filter
+                        .board_id
+                        .iter()
+                        .chain(filter.lane_id.iter())
+                        .any(|id| !valid_id(id))
+                    {
+                        return Err("invalid planning filter identifier".into());
+                    }
+                }
                 let skill = self.skills.get(&binding.skill_id).ok_or_else(|| {
                     format!(
                         "binding {} references missing Skill {}",
@@ -353,7 +384,7 @@ impl AutomationConfig {
                 }
                 for (name, path) in &binding.inputs {
                     if !skill.parameters.iter().any(|p| &p.name == name)
-                        || !["goal.", "system.", "event."]
+                        || !["goal.", "system.", "event.", "planning."]
                             .iter()
                             .any(|prefix| path.starts_with(prefix))
                         || path.split('.').any(|p| !valid_id(p))
@@ -415,6 +446,7 @@ pub struct SkillResult {
     pub role: String,
     /// success, failure (a finding), or error (execution infrastructure/contract).
     pub outcome: String,
+    #[serde(default)]
     pub summary: String,
     #[serde(default)]
     pub evidence: Vec<String>,
@@ -433,67 +465,8 @@ impl SkillResult {
         {
             return Err("Skill result identity does not match this invocation".into());
         }
-        if !["success", "failure", "error"].contains(&self.outcome.as_str())
-            || self.summary.trim().is_empty()
-        {
-            return Err("Skill result requires an outcome and summary".into());
-        }
-        if self.outcome == "success"
-            && role == "plan"
-            && !self.artifacts.get("plan").is_some_and(Value::is_object)
-        {
-            return Err("Plan Skills must return a plan artifact".into());
-        }
-        if self.outcome == "success"
-            && ["quality", "governance"].contains(&role)
-            && self.evidence.is_empty()
-        {
-            return Err("gate success requires supporting evidence".into());
-        }
-        if role == "governance" && self.outcome != "error" {
-            let violations = self
-                .artifacts
-                .get("violations")
-                .and_then(Value::as_array)
-                .ok_or("Governance requires a violations array")?;
-            if violations.iter().any(|v| {
-                v.get("rule_id")
-                    .and_then(Value::as_str)
-                    .is_none_or(|s| s.trim().is_empty())
-                    || v.get("message")
-                        .and_then(Value::as_str)
-                        .is_none_or(|s| s.trim().is_empty())
-            }) {
-                return Err(
-                    "Governance violations require stable rule_id and message fields".into(),
-                );
-            }
-            if self.outcome == "success" && !violations.is_empty() {
-                return Err("a Governance success cannot contain violations".into());
-            }
-            if self.outcome == "failure"
-                && (violations.is_empty()
-                    || self
-                        .artifacts
-                        .get("recovery_round_prompt")
-                        .and_then(Value::as_str)
-                        .is_none_or(|s| s.trim().is_empty()))
-            {
-                return Err(
-                    "Governance findings require violations and an actionable recovery request"
-                        .into(),
-                );
-            }
-        }
-        if role == "quality"
-            && self.outcome == "success"
-            && self
-                .artifacts
-                .get("tests")
-                .and_then(Value::as_array)
-                .is_none_or(Vec::is_empty)
-        {
-            return Err("Quality requires supervised test commands".into());
+        if !["success", "failure", "error"].contains(&self.outcome.as_str()) {
+            return Err("Skill result requires success, failure, or error".into());
         }
         Ok(())
     }

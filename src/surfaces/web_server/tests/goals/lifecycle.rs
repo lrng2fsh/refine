@@ -67,9 +67,6 @@ fn daemon_resolve_merged_action_reaches_shared_terminal_capability() {
                 "evaluation_scope": "isolated_candidate"
             },
             "rule_state": "passed",
-            "meta_rule_state": "passed",
-            "product_state": "passed",
-            "constitution_state": "passed",
             "governance_candidate_commit": candidate,
             "governance_checked_at": "2026-08-15T00:02:00Z"
         });
@@ -213,6 +210,7 @@ fn web_server_open_agent_attaches_to_the_workflow_goal_agent() {
         metadata.insert("goal_id".to_string(), json!("GOAL1"));
         run_goal_agent(
             GoalAgentLaunch {
+                refine_dir: None,
                 provider_session: None,
                 runtime_root: runtime_for_thread,
                 cwd: app_for_thread,
@@ -518,11 +516,10 @@ fn web_server_reports_between_planning_phases_without_launching_a_diagnostic_age
         )
         .unwrap();
     work_items
-        .replace_goal_round_implementation_plan(
+        .seed_legacy_implementation_plan(
             "GOAL-BETWEEN-PHASES",
             0,
-            None,
-            &ImplementationPlan {
+            &json!({"implementation_plan": ImplementationPlan {
                 schema_version: IMPLEMENTATION_PLAN_SCHEMA_VERSION,
                 state: ImplementationPlanState::InProgress,
                 phase: ImplementationPlanPhase::Criticize,
@@ -550,7 +547,7 @@ fn web_server_reports_between_planning_phases_without_launching_a_diagnostic_age
                 invalid_output_attempts: Vec::new(),
                 provider_session_id: None,
                 governance_precheck: None,
-            },
+            }}),
         )
         .unwrap();
 
@@ -803,6 +800,7 @@ fn browser_terminal_stop_fails_the_goal_after_stopping_its_local_agent() {
         metadata.insert("workflow_state".to_string(), json!("in-progress"));
         run_goal_agent(
             GoalAgentLaunch {
+                refine_dir: None,
                 provider_session: None,
                 runtime_root: runtime_for_thread,
                 cwd: workspace_path,
@@ -1056,10 +1054,13 @@ fn goal_cancel_uses_port_scoped_active_node_and_preserves_foreign_goals() {
     assert_eq!(bulk.status, 200, "{}", bulk.body);
     assert_eq!(bulk.body["updated"], 1);
     assert_eq!(bulk.body["ids"], json!(["GOAL-OWNED-BULK"]));
-    assert_eq!(bulk.body["skipped"], 1);
-    assert_eq!(
-        bulk.body["skipped_details"][0],
-        json!({"id": "GOAL-FOREIGN", "reason": format!("node:{foreign_node}")})
+    assert_eq!(bulk.body["failed"], 1);
+    assert_eq!(bulk.body["failures"][0]["id"], "GOAL-FOREIGN");
+    assert!(
+        bulk.body["failures"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains(foreign_node)
     );
     assert_eq!(
         active_work_items
@@ -1131,4 +1132,60 @@ fn public_process_stop_api_does_not_requeue_already_cancelled_goal() {
     assert!(!managed_pid_is_alive(process.pid.unwrap()).unwrap());
 
     remove_temp_dir(&temp_root);
+}
+
+#[test]
+fn goal_http_human_overrides_and_round_deletion_share_application_semantics() {
+    let root = unique_temp_dir("http-human-control");
+    let target = root.join("app");
+    init_git_app(&target);
+    let refine_dir = refine_dir_for_target_root(&target).unwrap();
+    let work = FileWorkItemService::new(&refine_dir);
+    work.create_goal_summary("Repairable", Some("HUMAN1"))
+        .unwrap();
+    work.append_goal_round_summary("HUMAN1", "User", "Original request")
+        .unwrap();
+    work.append_goal_round_summary("HUMAN1", "User", "Failed retry")
+        .unwrap();
+    let mut server = server_with_projection();
+    server.target_root = Some(target);
+    server.runtime_root = Some(root.join("run/8082"));
+    for status in [
+        "plan",
+        "implement",
+        "quality",
+        "governance",
+        "review",
+        "done",
+        "failed",
+        "todo",
+    ] {
+        let response = server.handle(ApiRequest {
+            method: "PATCH".into(),
+            path: "/api/goals/HUMAN1".into(),
+            body: Some(json!({"status":status})),
+        });
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert_eq!(work.show_goal_detail("HUMAN1").unwrap()["status"], status);
+    }
+    let revision = work.show_goal_detail("HUMAN1").unwrap()["workflow_revision"]
+        .as_u64()
+        .unwrap();
+    let response = server.handle(ApiRequest {
+        method: "DELETE".into(),
+        path: "/api/goals/HUMAN1/rounds/1".into(),
+        body: Some(json!({"expected_revision":revision})),
+    });
+    assert_eq!(response.status, 200, "{}", response.body);
+    let goal = work.show_goal_detail("HUMAN1").unwrap();
+    assert_eq!(goal["rounds"].as_array().unwrap().len(), 1);
+    assert_eq!(goal["rounds"][0]["prompt"], "Original request");
+    assert_eq!(goal["status"], "backlog");
+    let stale = server.handle(ApiRequest {
+        method: "DELETE".into(),
+        path: "/api/goals/HUMAN1/rounds/0".into(),
+        body: Some(json!({"expected_revision":revision})),
+    });
+    assert_eq!(stale.status, 409);
+    fs::remove_dir_all(root).unwrap();
 }

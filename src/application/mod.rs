@@ -13,10 +13,14 @@ pub mod imports;
 pub mod maintenance;
 pub mod operations;
 pub mod persistence_sync;
+pub mod planning;
 pub mod projects;
 pub mod protocol;
 pub mod system;
+pub mod templates;
 pub mod todos;
 pub mod work_items;
 pub mod workers;
 pub mod workflow;
+
+pub mod hub;

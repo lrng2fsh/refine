@@ -11,26 +11,34 @@ mod config;
 mod features;
 mod fleet;
 mod goals;
+mod hub;
 mod logs;
 mod nodes;
+mod planning;
 mod projects;
 mod skills;
 mod sync;
 mod system;
+mod templates;
 mod todos;
 mod workflow;
+pub use hub::HubAction;
 
 pub use agents::{AgentAction, CliAgentProfile};
-pub use config::{ConfigAction, ConfigDomain, ConfigPayload, ConfigSettingsAction};
+pub use config::{
+    ConfigAction, ConfigDomain, ConfigPayload, ConfigProvidersAction, ConfigSettingsAction,
+};
 pub use features::FeatureAction;
 pub use fleet::FleetAction;
 pub use goals::GoalAction;
 pub use logs::LogAction;
 pub use nodes::NodeAction;
+pub use planning::PlanningCliAction;
 pub use projects::ProjectAction;
 pub use skills::SkillAction;
 pub use sync::CliSyncAuthority;
 pub use system::{CliInstallTarget, SystemAction};
+pub use templates::TemplateAction;
 pub use todos::TodoAction;
 pub use workflow::{CliGoalStatus, WorkflowAction};
 
@@ -45,6 +53,16 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Inspect, edit, and preview the Templates used for agent prompts.
+    Templates {
+        #[command(subcommand)]
+        action: TemplateAction,
+    },
+    /// Manage Hub sites, JSON data, queries and publication.
+    Hub {
+        #[command(subcommand)]
+        action: HubAction,
+    },
     /// Configure reusable Skills and their triggers, or run a Skill manually.
     Skills {
         #[command(subcommand)]
@@ -97,8 +115,14 @@ pub enum Commands {
         #[command(subcommand)]
         action: FeatureAction,
     },
-    /// Manage Reporter-owned Todo lists and items.
+    /// Manage shared Project Planning boards, lanes, and Goal cards.
     /// Uses the same durable capability as the web UI and daemon API.
+    Planning {
+        #[command(subcommand)]
+        action: PlanningCliAction,
+    },
+    /// Legacy Todo commands. Migrate with planning apply migrate, then use planning.
+    #[command(hide = true)]
     Todo {
         #[command(subcommand)]
         action: TodoAction,

@@ -1,6 +1,31 @@
 use super::*;
 
 impl InProcessWebServer {
+    pub(crate) fn handle_providers_get(&self) -> ApiResponse {
+        let root = require_refine_dir!(self, "read AI providers");
+        let result = self
+            .settings_service(&root)
+            .provider_override()
+            .and_then(|node| {
+                crate::application::agents::providers::response(&root, node.as_deref())
+            });
+        match result {
+            Ok(value) => ApiResponse::json(200, value),
+            Err(error) => error_response(error),
+        }
+    }
+
+    pub(crate) fn handle_providers_save(&self, request: ApiRequest) -> ApiResponse {
+        let root = require_refine_dir!(self, "edit AI providers");
+        match crate::application::agents::providers::save(
+            &root,
+            &request.body.unwrap_or(Value::Null),
+        ) {
+            Ok(_) => self.handle_providers_get(),
+            Err(error) => error_response(error),
+        }
+    }
+
     pub(crate) fn handle_settings_get(&self) -> ApiResponse {
         let refine_dir = require_refine_dir!(self, "read settings");
         match self.settings_service(refine_dir).list_response() {
@@ -46,9 +71,6 @@ impl InProcessWebServer {
         };
         match updated {
             Ok(value) => {
-                if let Err(error) = self.apply_current_runtime_settings() {
-                    return error_response(error);
-                }
                 let value = self.with_runtime_settings(value);
                 if let Err(error) = self.current_projection_with_runtime_shared() {
                     return error_response(error);
@@ -57,18 +79,6 @@ impl InProcessWebServer {
             }
             Err(error) => error_response(error),
         }
-    }
-
-    pub(crate) fn apply_current_runtime_settings(&self) -> RefineResult<()> {
-        let Some(runtime_root) = &self.runtime_root else {
-            return Ok(());
-        };
-        let Some(target_root) = self.current_target_root()? else {
-            return Ok(());
-        };
-        WorkflowEngine::with_target_root(runtime_root, target_root)
-            .apply_runtime_settings()
-            .map(|_| ())
     }
 
     pub(crate) fn handle_upgrade_status(&self) -> ApiResponse {

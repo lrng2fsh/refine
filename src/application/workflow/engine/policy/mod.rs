@@ -1,3 +1,4 @@
+mod restart;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,14 +10,13 @@ mod scheduling_eligibility;
 mod settings;
 pub(crate) use scheduling_eligibility::SchedulingEligibility;
 pub(crate) use settings::{
-    agent_idle_timeout, automatic_resource_budget_percent, setting_cap_with_default_values,
-    setting_string, setting_usize,
+    automatic_resource_budget_percent, setting_cap_with_default_values, setting_string,
+    setting_usize,
 };
 
 use crate::application::fleet::nodes::FileNodeRegistryService;
 use crate::application::projects::projection::ActiveGoalIndex;
 use crate::application::work_items::FileWorkItemService;
-use crate::application::workflow::engine::scheduling::BacklogPromotionService;
 use crate::error::{RefineError, RefineResult};
 use crate::infrastructure::observability::logs::FileLogService;
 use crate::infrastructure::process::subprocess::{
@@ -144,27 +144,6 @@ impl WorkflowEngine {
         Ok(policy)
     }
 
-    pub fn apply_runtime_settings(&self) -> RefineResult<usize> {
-        if self.workflow_paused()? {
-            return Ok(0);
-        }
-        self.promote_backlog_to_todo()
-    }
-
-    pub fn promote_backlog_to_todo(&self) -> RefineResult<usize> {
-        let Some(refine_dir) = self.refine_dir()? else {
-            return Ok(0);
-        };
-        self.promote_backlog_to_todo_for_refine_dir(&refine_dir)
-    }
-
-    pub(crate) fn promote_backlog_to_todo_for_refine_dir(
-        &self,
-        refine_dir: &Path,
-    ) -> RefineResult<usize> {
-        BacklogPromotionService::new(refine_dir, &self.runtime_root).promote_backlog_to_todo()
-    }
-
     pub fn set_workflow_paused(&self, paused: bool) -> RefineResult<ProcessPauseState> {
         FileProcessSupervisor::new(&self.runtime_root).set_workflow_paused(paused)
     }
@@ -184,9 +163,8 @@ impl WorkflowEngine {
         Ok(())
     }
 
-    /// Reconciles node-local execution after a runner restart without changing synchronized
-    /// workflow authority. Old workers are stopped; durable stages remain where they were so the
-    /// next scheduler pass can repeat the incomplete idempotent work.
+    /// Reconcile missing execution ownership while retaining the current workflow step.
+    /// Completed failure verdicts still require an explicit workflow decision.
     pub fn recover_interrupted_goals(&self, detail: &str) -> RefineResult<usize> {
         let Some(refine_dir) = self.refine_dir()? else {
             return Ok(0);
@@ -200,7 +178,8 @@ impl WorkflowEngine {
             .filter(|goal| {
                 matches!(
                     goal.status,
-                    GoalStatus::Plan
+                    GoalStatus::Todo
+                        | GoalStatus::Plan
                         | GoalStatus::Implement
                         | GoalStatus::Quality
                         | GoalStatus::Governance
@@ -218,41 +197,83 @@ impl WorkflowEngine {
         };
         let mut recovered = 0;
         for goal in &active_goals {
-            let Some(round_idx) = goal.round_count.checked_sub(1) else {
-                eprintln!(
-                    "refine workflow recovery: Goal {} is {} with no authored Round; preserving the Goal and creating no worker or worktree",
-                    goal.id,
-                    goal.status.as_str()
-                );
-                continue;
-            };
-            crate::application::workflow::phases::implementation_planning::recover_interrupted_plan(
-                &work_items,
-                &goal.id,
-                round_idx,
-            )?;
-            logs.append_round_log(
-                &goal.id,
-                round_idx,
-                LogEntry {
-                    datetime: now_timestamp(),
-                    severity: "warning".to_string(),
-                    category: "workflow".to_string(),
-                    message: format!(
-                        "Workflow execution was restarted from durable {} state: {detail}",
+            let assessment = (|| -> RefineResult<usize> {
+                let Some(round_idx) = goal.round_count.checked_sub(1) else {
+                    eprintln!(
+                        "refine workflow recovery: Goal {} is {} with no authored Round; preserving the Goal and creating no worker or worktree",
+                        goal.id,
                         goal.status.as_str()
-                    ),
-                    details: Some(json_object(json!({
-                        "reason": detail,
-                        "checkpoint": goal.status.as_str(),
-                        "automatic_restart": true
-                    }))),
-                    actions: Vec::new(),
-                    actor: Some("refine".to_string()),
-                    goal_id: Some(goal.id.clone()),
-                },
-            )?;
-            recovered += 1;
+                    );
+                    return Ok(0);
+                };
+                let current = work_items.show_goal_detail(&goal.id)?;
+                let authority =
+                    crate::application::work_items::WorkflowStepAuthority::from_goal(&current)?;
+                let unresolved = self.unresolved_workflow_outcome(&goal.id, &current)?;
+                let receipts = restart::step_receipts(
+                    &crate::application::events::FileEventService::new(&refine_dir),
+                    &current,
+                    authority,
+                )?;
+                if receipts.completed && unresolved.is_none() {
+                    // The replacement consumes this step's accepted receipts through the
+                    // ordinary exact-candidate path. It does not invoke failed work again.
+                    return Ok(0);
+                }
+                if unresolved.is_none() {
+                    // Loss of an execution owner is not a Skill verdict. The admitted
+                    // occurrence will reconcile its old launch and resume in-place.
+                    if !receipts.started {
+                        return Ok(0);
+                    }
+                    logs.append_round_log(&goal.id, round_idx, LogEntry {
+                    datetime: now_timestamp(), severity: "info".into(), category: "workflow".into(),
+                    message: format!("Execution ownership released; {} remains scheduled for continuation", goal.status.as_str()),
+                    details: Some(json_object(json!({"reason":detail,"checkpoint":goal.status.as_str(),"automatic_restart":true}))),
+                    actions: Vec::new(), actor: Some("refine".into()), goal_id: Some(goal.id.clone()),
+                })?;
+                    return Ok(1);
+                }
+                match work_items.interrupt_workflow_if_current(
+                    &goal.id,
+                    authority,
+                    unresolved.as_deref().unwrap_or(detail),
+                ) {
+                    Err(RefineError::Conflict(_)) => return Ok(0),
+                    result => result?,
+                }
+                logs.append_round_log(
+                    &goal.id,
+                    round_idx,
+                    LogEntry {
+                        datetime: now_timestamp(),
+                        severity: "warning".to_string(),
+                        category: "workflow".to_string(),
+                        message: format!(
+                            "Workflow execution was interrupted in {} state: {detail}",
+                            goal.status.as_str()
+                        ),
+                        details: Some(json_object(json!({
+                            "reason": detail,
+                            "checkpoint": goal.status.as_str(),
+                            "automatic_restart": false
+                        }))),
+                        actions: Vec::new(),
+                        actor: Some("refine".to_string()),
+                        goal_id: Some(goal.id.clone()),
+                    },
+                )?;
+                Ok(1)
+            })();
+            match assessment {
+                Ok(count) => recovered += count,
+                Err(error) => {
+                    eprintln!(
+                        "refine workflow recovery: Goal {} needs recovery: {error}",
+                        goal.id
+                    );
+                }
+            }
         }
         Ok(recovered)
     }

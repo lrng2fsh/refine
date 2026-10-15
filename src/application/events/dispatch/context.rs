@@ -24,7 +24,7 @@ impl FileEventService {
             .get("agent_cli")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .unwrap_or("claude")
+            .unwrap_or_default()
             .to_string();
         let goal_id = body
             .get("goal_id")
@@ -75,7 +75,7 @@ impl FileEventService {
             round_idx,
             workflow_revision: None,
             candidate_commit,
-            data: json!({"goal": super::super::execution::goal_context(&goal), "system": {"node_id": node, "project_root": target_root, "workspace": cwd, "runtime_root": runtime, "refine_executable": std::env::current_exe().ok(), "refine_checkout": crate::infrastructure::runtime::checkout::active_refine_paths().ok().map(|(_, checkout)| checkout)}}),
+            data: json!({"hub_id":body.get("hub_id"), "goal": super::super::execution::goal_context(&goal), "system": {"node_id": node, "project_root": target_root, "workspace": cwd, "runtime_root": runtime, "refine_executable": std::env::current_exe().ok(), "refine_checkout": crate::infrastructure::runtime::checkout::active_refine_paths().ok().map(|(_, checkout)| checkout)}}),
             metadata: Default::default(),
         })
     }
@@ -98,6 +98,24 @@ impl FileEventService {
         }
         if let Some(id) = &invocation.context.goal_id {
             let goal = FileWorkItemService::new(&self.refine_dir).show_goal_detail(id)?;
+            if let Some(outcome) = invocation.context.data.get("outcome") {
+                if goal["pending_workflow_outcome"]["id"] != outcome["id"]
+                    || goal["pending_workflow_outcome"]["state"] != "pending"
+                    || chrono::Utc::now().timestamp_millis()
+                        >= outcome["deadline_ms"].as_i64().unwrap_or(0)
+                {
+                    return Err(RefineError::Conflict(
+                        "Workflow outcome was settled, superseded or expired".into(),
+                    ));
+                }
+            }
+            if let Some(occurrence) = invocation.context.data.get("occurrence") {
+                if !super::super::transitions::occurrence_is_current(&goal, occurrence) {
+                    return Err(RefineError::Conflict(
+                        "Workflow occurrence was superseded or is no longer durable".into(),
+                    ));
+                }
+            }
             let pinned = invocation.context.data.get("goal").unwrap_or(&Value::Null);
             for key in ["status", "node_id", "candidate_commit", "event_generation"] {
                 if invocation.context.data.get("occurrence").is_some()

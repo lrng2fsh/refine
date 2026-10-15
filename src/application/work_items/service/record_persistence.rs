@@ -8,6 +8,18 @@ pub(super) fn write_json_atomically(path: &std::path::Path, value: &Value) -> Re
     let record_root = workflow_record_root(path);
     let record_key = record_lock_key(path);
     with_record_lock(&record_root, &record_key, || {
+        let deletion = path.with_file_name("round-deletion.json");
+        if deletion.exists() {
+            let plan: Value = serde_json::from_slice(
+                &fs::read(&deletion).map_err(|e| RefineError::Io(e.to_string()))?,
+            )
+            .map_err(|e| RefineError::Serialization(e.to_string()))?;
+            if plan["goal"] != *value {
+                return Err(RefineError::Conflict(
+                    "Round deletion cleanup is pending; resume it before changing the Goal".into(),
+                ));
+            }
+        }
         let expected_revision = workflow_revision(value);
         let current = match fs::read(path) {
             Ok(bytes) => Some(serde_json::from_slice::<Value>(&bytes).map_err(|error| {
@@ -44,6 +56,14 @@ pub(super) fn write_json_atomically(path: &std::path::Path, value: &Value) -> Re
         }
 
         let mut next = value.clone();
+        // Older Round deletion versions wrote Goal-level receipts. They are
+        // removed history too, and disappear durably on the next Goal write.
+        if let Some(controls) = next
+            .get_mut("workflow_controls")
+            .and_then(Value::as_array_mut)
+        {
+            controls.retain(|control| control["request"]["reason"] != "Explicit Round deletion");
+        }
         let event_pending = if is_goal_record(path) {
             crate::application::events::transitions::prepare_write(
                 &record_root,
@@ -54,6 +74,9 @@ pub(super) fn write_json_atomically(path: &std::path::Path, value: &Value) -> Re
         } else {
             false
         };
+        if is_goal_record(path) {
+            workflow_attempts::prepare_occurrence(current.as_ref(), &mut next);
+        }
         let object = next.as_object_mut().ok_or_else(|| {
             RefineError::Serialization(format!(
                 "workflow record {} is not a JSON object",
@@ -67,17 +90,20 @@ pub(super) fn write_json_atomically(path: &std::path::Path, value: &Value) -> Re
         let encoded = serde_json::to_vec_pretty(&next).map_err(|error| {
             RefineError::Serialization(format!("failed to encode workflow JSON: {error}"))
         })?;
+        if is_goal_record(path) {
+            ActiveGoalIndex::prepare_goal_write(&record_root, path, Some(&encoded))?;
+        }
         replace_file_durably(path, &encoded)?;
         // Follow the record with the scheduler's view of it. Write-through is
         // what keeps that view affordable: the alternative is comparing every
         // Goal file against the index to discover which moved, which costs a
         // stat per Goal on every scheduling pass and is the scan the index
         // exists to avoid. The record is already durable, so a failure here
-        // leaves a stale index rather than a lost mutation — recoverable by
-        // reconstruction, which is why it does not fail the write.
+        // leaves the preceding durable marker pending. The daemon reprojects
+        // that source before scheduling, including after a process interruption.
         if is_goal_record(path) {
             let refine_dir = workflow_record_root(path);
-            if let Err(error) = ActiveGoalIndex::record_goal(&refine_dir, path) {
+            if let Err(error) = ActiveGoalIndex::complete_goal_write(&refine_dir, path) {
                 eprintln!(
                     "refine: active Goal index was not updated for {}: {error}",
                     path.display()

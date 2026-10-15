@@ -32,7 +32,7 @@ where
 }
 
 pub(super) fn run_goal_agent_session<F, O>(
-    launch: GoalAgentLaunch,
+    mut launch: GoalAgentLaunch,
     mut on_attention: F,
     mut on_process_settlement: O,
 ) -> RefineResult<GoalAgentResult>
@@ -40,6 +40,10 @@ where
     F: FnMut(GoalAgentAttention),
     O: FnMut(&FileProcessSupervisor, &ManagedProcess, &GoalAgentSettlement) -> RefineResult<()>,
 {
+    let refine_dir =
+        crate::infrastructure::storage::project_layout::refine_dir_for_target_root(&launch.cwd)?;
+    let _templates =
+        crate::application::templates::TemplateScope::pin(Some(&refine_dir), &mut launch.metadata)?;
     let super::pty_lifecycle::StartedSession {
         supervisor,
         session_id,
@@ -55,7 +59,6 @@ where
         artifact_handoff,
         completion_timeout,
         idle_timeout,
-        requires_planning_result,
     } = super::pty_lifecycle::launch_session(launch)?;
 
     let reader_path = stdout_path.clone();
@@ -93,8 +96,7 @@ where
     let mut implementation_evidence = None;
     let mut planning_result = None;
     let completion_started_at = std::time::Instant::now();
-    let mut signal_reader =
-        SignalReader::default().requiring_planning_result(requires_planning_result);
+    let mut signal_reader = SignalReader::default();
     let mut invalid_signal_recovery = InvalidSignalRecovery::default();
     let mut toolbar_timeout_protected = false;
     let mut status_result = (|| -> RefineResult<_> {
@@ -436,6 +438,15 @@ where
         // auth failure reads as an opaque non-zero exit, which is what made this
         // look like a capacity or liveness problem instead of a config one.
         let detail = crate::infrastructure::process::agent_env::auth_failure_hint(&output)
+            .or_else(|| {
+                // A configured executable can exist while its interpreter is missing.
+                // Preserve the ownership launcher's diagnostic instead of hiding it
+                // behind its generic exit code.
+                strip_terminal_control(&output)
+                    .lines()
+                    .find(|line| line.starts_with("ownership launch handshake:"))
+                    .map(str::to_string)
+            })
             .map(|hint| format!("; {hint}"))
             .unwrap_or_default();
         return Err(RefineError::Degraded(format!(

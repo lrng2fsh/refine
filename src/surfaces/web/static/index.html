@@ -11,103 +11,152 @@
   <link rel="stylesheet" href="/static/css/common.css">
   <link rel="stylesheet" href="/static/css/modals.css">
   <link rel="stylesheet" href="/static/css/goals.css">
-  <link rel="stylesheet" href="/static/css/guide.css">
+  <link rel="stylesheet" href="/static/css/templates.css">
+  <link rel="stylesheet" href="/static/css/workflow-settings.css">
   <link rel="stylesheet" href="/static/css/toolbar.css">
-  <link rel="stylesheet" href="/static/css/toolbar-todo.css">
+  <link rel="stylesheet" href="/static/css/planning.css">
   <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
   <link rel="stylesheet" href="/static/css/theme.css">
+  <link rel="stylesheet" href="/static/css/navigation.css">
 </head>
 <body>
-  <header class="topbar">
+  <aside id="navigation-rail" class="navigation-rail" aria-label="Refine navigation">
+    <div class="rail-brand-row">
     <a class="brand" href="#/" data-route="dashboard" data-node-scope-destination="dashboard" aria-label="Refine dashboard">
       <img class="brand-logo brand-logo-light" src="/static/images/refine_logo_transparent.png" alt="refine">
       <img class="brand-logo brand-logo-dark" src="/static/images/refine_logo_transparent_darkmode.png" alt="refine">
-      <div class="brand-node" id="active-node-label">-</div>
     </a>
-    <nav class="nav" data-testid="primary-nav">
-      <a href="#/" data-route="dashboard" data-node-scope-destination="dashboard" data-testid="nav-dashboard">Dashboard</a>
-      <a href="#/features" data-route="features" data-testid="nav-features">Features</a>
-      <a href="#/goals" data-route="goals" data-node-scope-destination="goals" data-testid="nav-goals">Goals</a>
-      <a href="#/changes" data-route="changes" data-testid="nav-changes">Changes</a>
-      <a href="#/logs" data-route="logs" data-testid="nav-logs">Logs</a>
-    </nav>
-    <div class="topbar-actions">
-      <details class="nav-menu nav-context-menu" id="nav-context-menu">
-        <summary class="nav-context-summary" aria-label="Open controls" data-testid="context-menu-toggle">
-          <span class="nav-context-main">
-            <svg class="nav-context-icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
-              <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"></path>
-              <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"></path>
-            </svg>
-            <span>Controls</span>
-          </span>
+    </div>
+    <div id="rail-navigation" class="rail-navigation">
+      <div class="rail-global topbar-actions">
+        <button id="btn-command-palette" class="rail-row" type="button" data-testid="command-palette-button" aria-label="Search commands">
+          <svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#search"></use></svg><span class="rail-copy">Search</span><kbd class="rail-copy" data-command-shortcut>Ctrl+K</kbd>
+        </button>
+        <details class="nav-menu" id="rail-new-menu">
+          <summary id="rail-new-toggle" class="rail-row" aria-label="New" title="New" aria-haspopup="menu" aria-expanded="false" aria-controls="rail-new-options">
+            <svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#plus"></use></svg><span class="rail-copy">New</span>
+            <span class="nav-context-more" aria-hidden="true"></span>
+          </summary>
+          <div id="rail-new-options" class="nav-menu-panel" role="menu" aria-labelledby="rail-new-toggle">
+            <button type="button" class="nav-menu-item nav-control-item" role="menuitem" tabindex="-1" data-rail-command="goal.new"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#target"></use></svg>New Goal</button>
+            <button type="button" class="nav-menu-item nav-control-item" role="menuitem" tabindex="-1" data-rail-command="plan.open"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#notebook-pen"></use></svg>New Plan</button>
+            <button type="button" class="nav-menu-item nav-control-item" role="menuitem" tabindex="-1" data-rail-command="feature.new"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#layers"></use></svg>New Feature</button>
+            <button type="button" class="nav-menu-item nav-control-item" role="menuitem" tabindex="-1" data-rail-command="goal.import"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#download"></use></svg>Import</button>
+          </div>
+        </details>
+      <details class="nav-menu nav-context-picker" data-topbar-picker="node">
+        <summary class="nav-context-summary nav-picker-summary" aria-label="Choose Node" aria-haspopup="listbox">
+          <svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#server"></use></svg><span class="nav-picker-copy rail-copy"><span class="nav-picker-label">Node</span><span data-picker-value>Loading…</span></span>
           <span class="nav-context-more" aria-hidden="true"></span>
         </summary>
-        <div class="nav-menu-panel nav-context-panel">
-          <div class="nav-menu-label">Application</div>
-          <a id="target-app-indicator" class="target-app-indicator nav-context-status"
-             href="#/settings/processes"
-             aria-label="Target application status (click to manage)"
-             title="Target application status"
-             data-testid="context-target-app-status"
-             data-state="unknown">
-            <span class="target-app-dot" aria-hidden="true"></span>
-            <span class="nav-control-copy">
-              <span class="target-app-label">Application</span>
-              <span class="nav-control-status target-app-state">Status unknown</span>
-            </span>
-          </a>
-          <label class="nav-menu-label nav-context-section-label" for="global-node">Node</label>
-          <select id="global-node" aria-label="Node" data-testid="global-node" disabled>
-            <option value="">No node</option>
-          </select>
-          <label class="nav-menu-label nav-context-section-label" for="global-reporter">Reporter</label>
-          <select id="global-reporter" aria-label="Reporter" data-testid="global-reporter"></select>
-          <div class="nav-menu-label nav-context-section-label">Status and actions</div>
-          <a id="agent-status-indicator" class="agent-status-indicator nav-menu-item nav-control-item"
-             href="#/settings/processes"
-             aria-label="Agent status (click to view processes)"
-             title="Agent status"
-             data-state="unknown">
-            <span class="target-app-dot" aria-hidden="true"></span>
-            <span class="nav-control-copy">
-              <span>Agent status</span>
-              <span class="nav-control-status agent-status-label">Status unknown</span>
-            </span>
-          </a>
-          <button class="nav-menu-item nav-control-item nav-management-item nav-command-button" id="btn-command-palette"
-                  data-testid="command-palette-button"
-                  aria-label="Open command palette">
-            <svg class="nav-menu-icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
-              <circle cx="11" cy="11" r="7"></circle>
-              <path d="m20 20-4-4"></path>
-            </svg>
-            <span>Command palette</span>
-          </button>
+        <select id="global-node" aria-label="Node" data-testid="global-node" hidden tabindex="-1" disabled></select>
+        <div class="nav-menu-panel nav-picker-options"><div class="nav-menu-label rail-picker-heading">Node</div><div role="listbox" aria-label="Choose Node"></div><button type="button" class="nav-menu-item" data-picker-add-node>Add Node…</button></div>
+      </details>
+      <details class="nav-menu nav-context-picker" data-topbar-picker="reporter">
+        <summary class="nav-context-summary nav-picker-summary" aria-label="Choose Reporter" aria-haspopup="listbox">
+          <svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#user-round"></use></svg><span class="nav-picker-copy rail-copy"><span class="nav-picker-label">Reporter</span><span data-picker-value>Loading…</span></span>
+          <span class="nav-context-more" aria-hidden="true"></span>
+        </summary>
+        <select id="global-reporter" aria-label="Reporter" data-testid="global-reporter" hidden tabindex="-1"></select>
+        <div class="nav-menu-panel nav-picker-options"><div class="nav-menu-label rail-picker-heading">Reporter</div><div role="listbox" aria-label="Choose Reporter"></div></div>
+      </details>
+      </div>
+      <details class="rail-section" id="rail-main-section" open>
+        <summary class="rail-section-heading" title="Main navigation"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#compass"></use></svg><span class="rail-copy">Main</span><span class="rail-section-state" aria-hidden="true"><svg class="rail-icon rail-section-open-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#plus"></use></svg><svg class="rail-icon rail-section-close-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#minus"></use></svg></span></summary>
+        <nav class="nav rail-main" aria-label="Main" data-testid="primary-nav">
+          <a class="rail-row" href="#/" data-route="dashboard" data-node-scope-destination="dashboard" data-testid="nav-dashboard" title="Dashboard"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#layout-dashboard"></use></svg><span class="rail-copy">Dashboard</span></a>
+          <a class="rail-row" href="#/features" data-route="features" data-testid="nav-features" title="Features"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#layers"></use></svg><span class="rail-copy">Features</span></a>
+          <a class="rail-row" href="#/goals" data-route="goals" data-node-scope-destination="goals" data-testid="nav-goals" title="Goals"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#target"></use></svg><span class="rail-copy">Goals</span></a>
+          <a class="rail-row" href="#/changes" data-route="changes" data-testid="nav-changes" title="Changes"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#git-pull-request"></use></svg><span class="rail-copy">Changes</span></a>
+          <a class="rail-row" href="#/control" data-route="control" data-testid="nav-control" title="Control"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#sliders-horizontal"></use></svg><span class="rail-copy">Control</span></a>
+          <a class="rail-row" href="#/settings/application" data-route="settings" data-testid="nav-settings" title="Settings"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#settings"></use></svg><span class="rail-copy">Settings</span></a>
+        </nav>
+      </details>
+      <section class="rail-section rail-windows-section" id="rail-windows-section" aria-label="Open tools">
+        <details class="nav-menu nav-context-picker toolbar-add-menu" data-testid="toolbar-add-menu">
+          <summary class="nav-context-summary nav-picker-summary rail-window-add" data-testid="toolbar-add" aria-label="Tools" title="Open a tool"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#wrench"></use></svg><span class="nav-picker-copy rail-copy">Tools</span><span class="nav-context-more" aria-hidden="true"></span></summary>
+          <div class="toolbar-add-options" aria-label="Tool types">
+            <button type="button" data-add-toolbar-tab="agent"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#bot"></use></svg>Agent</button>
+            <button type="button" data-add-toolbar-tab="standalone"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#git-branch"></use></svg>Agent in Worktree</button>
+            <button type="button" data-add-toolbar-tab="system"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#activity"></use></svg>System</button>
+            <button type="button" data-add-toolbar-tab="files"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#folder-open"></use></svg>Files</button>
+            <button type="button" data-add-toolbar-tab="terminal"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#square-terminal"></use></svg>Terminal</button>
+            <button type="button" data-add-toolbar-tab="plan"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#notebook-pen"></use></svg>Planning Agent</button>
+          </div>
+        </details>
+        <nav class="rail-window-list" id="rail-windows" aria-label="Tools"></nav>
+      </section>
+      <section class="rail-section" id="rail-planning-section" aria-label="Project Planning">
+        <details class="nav-menu nav-context-picker" id="planning-board-menu">
+          <summary class="nav-context-summary nav-picker-summary rail-window-add" data-testid="planning-menu" aria-label="Planning" title="Create or select a board"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#kanban"></use></svg><span class="nav-picker-copy rail-copy">Planning</span><span class="nav-context-more" aria-hidden="true"></span></summary>
+          <div class="toolbar-add-options planning-board-options">
+            <div class="nav-menu-label">Planning</div>
+            <button type="button" data-planning-create-board><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#plus"></use></svg>Create board</button>
+            <nav class="toolbar-add-options-group" aria-label="Project boards" id="planning-board-options"><a href="#/planning" data-route="planning" data-testid="nav-planning">All boards</a></nav>
+          </div>
+        </details>
+        <nav class="rail-window-list" id="rail-planning-boards" aria-label="Planning boards"></nav>
+      </section>
+      <details class="rail-section" id="rail-skills-section" open>
+        <summary class="rail-section-heading" title="Skills"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#wand-sparkles"></use></svg><span class="rail-copy">Skills</span><span class="rail-section-state" aria-hidden="true"><svg class="rail-icon rail-section-open-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#plus"></use></svg><svg class="rail-icon rail-section-close-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#minus"></use></svg></span></summary>
+        <p class="rail-description rail-copy">Run reusable instructions with an agent.</p>
+        <div id="nav-manual-skills" class="rail-resource-list" aria-label="Skills"></div>
+      </details>
+      <details class="rail-section" id="rail-hubs-section" open>
+        <summary class="rail-section-heading" title="Hubs"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#globe"></use></svg><span class="rail-copy">Hubs</span><span class="rail-section-state" aria-hidden="true"><svg class="rail-icon rail-section-open-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#plus"></use></svg><svg class="rail-icon rail-section-close-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#minus"></use></svg></span></summary>
+        <p class="rail-description rail-copy">Open shared sites, reports, and data.</p>
+        <div id="nav-hubs" class="rail-resource-list" aria-label="Hubs"></div>
+      </details>
+    </div>
+    <div class="rail-footer">
+      <button id="rail-toggle" class="rail-toggle rail-row" type="button" aria-label="Collapse navigation" aria-expanded="true" aria-controls="rail-navigation" title="Collapse menu"><span class="rail-toggle-label">Collapse menu</span><svg class="rail-icon rail-collapse-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#chevrons-left"></use></svg><svg class="rail-icon rail-expand-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#chevrons-right"></use></svg><svg class="rail-icon rail-mobile-close-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#chevrons-left"></use></svg></button>
+    </div>
+  </aside>
+  <button id="rail-scrim" class="rail-scrim" aria-label="Close navigation" hidden></button>
+  <div class="workspace">
+    <header class="mobile-navigation"><button id="mobile-rail-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="navigation-rail"><svg class="rail-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><use href="/static/vendor/lucide/navigation.svg#arrow-right"></use></svg> <span>Refine</span></button></header>
+    <div id="banners" class="banners"></div>
+    <div id="workspace-tools" class="workspace-tools topbar-actions" hidden>
+      <details class="nav-menu" id="nav-create-menu">
+        <summary class="rail-row" data-testid="create-menu-toggle">Workspace controls &amp; support</summary>
+          <div class="nav-menu-panel nav-create-panel nav-context-panel">
+            <div class="nav-menu-label">Create</div>
+            <a class="nav-menu-item" href="#/goals/new" id="btn-new-goal" data-testid="nav-new-goal">New Goal</a>
+            <a class="nav-menu-item" href="#/features/new" id="btn-new-feature" data-testid="nav-new-feature">New Feature</a>
+            <a class="nav-menu-item" href="#/goals/import" id="btn-import" data-testid="nav-import-goals">Import</a>
+          <div class="nav-menu-label">Status</div>
+          <div class="quick-status-row">
+            <a id="workflow-status-indicator" class="workflow-status-indicator nav-menu-item nav-control-item"
+               href="#/control" aria-label="Workflow status: unknown; click to view processes"
+               title="Workflow status: unknown" data-state="unknown">
+              <span class="target-app-dot" aria-hidden="true"></span>
+              <span>Workflow status</span>
+            </a>
+            <div class="quick-status-actions" id="quick-workflow-actions" aria-label="Workflow actions"></div>
+          </div>
+          <div class="quick-status-row">
+            <a id="target-app-indicator" class="target-app-indicator nav-menu-item nav-control-item"
+               href="#/control"
+               aria-label="Target application status (click to manage)"
+               title="Target application status"
+               data-testid="context-target-app-status"
+               data-state="unknown">
+              <span class="target-app-dot" aria-hidden="true"></span>
+              <span>Target application status</span>
+            </a>
+            <div class="quick-status-actions" id="quick-target-actions" aria-label="Target application actions"></div>
+          </div>
+          <div class="nav-menu-label nav-context-section-label">Tools and Support</div>
           <button class="nav-menu-item nav-control-item nav-management-item nav-issue-button" id="btn-refine-issue"
                   data-testid="nav-refine-issue"
-                  aria-label="Request refine feature or bugfix"
-                  title="Request refine feature or bugfix">
-            <span class="nav-menu-icon nav-bug-icon" aria-hidden="true"></span>
-            <span>Report a bug to Refine Devs</span>
-          </button>
-          <div class="nav-menu-label nav-context-section-label">Management</div>
-          <button class="nav-menu-item nav-control-item nav-management-item nav-source-update-button" id="btn-source-update"
-                  data-testid="nav-source-update"
-                  data-state="checking"
-                  aria-label="Update running Refine from source"
-                  title="Checking for Refine source updates"
-                  hidden disabled>
-            <svg class="nav-menu-icon nav-source-update-icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
-              <path d="M20 11a8 8 0 0 0-14.9-4"></path>
-              <path d="M4 4v5h5"></path>
-              <path d="M4 13a8 8 0 0 0 14.9 4"></path>
-              <path d="M20 20v-5h-5"></path>
+                  aria-label="Contact Refine Devs"
+                  title="Contact Refine Devs">
+            <svg class="nav-menu-icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+              <path d="M9 7V6a3 3 0 0 1 6 0v1M8 3l2 2m6-2-2 2"></path>
+              <rect x="7" y="7" width="10" height="14" rx="5"></rect>
+              <path d="M12 7v14M3 9l4 2m-4 4h4m-4 6 4-3M21 9l-4 2m4 4h-4m4 6-4-3"></path>
             </svg>
-            <span class="nav-control-copy">
-              <span class="nav-source-update-action">Check for updates</span>
-              <span class="nav-control-status nav-source-update-status">Checking for updates</span>
-            </span>
+            <span>Contact Refine Devs</span>
           </button>
           <button class="nav-menu-item nav-control-item nav-management-item nav-theme-toggle" id="btn-theme-toggle"
                   data-testid="nav-theme-toggle"
@@ -122,47 +171,12 @@
               <span class="nav-control-status nav-theme-status">Off</span>
             </span>
           </button>
-          <a class="nav-menu-item nav-management-item" href="#/guide" id="nav-guide-open" data-route="guide" data-testid="nav-guide-open">
-            <svg class="nav-menu-icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
-              <path d="M12 7v14"></path>
-              <path d="M3 5a2 2 0 0 1 2-2h4a3 3 0 0 1 3 3v15a3 3 0 0 0-3-3H5a2 2 0 0 1-2-2V5Z"></path>
-              <path d="M21 5a2 2 0 0 0-2-2h-4a3 3 0 0 0-3 3v15a3 3 0 0 1 3-3h4a2 2 0 0 0 2-2V5Z"></path>
-            </svg>
-            <span>Guide</span>
-          </a>
-          <a class="nav-menu-item nav-management-item" href="#/settings/processes" data-route="settings">
-            <svg class="nav-menu-icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
-              <rect x="3" y="4" width="18" height="16" rx="2"></rect>
-              <path d="M8 8h8"></path>
-              <path d="M8 12h8"></path>
-              <path d="M8 16h5"></path>
-            </svg>
-            <span>Settings</span>
-          </a>
-          <section id="nav-manual-skills" aria-label="Skills"></section>
-        </div>
-      </details>
-      <div class="nav-create-group">
-        <a class="btn nav-action nav-create-primary" href="#/goals/new" id="btn-new-goal" data-testid="nav-new-goal">+ New Goal</a>
-        <details class="nav-menu nav-create-menu" id="nav-create-menu">
-          <summary class="btn nav-action nav-create-more" aria-label="More create actions" data-testid="create-menu-toggle"></summary>
-          <div class="nav-menu-panel nav-create-panel">
-            <a class="nav-menu-item" href="#/features/new" id="btn-new-feature" data-testid="nav-new-feature">New Feature</a>
-            <a class="nav-menu-item" href="#/goals/import" id="btn-import" data-testid="nav-import-goals">Import</a>
-            <a class="nav-menu-item" href="https://github.com/buwilliams/refine/issues/new"
-               id="btn-refine-issue-menu" data-testid="nav-refine-issue-menu">Request refine feature/bugfix</a>
           </div>
-        </details>
-      </div>
+      </details>
     </div>
-  </header>
-
-  <div id="banners" class="banners"></div>
-
-  <main id="main"></main>
-
-  <aside id="toolbar-dock" class="toolbar-dock" aria-label="Toolbar" data-testid="toolbar-dock"></aside>
-  <aside id="guide-panel" class="guide-panel" aria-label="Guide" aria-hidden="true" data-testid="guide-panel"></aside>
+    <main id="main"></main>
+    <section id="toolbar-dock" class="toolbar-dock" role="main" aria-label="Window content" data-testid="toolbar-dock" hidden></section>
+  </div>
 
   <template id="t-banner">
     <div class="banner" data-testid="global-banner">
@@ -173,6 +187,7 @@
 
   <script src="/static/js/common.js"></script>
   <script src="/static/js/node-context.js"></script>
+  <script src="/static/js/topbar-pickers.js"></script>
   <script src="/static/js/node-scope-navigation.js"></script>
   <script src="/static/vendor/idiomorph/idiomorph.min.js"></script>
   <script src="/static/js/dom-morph.js"></script>
@@ -180,12 +195,14 @@
   <script src="/static/js/command-registry.js"></script>
   <script src="/static/js/workflow-visualization.js"></script>
   <script src="/static/js/table-column-resize.js"></script>
-  <script src="/static/js/features/dashboard_state_recovery.js"></script>
+  <script src="/static/js/features/system-recovery.js"></script>
   <script src="/static/js/features/dashboard.js"></script>
   <script src="/static/js/features/feature-goal-inline.js"></script>
   <script src="/static/js/features/features.js"></script>
   <script src="/static/js/features/goals-list.js"></script>
   <script src="/static/js/features/goals-bulk.js"></script>
+  <script src="/static/js/features/goals-prompts.js"></script>
+  <script src="/static/js/features/goals-failures.js"></script>
   <script src="/static/js/features/goals-detail.js"></script>
   <script src="/static/js/features/goals-new.js"></script>
   <script src="/static/js/features/goals-import.js"></script>
@@ -199,22 +216,31 @@
   <script src="/static/js/features/terminal-clipboard.js"></script>
   <script src="/static/js/features/terminal-keyboard.js"></script>
   <script src="/static/js/features/toolbar.js"></script>
-  <script src="/static/js/features/toolbar-todo.js"></script>
+  <script src="/static/js/features/planning.js"></script>
   <script src="/static/js/features/guide.js"></script>
-  <script src="/static/js/features/logs.js"></script>
   <script src="/static/js/features/settings_target_app_tests.js"></script>
   <script src="/static/js/features/settings_application.js"></script>
   <script src="/static/js/features/settings_processes.js"></script>
   <script src="/static/js/features/settings_skills.js"></script>
+  <script src="/static/js/features/settings_templates_catalog.js"></script>
+  <script src="/static/js/features/settings_resource_map.js"></script>
+  <script src="/static/js/features/settings_resource_reset.js"></script>
+  <script src="/static/js/features/settings_templates.js"></script>
+  <script src="/static/js/features/settings_workflow.js"></script>
+  <script src="/static/js/features/hubs.js"></script>
+  <script src="/static/js/features/workflow-controls.js"></script>
+  <script src="/static/js/features/settings_providers.js"></script>
   <script src="/static/js/features/settings_runtime.js"></script>
   <script src="/static/js/features/source_update.js"></script>
   <script src="/static/js/features/settings_nodes.js"></script>
   <script src="/static/js/features/settings_reporters.js"></script>
   <script src="/static/js/features/settings.js"></script>
+  <script src="/static/js/quick-actions.js"></script>
   <script src="/static/js/target-app.js"></script>
   <script src="/static/js/commands.js"></script>
   <script src="/static/js/command-palette.js"></script>
   <script src="/static/js/features/reporter-onboarding.js"></script>
+  <script src="/static/js/navigation.js"></script>
   <script src="/static/js/router.js"></script>
   <script src="/static/js/init.js"></script>
 </body>

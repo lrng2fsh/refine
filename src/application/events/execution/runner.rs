@@ -60,6 +60,13 @@ impl FileEventService {
             self.validate_retained_invocation(&invocation)?;
             return Ok(invocation);
         }
+        let _templates = crate::application::templates::TemplateScope::pin(
+            Some(&self.refine_dir),
+            &mut invocation.context.metadata,
+        )?;
+        crate::application::templates::TemplateScope::set_values(
+            crate::application::templates::TemplateScope::context_values(&invocation.context.data),
+        );
         self.validate_lifecycle(&invocation)?;
         if invocation
             .bindings
@@ -81,7 +88,19 @@ impl FileEventService {
         }
         let runtime = self.runtime()?;
         #[cfg(test)]
-        if invocation.context.provider != "smoke-ai" {
+        if invocation.context.provider != "smoke-ai"
+            && !std::env::var("REFINE_SMOKE_AI_PATH")
+                .ok()
+                .is_some_and(|fixture| {
+                    crate::infrastructure::storage::providers::ProviderStore::new(&self.refine_dir)
+                        .load()
+                        .ok()
+                        .and_then(|catalog| {
+                            catalog.provider(&invocation.context.provider).ok().cloned()
+                        })
+                        .is_some_and(|provider| provider.executable == fixture)
+                })
+        {
             return Err(RefineError::InvalidInput(
                 "Event tests require an explicit smoke-ai provider fixture".into(),
             ));
@@ -100,6 +119,16 @@ impl FileEventService {
             FileOperationRegistry, OperationRegistry, OperationState,
         };
         let operations = FileOperationRegistry::new(runtime);
+        if invocation
+            .context
+            .metadata
+            .contains_key("event_operation_id")
+        {
+            invocation
+                .context
+                .metadata
+                .insert("interrupted_resume".into(), json!(true));
+        }
         if let Some(previous) = invocation
             .context
             .metadata
@@ -112,6 +141,57 @@ impl FileEventService {
                 self.terminate_invocation_processes(id)?;
                 operations.ensure_cancellation_processes_exited(previous)?;
             }
+        }
+        // Only a currently admitted workflow owner may continue an unfinished
+        // occurrence. The workspace lease and authority checks exclude competing
+        // coordinators; complete scope exit excludes surviving agent descendants.
+        if launch_metadata.is_some()
+            && invocation.context.goal_id.is_some()
+            && invocation
+                .event
+                .source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("workflow."))
+            && (invocation.context.metadata.contains_key("started_bindings")
+                || invocation
+                    .context
+                    .metadata
+                    .contains_key("interrupted_resume"))
+        {
+            validate_authority()?;
+            for root in [runtime.to_path_buf(), runtime.join("agents")] {
+                let owner =
+                    crate::infrastructure::process::subprocess::FileProcessSupervisor::new(root);
+                for process in owner.capacity_processes()? {
+                    let details: Value =
+                        serde_json::from_str(process.details.as_deref().unwrap_or("{}"))
+                            .map_err(|e| RefineError::Serialization(e.to_string()))?;
+                    if details["event_invocation_id"] != id {
+                        continue;
+                    }
+                    owner
+                        .terminate_and_confirm_exit(&process, std::time::Duration::from_secs(2))?;
+                }
+            }
+            validate_authority()?;
+            if let Some(started) = invocation.context.metadata.remove("started_bindings") {
+                invocation
+                    .context
+                    .metadata
+                    .entry("interrupted_launches")
+                    .or_insert_with(|| json!([]))
+                    .as_array_mut()
+                    .ok_or_else(|| {
+                        RefineError::Serialization("invalid interrupted launch history".into())
+                    })?
+                    .push(json!({"started_bindings":started,"reconciled_at":now()}));
+            }
+            invocation.context.metadata.remove("interrupted_resume");
+            invocation
+                .context
+                .metadata
+                .insert("resuming_work".into(), json!(true));
+            self.save_accepted_invocation(&invocation, &validate_authority)?;
         }
         let operation = with_record_lock(&self.refine_dir, &format!("event-{id}"), || {
             if self.invocation(id)?.state == InvocationState::Cancelled {
@@ -145,19 +225,30 @@ impl FileEventService {
                 })
                 .unwrap_or(default)
         };
+        use crate::application::templates::{TemplateScope, TemplateValue};
         let contexts = invocation
             .bindings
             .iter()
             .filter(|b| b.binding.mode == BindingMode::Context)
             .map(|b| {
-                format!(
-                    "{}\n{}\nParameters: {}",
-                    b.skill.name,
-                    b.skill.prompt,
-                    json!(b.parameters)
-                )
+                let mut values = TemplateScope::literals(&[
+                    (
+                        "hubs",
+                        &invocation.context.data["hubs"][&b.skill.id]
+                            .as_array()
+                            .map(|v| json!(v).to_string())
+                            .unwrap_or_default(),
+                    ),
+                    ("skill_name", &b.skill.name),
+                    ("parameters", &json!(b.parameters).to_string()),
+                ]);
+                values.insert(
+                    "skill".into(),
+                    TemplateValue::Template(b.skill.prompt.clone()),
+                );
+                TemplateScope::render("context-skill", values)
             })
-            .collect::<Vec<_>>()
+            .collect::<RefineResult<Vec<_>>>()?
             .join("\n\n");
         for pinned in invocation.bindings.clone() {
             if pinned.binding.mode == BindingMode::Context
@@ -185,6 +276,24 @@ impl FileEventService {
                 );
                 if let Some(goal_id) = &invocation.context.goal_id {
                     metadata.insert("goal_id".into(), json!(goal_id));
+                    if let Some(round_idx) = invocation.context.data["goal"]["rounds"]
+                        .as_array()
+                        .and_then(|rounds| rounds.len().checked_sub(1))
+                    {
+                        metadata.entry("round_idx").or_insert(json!(round_idx));
+                    }
+                    // Lifecycle and standalone Skills need the same durable launch
+                    // occurrence as workflow-owned agents, including the Skill that
+                    // submits a redirect. Keep current recovered launch metadata when
+                    // supplied; otherwise use the invocation's pinned Goal snapshot.
+                    for (key, field) in [
+                        ("workflow_step_generation", "event_generation"),
+                        ("workflow_revision", "workflow_revision"),
+                    ] {
+                        if let Some(value) = invocation.context.data["goal"][field].as_u64() {
+                            metadata.entry(key).or_insert(json!(value));
+                        }
+                    }
                 }
                 metadata.insert("skill_id".into(), json!(pinned.skill.id));
                 metadata.insert("node_id".into(), json!(invocation.context.node_id));
@@ -197,42 +306,66 @@ impl FileEventService {
                     json!(seconds("agent_hard_cap_seconds", 7200)),
                 );
                 let contract =
-                    crate::application::agent_io::contracts::skill_result::result_contract(
-                        id,
-                        &pinned.binding.id,
-                        &pinned.skill.role,
-                    );
-                let observational = pinned.skill.role == "plan"
-                    || pinned.skill.role == "governance"
-                    || invocation
-                        .context
-                        .data
-                        .get("verification_only")
-                        .and_then(Value::as_bool)
-                        == Some(true);
-                let role_instructions = if pinned.skill.role == "governance" {
-                    "For failure, artifacts.violations must contain objects with stable rule_id and message fields; also fill recovery_analysis and recovery_round_prompt."
-                } else {
-                    ""
-                };
-                let authority = if invocation.context.goal_id.is_some() {
-                    "Do not change Goal state, merge or push."
-                } else {
-                    "Perform only the actions authorized by the Skill instructions and inputs. Use supported Refine commands for Goal changes."
-                };
-                let prompt = format!(
-                    "{}\n{role_instructions}\n\nAttached Skills:\n{}\n\nParameters:\n{}\n\nPinned context:\n{}\n\nRefine completion contract (supplied by the system):\n{}\nReturn one JSON object matching this contract. {authority} Identity fields must be copied exactly. Use outcome failure for findings and error for execution faults. Supply actual evidence; do not fabricate a pass. {}",
-                    pinned.skill.prompt,
-                    contexts,
-                    json!(pinned.parameters),
-                    invocation.context.data,
-                    contract,
-                    if observational {
-                        "This invocation is observational: do not change files or Git state. Report findings and proposed check commands against the pinned candidate."
+                    crate::application::agent_io::contracts::skill_result::report_contract();
+                let observational = invocation
+                    .context
+                    .data
+                    .get("verification_only")
+                    .and_then(Value::as_bool)
+                    == Some(true);
+                let mut prompt_context = invocation.context.data.clone();
+                if let Some(object) = prompt_context.as_object_mut() {
+                    object.remove("hubs");
+                }
+                let mut values = TemplateScope::literals(&[
+                    (
+                        "hubs",
+                        &invocation.context.data["hubs"][&pinned.skill.id]
+                            .as_array()
+                            .map(|v| json!(v).to_string())
+                            .unwrap_or_default(),
+                    ),
+                    ("attached_skills", &contexts),
+                    ("parameters", &json!(pinned.parameters).to_string()),
+                    ("context", &prompt_context.to_string()),
+                    (
+                        "execution",
+                        &json!({"invocation_id": id, "binding_id": pinned.binding.id, "role": pinned.skill.role})
+                            .to_string(),
+                    ),
+                    ("completion_contract", &contract.to_string()),
+                ]);
+                values.insert(
+                    "continuation".into(),
+                    if invocation.context.metadata.get("resuming_work") == Some(&json!(true)) {
+                        TemplateValue::Template("{{templates.workflow-continuation}}".into())
                     } else {
-                        ""
-                    }
+                        TemplateValue::Literal(String::new())
+                    },
                 );
+                values.insert(
+                    "observational".into(),
+                    if observational {
+                        TemplateValue::Template("{{templates.workflow-observational}}".into())
+                    } else {
+                        TemplateValue::Literal(String::new())
+                    },
+                );
+                values.insert(
+                    "skill".into(),
+                    TemplateValue::Template(pinned.skill.prompt.clone()),
+                );
+                let template_id = if invocation
+                    .event
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.starts_with("workflow."))
+                {
+                    "workflow"
+                } else {
+                    "supervised-skill"
+                };
+                let prompt = TemplateScope::render(template_id, values)?;
                 let pinned_invocation = invocation.clone();
                 let validate = || {
                     validate_authority()?;

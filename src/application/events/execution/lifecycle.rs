@@ -32,6 +32,9 @@ pub struct LifecycleWorkspace {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LifecycleAuthority {
+    Planning {
+        action_id: String,
+    },
     Transition {
         pending: Value,
     },
@@ -50,15 +53,31 @@ pub(super) fn applicable(event: &EventDefinition, context: &InvocationContext) -
     if event.kind != EventKind::System || context.goal_id.is_none() {
         return false;
     }
+    if event
+        .source
+        .as_deref()
+        .is_some_and(|s| s.ends_with(".error") || s.ends_with(".success"))
+        && context.data["goal"]["branch_name"].is_null()
+    {
+        return true;
+    }
     match event.source.as_deref() {
         Some(
-            "workflow.backlog.enter"
+            "planning.lane.enter"
+            | "planning.lane.exit"
+            | "workflow.draft.enter"
+            | "workflow.draft.exit"
+            | "workflow.backlog.enter"
             | "workflow.backlog.exit"
             | "workflow.todo.enter"
             | "workflow.todo.exit",
         ) => true,
         Some(
-            "workflow.failed.enter"
+            "workflow.done.enter"
+            | "workflow.done.exit"
+            | "workflow.review.enter"
+            | "workflow.review.exit"
+            | "workflow.failed.enter"
             | "workflow.failed.exit"
             | "workflow.cancelled.enter"
             | "workflow.cancelled.exit",
@@ -88,7 +107,7 @@ fn unavailable(reason: &str) -> RefineError {
 fn request(goal: &Value) -> Value {
     goal["rounds"].as_array().and_then(|rounds| rounds.last()).map(|round| {
         json!({"created":round["created"], "prompt":round["prompt"], "reporter":round["reporter"], "assignee":round["assignee"]})
-    }).unwrap_or(Value::Null)
+    }).unwrap_or_else(|| json!({"name":goal["name"],"description":goal["description"],"reporter":goal["reporter"]}))
 }
 
 impl LifecycleWorkspace {
@@ -104,7 +123,8 @@ impl LifecycleWorkspace {
         if context.goal_id.as_deref() != Some(&self.goal_id)
             || context.round_idx != self.round_idx
             || round != self.round_idx
-            || request(&goal) != self.request
+            || (!(self.round_idx.is_none() && self.request.is_null())
+                && request(&goal) != self.request)
         {
             return Err(unavailable("Goal Round or authored request changed"));
         }
@@ -122,6 +142,21 @@ impl LifecycleWorkspace {
             return Err(unavailable("Goal was cancelled or failed after admission"));
         }
         match &self.authority {
+            LifecycleAuthority::Planning { action_id } => {
+                let path = root
+                    .join("planning/actions")
+                    .join(format!("{action_id}.json"));
+                let action: crate::application::planning::PlanningAction =
+                    crate::infrastructure::storage::automation::read_json(&path)?;
+                if action.state == "cancelled"
+                    || action.state == "failed"
+                    || action.owner != self.node_id
+                {
+                    return Err(unavailable(
+                        "planning action was cancelled, failed or transferred",
+                    ));
+                }
+            }
             LifecycleAuthority::WorkflowTransition {
                 from,
                 to,
@@ -133,18 +168,23 @@ impl LifecycleWorkspace {
                     || goal["status"] != *from
                     || goal["event_generation"].as_u64().unwrap_or(0) != *generation
                     || context.workflow_revision != Some(*workflow_revision)
-                    || !["workflow.todo.enter", "workflow.todo.exit"]
-                        .contains(&self.source.as_str())
+                    || ![
+                        "workflow.todo.enter",
+                        "workflow.todo.success",
+                        "workflow.todo.exit",
+                    ]
+                    .contains(&self.source.as_str())
                 {
                     return Err(unavailable("claimed lifecycle transition changed"));
                 }
                 FileWorkItemService::new(root).verify_workflow_attempt(
                     &self.goal_id,
-                    crate::application::work_items::WorkflowAttemptAuthority {
+                    crate::application::work_items::WorkflowStepAuthority {
                         round_idx: self
                             .round_idx
                             .ok_or_else(|| unavailable("missing claimed Round"))?,
                         workflow_revision: *workflow_revision,
+                        generation: *generation,
                     },
                     crate::model::workflow::GoalStatus::Todo,
                     &self.node_id,
@@ -154,6 +194,13 @@ impl LifecycleWorkspace {
                 if goal["pending_event_transition"] != *pending
                     || pending["state"] != "pending"
                     || pending["revision"] != goal["workflow_revision"]
+                    || pending["generation"].as_u64().map_or(
+                        pending["revision"] != goal["workflow_revision"],
+                        |generation| {
+                            generation != goal["event_generation"].as_u64().unwrap_or(0)
+                                || pending["candidate_commit"] != goal["candidate_commit"]
+                        },
+                    )
                     || pending["from"] != goal["status"]
                     || ![
                         format!(
@@ -162,6 +209,10 @@ impl LifecycleWorkspace {
                         ),
                         format!(
                             "workflow.{}.exit",
+                            pending["from"].as_str().unwrap_or_default()
+                        ),
+                        format!(
+                            "workflow.{}.success",
                             pending["from"].as_str().unwrap_or_default()
                         ),
                     ]
@@ -173,20 +224,20 @@ impl LifecycleWorkspace {
                 }
             }
             LifecycleAuthority::Occurrence { occurrence } => {
-                let side = if self.source.ends_with(".enter") {
-                    "to"
-                } else {
-                    "from"
-                };
+                let edge = self.source.rsplit('.').next().unwrap_or_default();
+                if !["enter", "exit", "success", "error"].contains(&edge)
+                    || (edge == "error" && occurrence["error"] != true)
+                {
+                    return Err(unavailable("invalid lifecycle outcome occurrence"));
+                }
+                let side = if edge == "enter" { "to" } else { "from" };
                 let expected = format!(
                     "workflow.{}.{}",
                     occurrence[side].as_str().unwrap_or_default(),
-                    if side == "to" { "enter" } else { "exit" }
+                    edge
                 );
                 if self.source != expected
-                    || !goal["workflow_events"]
-                        .as_array()
-                        .is_some_and(|items| items.contains(occurrence))
+                    || !super::super::transitions::occurrence_is_current(&goal, occurrence)
                 {
                     return Err(unavailable(
                         "durable lifecycle occurrence is missing or changed",

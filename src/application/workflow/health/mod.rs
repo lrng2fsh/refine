@@ -57,19 +57,33 @@ pub fn assess_worker(
     root: &Path,
     process: &ManagedProcess,
     target: Option<&Path>,
-    now: i64,
+) -> WorkflowHealth {
+    assess_worker_with_clock(root, process, target, || {
+        chrono::Utc::now().timestamp_millis()
+    })
+}
+
+pub(crate) fn assess_worker_with_clock(
+    root: &Path,
+    process: &ManagedProcess,
+    target: Option<&Path>,
+    clock: impl FnOnce() -> i64,
 ) -> WorkflowHealth {
     let incarnation = workflow_incarnation(process);
     let snapshot = incarnation
         .as_deref()
         .ok_or_else(|| RefineError::Degraded("worker incarnation is unavailable".into()))
         .and_then(|token| SchedulerObservation::read(root, token));
+    // Read the observation before sampling time: the scheduling thread can publish
+    // a newer tick during the read. A time captured by the caller can make that
+    // healthy tick look future-dated and trigger termination of the worker.
+    let now = clock();
     let started = process.started_at.parse::<i64>().ok().or_else(|| {
         chrono::DateTime::parse_from_rfc3339(&process.started_at)
             .ok()
             .map(|d| d.timestamp_millis())
     });
-    let starting = started.is_some_and(|t| (0..STARTUP_MS).contains(&(now - t)));
+    let starting = started.is_some_and(|t| (-STARTUP_MS..STARTUP_MS).contains(&(now - t)));
     let mut health = match snapshot {
         Ok(snapshot) => {
             let runtime_matches = root.canonicalize().ok().as_ref() == Some(&snapshot.runtime_root);
@@ -82,11 +96,19 @@ pub fn assess_worker(
                     == Some(&snapshot.os_identity);
             let node_matches = observed_node(root, snapshot.target_root.as_deref()).ok()
                 == Some(snapshot.node_id.clone());
-            let fresh =
-                snapshot.sequence > 0 && (0..SILENCE_MS).contains(&(now - snapshot.tick_ms));
-            let cycle_fresh = snapshot
-                .completed_cycle_ms
-                .is_some_and(|t| (0..SILENCE_MS).contains(&(now - t)));
+            let monotonic =
+                crate::infrastructure::process::subprocess::scheduler_observation::monotonic_millis(
+                );
+            let tick_age = monotonic
+                .zip(snapshot.tick_monotonic_ms)
+                .map(|(now, tick)| now - tick)
+                .unwrap_or(now - snapshot.tick_ms);
+            let cycle_age = monotonic
+                .zip(snapshot.completed_cycle_monotonic_ms)
+                .map(|(now, tick)| now - tick)
+                .or_else(|| snapshot.completed_cycle_ms.map(|tick| now - tick));
+            let fresh = snapshot.sequence > 0 && (0..SILENCE_MS).contains(&tick_age);
+            let cycle_fresh = cycle_age.is_some_and(|age| (0..SILENCE_MS).contains(&age));
             let draining = !target_matches && !snapshot.active_attempts.is_empty();
             let healthy = runtime_matches
                 && identity_matches
@@ -108,13 +130,16 @@ pub fn assess_worker(
                 "stalled"
             };
             let reason = if healthy && draining {
-                "scheduler is draining owned work from the previous target"
+                "scheduler is draining owned work from the previous target".to_string()
             } else if healthy {
-                "workflow scheduler is ticking"
+                "workflow scheduler is ticking".to_string()
             } else if !target_matches {
-                "worker has not observed the active target"
+                "worker has not observed the active target".to_string()
             } else {
-                "scheduler ticks or admission cycles are stale, or worker identity is unverified"
+                format!(
+                    "scheduler health mismatch: runtime={runtime_matches}, identity={identity_matches}, node={node_matches}, tick_age_ms={}, cycle_age_ms={:?}",
+                    tick_age, cycle_age
+                )
             };
             WorkflowHealth {
                 healthy,
@@ -131,6 +156,7 @@ pub fn assess_worker(
             format!("scheduler evidence unavailable: {error}"),
         ),
     };
+    apply_admission_assessment(root, target, now, &mut health);
     if !health.healthy {
         health.remedy = format!(
             "refine system doctor; refine system status --port {}",
@@ -178,12 +204,7 @@ pub fn assess_workflow_health(root: &Path) -> WorkflowHealth {
         .active_app
         .map(PathBuf::from);
         let mut health = if live.len() == 1 {
-            assess_worker(
-                root,
-                &live[0],
-                target.as_deref(),
-                chrono::Utc::now().timestamp_millis(),
-            )
+            assess_worker(root, &live[0], target.as_deref())
         } else {
             WorkflowHealth::unavailable(
                 "unavailable",
@@ -197,22 +218,12 @@ pub fn assess_workflow_health(root: &Path) -> WorkflowHealth {
             health.state = "detached".into();
             health.reason = "no target app is attached; scheduler is ticking".into();
         }
-        health.admission = admission::read_admission(
+        apply_admission_assessment(
             root,
             target.as_deref(),
             chrono::Utc::now().timestamp_millis(),
+            &mut health,
         );
-        if let Some(admission) = &health.admission {
-            let waiting = admission.waiting_count(chrono::Utc::now().timestamp_millis());
-            health.waiting_todo_count = waiting;
-            if waiting > 0 && health.healthy {
-                health.healthy = false;
-                health.state = "admission_stalled".into();
-                health.reason = format!(
-                    "{waiting} continuously eligible Todo Goals have waited over 30 seconds with free capacity"
-                );
-            }
-        }
         let recovery = root.join("workflow-recovery.json");
         if recovery.exists() {
             let value: serde_json::Value = serde_json::from_slice(
@@ -246,5 +257,34 @@ pub fn enrich_status(root: &Path, value: &mut serde_json::Value) {
             object.insert("daemon_healthy".into(), serde_json::json!(false));
         }
         object.insert("daemon_maintenance".into(), maintenance);
+    }
+}
+
+// The supervisor and diagnostic surfaces consume the same work-ownership
+// assessment. A ticking scheduler alone does not prove eligible work is owned.
+fn apply_admission_assessment(
+    root: &Path,
+    target: Option<&Path>,
+    now: i64,
+    health: &mut WorkflowHealth,
+) {
+    health.admission = admission::read_admission(root, target, now);
+    if let Some(admission) = &health.admission {
+        let same_owner = health.observation.as_ref().is_some_and(|worker| {
+            admission.scheduler_incarnation.as_deref() == Some(worker.incarnation.as_str())
+        });
+        let waiting = if same_owner || health.observation.is_none() {
+            admission.waiting_count(now)
+        } else {
+            0
+        };
+        health.waiting_todo_count = waiting;
+        if waiting > 0 && same_owner && health.healthy {
+            health.healthy = false;
+            health.state = "admission_stalled".into();
+            health.reason = format!(
+                "{waiting} continuously eligible Goals have no execution owner after 30 seconds with free capacity"
+            );
+        }
     }
 }

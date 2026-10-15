@@ -56,7 +56,7 @@ fn migration_preserves_content_is_idempotent_and_stale_writes_cannot_erase_edits
     std::fs::create_dir_all(&service.refine_dir).unwrap();
     std::fs::write(service.refine_dir.join("guidance.json"), r#"[{"id":"context","name":"Accessibility","rule":"For interfaces","instructions":"Support keyboard navigation","enabled":false}]"#).unwrap();
     let config = service.config().unwrap();
-    assert_eq!(config.events.len(), 21);
+    assert_eq!(config.events.len(), 49);
     assert!(!system_catalog().iter().any(|s| s.contains("sync")));
     assert!(
         config.skills["guidance-context"]
@@ -182,11 +182,12 @@ fn ordered_independent_runs_collect_failure_preserve_evidence_and_do_not_replay(
     std::fs::write(&provider, r#"#!/usr/bin/env python3
 import json, sys, pathlib
 prompt = sys.argv[1]
-contract = json.loads(prompt.split('Refine completion contract (supplied by the system):\n', 1)[1].split('\nReturn one JSON', 1)[0])
+contract = json.JSONDecoder().raw_decode(prompt.split('Refine completion contract (supplied by the system):\n', 1)[1].lstrip())[0]
 contract['outcome'] = 'failure' if prompt.startswith('FAIL') else 'success'
 contract['summary'] = 'Observed ' + contract['outcome']
 path = pathlib.Path('launches.txt')
-with path.open('a') as f: f.write(contract['binding_id'] + '\n')
+with path.open('a') as f: f.write(('first' if prompt.startswith('FAIL') else 'second') + '\n')
+pathlib.Path('received-' + ('first' if prompt.startswith('FAIL') else 'second') + '.txt').write_text(prompt)
 print(json.dumps(contract))
 "#).unwrap();
     std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -196,8 +197,12 @@ print(json.dumps(contract))
     }
     let mut config = (*service.config().unwrap()).clone();
     for (id, prompt) in [
-        ("first", "FAIL: inspect first"),
-        ("second", "Inspect independently"),
+        ("first", "FAIL: inspect first using {{refine_executable}}"),
+        (
+            "second",
+            "Inspect independently using {{ refine_executable }}",
+        ),
+        ("context", "Context CLI: {{refine_executable}}"),
     ] {
         config.skills.insert(
             id.into(),
@@ -222,14 +227,19 @@ print(json.dumps(contract))
         scope: Scope::default(),
         parameters: Vec::new(),
         on_success: None,
-        bindings: ["first", "second"]
+        bindings: ["first", "second", "context"]
             .iter()
             .enumerate()
             .map(|(order, id)| Binding {
+                planning: None,
                 id: (*id).into(),
                 skill_id: (*id).into(),
                 enabled: true,
-                mode: BindingMode::Blocking,
+                mode: if *id == "context" {
+                    BindingMode::Context
+                } else {
+                    BindingMode::Blocking
+                },
                 order: order as i32,
                 scope: Scope::default(),
                 overrides: None,
@@ -264,6 +274,21 @@ print(json.dumps(contract))
     let result = result.unwrap();
     assert_eq!(result.state, InvocationState::Failed, "{result:?}");
     assert_eq!(result.results.len(), 2);
+    let executable = std::env::current_exe().unwrap();
+    for id in ["first", "second"] {
+        let received =
+            std::fs::read_to_string(fixture.0.join(format!("received-{id}.txt"))).unwrap();
+        assert!(received.contains(&format!("using {}", executable.display())));
+        assert!(received.contains(&format!("Context CLI: {}", executable.display())));
+        assert!(!received.contains("{{refine_executable}}"));
+        assert!(!received.contains("{{ refine_executable }}"));
+    }
+    assert!(
+        invocation.bindings[0]
+            .skill
+            .prompt
+            .contains("{{refine_executable}}")
+    );
     assert_eq!(
         std::fs::read_to_string(fixture.0.join("launches.txt")).unwrap(),
         "first\nsecond\n"
@@ -279,17 +304,23 @@ print(json.dumps(contract))
 #[cfg(unix)]
 #[test]
 fn default_skills_complete_a_real_workflow_with_observed_quality_and_candidate_evidence() {
-    exercise_workflow(false);
+    exercise_workflow(false, false);
 }
 
 #[cfg(unix)]
 #[test]
 fn queued_custom_skill_is_admitted_before_an_active_goal_finishes() {
-    exercise_workflow(true);
+    exercise_workflow(true, false);
 }
 
 #[cfg(unix)]
-fn exercise_workflow(concurrent_skill: bool) {
+#[test]
+fn governance_failure_needs_no_violation_list_or_recovery_proposal() {
+    exercise_workflow(false, true);
+}
+
+#[cfg(unix)]
+fn exercise_workflow(concurrent_skill: bool, governance_failure: bool) {
     use crate::application::work_items::FileWorkItemService;
     use crate::application::workflow::WorkflowEngine;
     use crate::infrastructure::process::supervisor::config::FileSettingsService;
@@ -317,15 +348,18 @@ fn exercise_workflow(concurrent_skill: bool) {
     git(&["add", "app.txt"]);
     git(&["commit", "-qm", "initial"]);
     let provider = fixture.0.join("provider");
-    std::fs::write(&provider, r##"#!/usr/bin/env python3
+    std::fs::write(
+        &provider,
+        r##"#!/usr/bin/env python3
 import sys,json,pathlib,time
 fixture=pathlib.Path(@FIXTURE@)
 prompt=' '.join(sys.argv[1:])
 decode=json.JSONDecoder().raw_decode
 result=decode(prompt.split('Refine completion contract (supplied by the system):\n',1)[1])[0]
 context=decode(prompt.split('Pinned context:\n',1)[1])[0]
-role=result['role']
-result['evidence']=['Inspected the candidate and observed the requested behavior.']
+role=json.JSONDecoder().raw_decode(prompt.split('Skill execution:\n',1)[1])[0]['role']
+result.pop('summary', None)
+if role=='governance' and (fixture/'decline').exists(): result['outcome']='failure'
 if role=='task':
  (fixture/'skill-finished').write_text('done')
 if role=='implement':
@@ -335,12 +369,14 @@ if role=='implement':
   while not (fixture/'skill-finished').exists() and time.monotonic()<deadline: time.sleep(.02)
   assert (fixture/'skill-finished').exists(), 'Queued Skill was starved behind the active Goal'
  pathlib.Path('app.txt').write_text('after\n')
- checklist=context['goal']['rounds'][-1]['implementation_plan']['final_plan']['result']['checklist']
- result['artifacts']={'implementation_evidence':{'checklist':[{'id':i['id'],'outcome':'completed','evidence':'Changed app.txt and verified contents'} for i in checklist], 'verification':['app.txt contains after']}}
 if role=='quality':
- result['artifacts']={'tests':[{'test':'Requested output','command':"test \"$(cat app.txt)\" = after",'status':'passed','evidence':'The supervised command checks the actual file'}]}
+ assert pathlib.Path('app.txt').read_text() == 'after\n'
+ result['artifacts']={'tests':[{'command':'touch must-not-execute; exit 1'}]}
 print(json.dumps(result))
-"##.replace("@FIXTURE@", &json!(fixture.0).to_string())).unwrap();
+"##
+        .replace("@FIXTURE@", &json!(fixture.0).to_string()),
+    )
+    .unwrap();
     std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
     let _environment = crate::infrastructure::agents::invocation::smoke_ai_env_lock()
         .lock()
@@ -363,8 +399,13 @@ print(json.dumps(result))
     }
     let root = crate::infrastructure::storage::project_layout::refine_dir_for_target_root(&target)
         .unwrap();
+    let mut catalog = crate::model::providers::defaults();
+    let mut configured = crate::model::providers::ProviderDefinition::generic("WorkflowFixture");
+    configured.executable = provider.to_string_lossy().into_owned();
+    catalog.providers.push(configured);
+    crate::application::agents::providers::save(&root, &json!(catalog)).unwrap();
     FileSettingsService::new(&root)
-        .update(&json!({"agent_cli":"smoke-ai","parallel_run_cap":2}))
+        .update(&json!({"agent_cli":"WorkflowFixture","parallel_run_cap":2}))
         .unwrap();
     let service = FileEventService::with_runtime_root(&root, fixture.0.join("runtime"));
     service.config().unwrap();
@@ -380,6 +421,9 @@ print(json.dumps(result))
             json!({"revision":quality["revision"],"item":quality_item,"trigger":quality_trigger}),
         )
         .unwrap();
+    if governance_failure {
+        std::fs::write(fixture.0.join("decline"), "yes").unwrap();
+    }
     if concurrent_skill {
         std::fs::write(fixture.0.join("concurrent"), "yes").unwrap();
         let revision = service.config().unwrap().revision;
@@ -433,12 +477,36 @@ print(json.dumps(result))
     } else {
         engine.evaluate_workflow()
     };
+    let goal = work.show_goal_detail("EVENTGOAL").unwrap();
+    if governance_failure {
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Governance agent reported failure")
+        );
+        assert_eq!(goal["status"], "failed", "{goal}");
+        assert_eq!(goal["rounds"][0]["failure_category"], "governance");
+        assert_eq!(
+            std::fs::read_to_string(target.join("app.txt")).unwrap(),
+            "before\n"
+        );
+        let runs = service.invocations(0, 100).unwrap();
+        assert!(
+            runs["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["event"]["source"] == "workflow.governance.enter"
+                    && i["state"] == "failed")
+        );
+        return;
+    }
     assert!(
         result.is_ok(),
         "{result:?}\n{}",
         work.show_goal_detail("EVENTGOAL").unwrap()
     );
-    let goal = work.show_goal_detail("EVENTGOAL").unwrap();
     assert_eq!(goal["status"], "review", "{goal}");
     assert_eq!(
         std::fs::read_to_string(target.join("app.txt")).unwrap(),
@@ -471,6 +539,12 @@ print(json.dumps(result))
         1,
         "An unchanged candidate needs one Quality review: {runs}"
     );
+    assert!(
+        !target
+            .join(".git/refine-worktrees/refine-EVENTGOAL-round-1/must-not-execute")
+            .exists()
+    );
+    assert!(!target.join("must-not-execute").exists());
     let proof = &goal["rounds"][0]["quality_details"]["quality_proof"];
     assert_eq!(
         proof["skills"]["required_bindings"]
@@ -494,6 +568,7 @@ fn add_gate(service: &FileEventService, source: &str, missing_input: bool) {
     }
     config.skills.insert(skill.id.clone(), skill);
     let binding = Binding {
+        planning: None,
         id: "gate".into(),
         skill_id: "gate".into(),
         enabled: true,
@@ -585,8 +660,8 @@ fn missing_automatic_input_settles_as_visible_error_instead_of_waiting_forever()
     );
     service.dispatch_goal_events(&fixture.0).unwrap();
     let goal = work.show_goal_detail("INPUT1").unwrap();
-    assert_eq!(goal["status"], "backlog");
-    assert_eq!(goal["pending_event_transition"]["state"], "failed");
+    assert_eq!(goal["status"], "failed");
+    assert_eq!(goal["event_transition_history"][0]["state"], "failed");
     let runs = service.invocations(0, 100).unwrap();
     assert_eq!(runs["items"][0]["state"], "error");
     assert!(
@@ -1003,7 +1078,7 @@ fn v2_migration_splits_assignments_preserves_overrides_and_is_idempotent() {
     )
     .unwrap();
     let migrated = service.config().unwrap();
-    assert_eq!(migrated.schema_version, 2);
+    assert_eq!(migrated.schema_version, SCHEMA_VERSION);
     assert_eq!(migrated.revision, old.revision + 1);
     assert_eq!(migrated.skills.len(), old.skills.len() + 2);
     assert_eq!(
@@ -1050,7 +1125,7 @@ fn manual_skills_select_one_skill_validate_inputs_and_pin_replay_without_a_goal(
     let service = fixture.service();
     for id in ["one", "two"] {
         let revision = service.config().unwrap().revision;
-        service.save("skills", id, json!({"revision":revision,"item":{"name":id,"prompt":format!("Run only {id}"),"role":"governance","parameters":[{"name":"count","kind":"number","required":true,"default":3}]},"trigger":{"source":"custom"}})).unwrap();
+        service.save("skills", id, json!({"revision":revision,"item":{"name":id,"prompt":format!("Run only {id}; CLI: {{{{refine_executable}}}}"),"role":"governance","parameters":[{"name":"count","kind":"number","required":true,"default":3}]},"trigger":{"source":"custom"}})).unwrap();
     }
     let inputs = service.skill_inputs("one", &fixture.0).unwrap();
     assert_eq!(inputs["parameters"][0]["default"], 3);
@@ -1087,6 +1162,17 @@ fn manual_skills_select_one_skill_validate_inputs_and_pin_replay_without_a_goal(
         .terminal_skill_prompt("one", &fixture.0, &json!({"count":9}))
         .unwrap();
     assert!(prompt.contains("Run only one"));
+    assert!(prompt.contains(&format!(
+        "CLI: {}",
+        std::env::current_exe().unwrap().display()
+    )));
+    assert!(!prompt.contains("{{refine_executable}}"));
+    assert!(
+        run.bindings[0]
+            .skill
+            .prompt
+            .contains("{{refine_executable}}")
+    );
     assert!(!prompt.contains("Run only two"));
     assert_eq!(metadata["skill_parameters"]["count"], 9);
     let config = service.config().unwrap();
@@ -1115,7 +1201,7 @@ fn manual_skills_select_one_skill_validate_inputs_and_pin_replay_without_a_goal(
 }
 
 #[test]
-fn single_trigger_save_rejects_multiple_and_derives_the_workflow_result_contract() {
+fn reusable_skill_assignments_preserve_shared_edits_and_derive_the_workflow_result_contract() {
     let fixture = Fixture::new();
     let service = fixture.service();
     let revision = service.config().unwrap().revision;
@@ -1136,9 +1222,58 @@ fn single_trigger_save_rejects_multiple_and_derives_the_workflow_result_contract
         )
         .unwrap();
     assert!(run.bindings.iter().all(|b| b.skill.role == "quality"));
-    assert!(service.save("skills", "review", json!({"revision":config.revision,"item":item,"event_bindings":[{"event_id":"custom","binding":{"id":"one","skill_id":"review"}},{"event_id":"workflow.quality.enter","binding":{"id":"two","skill_id":"review"}}]})).is_err());
-    assert_eq!(*service.config().unwrap(), *config);
-    service.remove("skills", "review", config.revision).unwrap();
+    let saved = service.save("skills", "review", json!({"revision":config.revision,"item":item,"event_bindings":[{"event_id":"custom","binding":{"id":"one","skill_id":"review"}},{"event_id":"workflow.quality.enter","binding":{"id":"two","skill_id":"review"}}]})).unwrap();
+    let shown = service.show_skill("review").unwrap();
+    assert!(shown["trigger"].is_null());
+    assert_eq!(shown["triggers"].as_array().unwrap().len(), 2);
+    let shared = service.config().unwrap();
+    for (source, expected_role) in [("custom", "task"), ("workflow.quality.enter", "quality")] {
+        let prepared = service
+            .prepare_pinned(
+                &shared,
+                &shared.events[source],
+                service.manual_context(&fixture.0, &json!({})).unwrap(),
+                BTreeMap::new(),
+                &format!("shared-{expected_role}"),
+            )
+            .unwrap();
+        let binding = prepared
+            .bindings
+            .iter()
+            .find(|binding| binding.skill.id == "review")
+            .unwrap();
+        assert_eq!(binding.skill.role, expected_role);
+    }
+    let edited = service.save("skills", "review", json!({"revision":saved["revision"],"item":{"name":"Review", "prompt":"Updated shared instructions"}})).unwrap();
+    assert_eq!(
+        service.show_skill("review").unwrap()["triggers"],
+        shown["triggers"]
+    );
+    assert!(
+        service
+            .save(
+                "skills",
+                "review",
+                json!({"revision":edited["revision"], "item":item,"trigger":{"source":"custom"}})
+            )
+            .is_err()
+    );
+    // Removing one assignment retains the shared Skill and its other assignment.
+    let detached = service.save("skills", "review", json!({"revision":edited["revision"],"item":edited["item"],"event_bindings":[{"event_id":"workflow.quality.enter","binding":{"id":"two","skill_id":"review"}}]})).unwrap();
+    assert_eq!(
+        service.show_skill("review").unwrap()["triggers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        service.show_skill("review").unwrap()["item"]["prompt"],
+        "Updated shared instructions"
+    );
+    service
+        .remove("skills", "review", detached["revision"].as_u64().unwrap())
+        .unwrap();
     assert_eq!(
         service.config().unwrap().events["workflow.quality.enter"]
             .bindings
@@ -1147,4 +1282,337 @@ fn single_trigger_save_rejects_multiple_and_derives_the_workflow_result_contract
     );
 }
 
+mod recovery;
 mod repairs;
+
+#[test]
+fn migrated_settings_are_archived_retired_and_cannot_regain_authority() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    std::fs::create_dir_all(service.refine_dir.join("quality")).unwrap();
+    let governance = "{\"constitution\":\"Preserve user work\"}\n";
+    std::fs::write(service.refine_dir.join("governance.json"), governance).unwrap();
+    std::fs::write(
+        service
+            .refine_dir
+            .join("quality/legacy-command-transition.json"),
+        "{\"old\":true}",
+    )
+    .unwrap();
+    let config = service.config().unwrap();
+    assert!(
+        config.skills["default-governance"]
+            .prompt
+            .contains("Preserve user work")
+    );
+    for name in [
+        "governance.json",
+        "guidance.json",
+        "quality/settings.json",
+        "quality/legacy-command-transition.json",
+    ] {
+        assert!(!service.refine_dir.join(name).exists(), "{name}");
+    }
+    let archives = service
+        .refine_dir
+        .join("automation/retired-settings/governance.json");
+    let snapshot = std::fs::read_dir(&archives)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(snapshot).unwrap()).unwrap();
+    assert_eq!(saved["content"], governance);
+    let quality =
+        crate::application::workflow::phases::quality::FileQualityService::new(&service.refine_dir);
+    assert!(
+        quality
+            .load_settings()
+            .unwrap_err()
+            .to_string()
+            .contains("Skills")
+    );
+    assert!(
+        quality
+            .save_settings(Default::default())
+            .unwrap_err()
+            .to_string()
+            .contains("Skills")
+    );
+    assert!(!service.refine_dir.join("quality/settings.json").exists());
+    // An older node can reintroduce a source. Preserve that version too, without
+    // overwriting either the current Skill or the original migration evidence.
+    std::fs::write(
+        service.refine_dir.join("governance.json"),
+        "{\"constitution\":\"Old node edit\"}",
+    )
+    .unwrap();
+    assert_eq!(*service.config().unwrap(), *config);
+    assert!(!service.refine_dir.join("governance.json").exists());
+    assert_eq!(std::fs::read_dir(archives).unwrap().count(), 2);
+    assert!(
+        super::migration::retire_settings(&service.refine_dir)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn settings_retirement_requires_valid_skills_and_successful_archival() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    std::fs::create_dir_all(&service.refine_dir).unwrap();
+    let source = service.refine_dir.join("governance.json");
+    std::fs::write(&source, "{}").unwrap();
+    assert!(
+        super::migration::retire_settings(&service.refine_dir)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(source.exists());
+    service.config().unwrap();
+    std::fs::write(&source, "{\"changed\":true}").unwrap();
+    let archive = service.refine_dir.join("automation/retired-settings");
+    std::fs::remove_dir_all(&archive).unwrap();
+    std::fs::write(&archive, "blocked").unwrap();
+    assert!(super::migration::retire_settings(&service.refine_dir).is_err());
+    assert_eq!(
+        std::fs::read_to_string(&source).unwrap(),
+        "{\"changed\":true}"
+    );
+    std::fs::remove_file(archive).unwrap();
+    std::fs::write(service.refine_dir.join("automation/config.json"), "invalid").unwrap();
+    assert!(super::migration::retire_settings(&service.refine_dir).is_err());
+    assert!(source.exists());
+}
+
+#[test]
+fn deleted_round_invocation_cannot_be_recreated_by_late_skill_output() {
+    use crate::application::work_items::FileWorkItemService;
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    let work = FileWorkItemService::new(&service.refine_dir);
+    work.create_goal_summary("Delete round", Some("GOAL1"))
+        .unwrap();
+    work.append_goal_round_summary("GOAL1", "User", "Original")
+        .unwrap();
+    let config = service.config().unwrap();
+    let invocation = EventInvocation {
+        id: "late-result".into(),
+        event: config.events.values().next().unwrap().clone(),
+        config_revision: config.revision,
+        context: InvocationContext {
+            node_id: "default".into(),
+            target_root: fixture.0.clone(),
+            cwd: fixture.0.clone(),
+            workspace: None,
+            lifecycle: None,
+            provider: "smoke-ai".into(),
+            goal_id: Some("GOAL1".into()),
+            round_idx: Some(0),
+            workflow_revision: None,
+            candidate_commit: None,
+            data: json!({"goal":context::goal_context(&work.show_goal_detail("GOAL1").unwrap())}),
+            metadata: Default::default(),
+        },
+        bindings: Vec::new(),
+        state: InvocationState::Running,
+        results: Default::default(),
+        attempts: Vec::new(),
+        created_at: "2026-09-12T00:00:00Z".into(),
+        completed_at: None,
+        error: None,
+        action_applied: false,
+    };
+    service.save_invocation(&invocation).unwrap();
+    let revision = work.show_goal_detail("GOAL1").unwrap()["workflow_revision"]
+        .as_u64()
+        .unwrap();
+    work.delete_goal_round("GOAL1", 0, revision).unwrap();
+    assert!(!service.invocation_path(&invocation.id).unwrap().exists());
+    let mut late = invocation.clone();
+    late.state = InvocationState::Succeeded;
+    // A user may still hold the Goal lock while a stopped callback drains.
+    // Callback rejection must not wait for that lock and invert lock ordering.
+    let goal_lock = crate::infrastructure::process::supervisor::coordination::acquire_record_lock(
+        &service.refine_dir,
+        "GOAL1",
+    )
+    .unwrap();
+    let worker = service.clone();
+    let (send, receive) = std::sync::mpsc::channel();
+    let callback = std::thread::spawn(move || {
+        send.send(worker.save_invocation(&late).is_err()).unwrap();
+    });
+    let rejected = receive.recv_timeout(std::time::Duration::from_secs(2));
+    drop(goal_lock);
+    callback.join().unwrap();
+    assert_eq!(rejected.unwrap(), true);
+    assert!(!service.invocation_path(&invocation.id).unwrap().exists());
+}
+
+#[test]
+fn default_workflow_skills_include_editable_project_guidance_and_catalog_uses_shared_contract() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    let config = service.config().unwrap();
+    for step in ["plan", "implement", "quality", "governance"] {
+        let prompt = &config.skills[&format!("default-{step}")].prompt;
+        assert!(prompt.contains("{{templates.purpose}}"));
+        assert!(prompt.contains("{{templates.architecture}}"));
+    }
+    assert_eq!(
+        service.catalog()["completion_contract"],
+        crate::application::agent_io::contracts::skill_result::report_contract()
+    );
+}
+
+#[test]
+fn reusable_skills_upgrade_preserves_existing_configuration() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    let mut old = (*service.config().unwrap()).clone();
+    old.schema_version = 2;
+    crate::infrastructure::storage::automation::write_json(
+        &service.refine_dir.join("automation/config.json"),
+        &old,
+    )
+    .unwrap();
+    let upgraded = service.config().unwrap();
+    assert_eq!(upgraded.schema_version, SCHEMA_VERSION);
+    assert_eq!(upgraded.revision, old.revision + 1);
+    assert_eq!(upgraded.skills, old.skills);
+    assert_eq!(upgraded.events, old.events);
+    assert_eq!(*service.config().unwrap(), *upgraded);
+}
+
+#[test]
+fn hub_skill_associations_pin_context_and_protect_product_skill() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    let config = service.config().unwrap();
+    let builtin = service.show_skill(super::hub_skill::ID).unwrap();
+    assert_eq!(builtin["item"]["removable"], false);
+    assert!(
+        service
+            .remove("skills", super::hub_skill::ID, config.revision)
+            .is_err()
+    );
+    assert!(
+        service
+            .manual_skill_event(&config, super::hub_skill::ID, "default")
+            .is_ok()
+    );
+    let (prompt, _) = service
+        .terminal_hub_skill_prompt(
+            super::hub_skill::ID,
+            &fixture.0,
+            &json!({"request":"Explain the new Hub Skill"}),
+            Some("refine"),
+        )
+        .unwrap();
+    assert!(prompt.contains("src/surfaces/refine-hub"));
+    assert!(!prompt.contains("{{refine_checkout}}"));
+    assert!(prompt.contains("Explain the new Hub Skill"));
+    assert!(prompt.contains("\"builtin\":true"));
+    service.save("skills", "maintain", json!({"revision":config.revision,"item":{"name":"Maintain","prompt":"Maintain these Hubs: {{hubs}}"},"trigger":{"source":"custom"}})).unwrap();
+    let hub = crate::application::hub::Hub::new(&service.refine_dir, fixture.0.join("runtime"));
+    for id in ["metrics", "activity"] {
+        hub.save_site(id, &json!({"name":id,"skill_id":"maintain"}))
+            .unwrap();
+    }
+    assert!(
+        hub.save_site("bad", &json!({"name":"Bad","skill_id":"absent"}))
+            .is_err()
+    );
+    assert!(
+        hub.save_site(
+            "bad",
+            &json!({"name":"Bad","skill_id":super::hub_skill::ID})
+        )
+        .is_err()
+    );
+    assert_eq!(hub.for_skill("maintain").unwrap().len(), 2);
+    let revision = service.config().unwrap().revision;
+    assert!(service.remove("skills", "maintain", revision).is_err());
+    let run = service
+        .trigger_skill("maintain", &fixture.0, &json!({}))
+        .unwrap();
+    assert_eq!(
+        run.context.data["hubs"]["maintain"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let (prompt, _) = service
+        .terminal_hub_skill_prompt("maintain", &fixture.0, &json!({}), Some("metrics"))
+        .unwrap();
+    assert!(prompt.contains("metrics"));
+    assert!(!prompt.contains("activity"));
+    assert!(!prompt.contains("{{hubs}}"));
+    assert!(
+        service
+            .terminal_hub_skill_prompt("maintain", &fixture.0, &json!({}), Some("refine"))
+            .is_err()
+    );
+    let saved = hub.show("metrics").unwrap();
+    hub.save_site(
+        "metrics",
+        &json!({"name":"Renamed","revision":saved["revision"]}),
+    )
+    .unwrap();
+    assert_eq!(hub.show("metrics").unwrap()["item"]["skill_id"], "maintain");
+    // Associations and content are snapshots; later Hub edits do not rewrite a run.
+    assert!(
+        run.context.data["hubs"]["maintain"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|site| site["name"] == "metrics")
+    );
+    let store = crate::application::templates::TemplateStore::new(Some(&service.refine_dir));
+    store
+        .save("manual-skill", 0, "User controls the complete prompt")
+        .unwrap();
+    let (prompt, _) = service
+        .terminal_hub_skill_prompt("maintain", &fixture.0, &json!({}), Some("metrics"))
+        .unwrap();
+    assert_eq!(prompt, "User controls the complete prompt");
+}
+
+#[test]
+fn existing_installations_receive_product_skill_once_and_keep_edits() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    let store =
+        crate::infrastructure::storage::automation::AutomationStore::new(&service.refine_dir);
+    let first = service.config().unwrap();
+    store
+        .update(first.revision, |config| {
+            config.skills.remove(super::hub_skill::ID);
+            config.events.remove(super::hub_skill::ID);
+            Ok(())
+        })
+        .unwrap();
+    let installed = service.config().unwrap();
+    assert!(installed.skills.contains_key(super::hub_skill::ID));
+    assert_eq!(installed.revision, first.revision + 2);
+    let mut item = service.show_skill(super::hub_skill::ID).unwrap()["item"].clone();
+    item["prompt"] = json!("Our documentation style");
+    service
+        .save(
+            "skills",
+            super::hub_skill::ID,
+            json!({"revision":installed.revision,"item":item}),
+        )
+        .unwrap();
+    let edited = service.config().unwrap();
+    assert_eq!(
+        edited.skills[super::hub_skill::ID].prompt,
+        "Our documentation style"
+    );
+    assert_eq!(service.config().unwrap().revision, edited.revision);
+}

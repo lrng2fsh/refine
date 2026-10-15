@@ -35,6 +35,9 @@ enum ToolBinding {
     /// agent can reach any daemon route, including writes.
     Passthrough,
     SkillTrigger,
+    WorkflowControl,
+    RoundDelete,
+    PlanningCommand,
 }
 
 /// A capability the MCP surface exposes to clients.
@@ -60,6 +63,52 @@ impl McpTool {
     /// arguments are missing or invalid.
     pub fn build_request(&self, arguments: &Value) -> Result<RequestParts, String> {
         match &self.binding {
+            ToolBinding::PlanningCommand => Ok(RequestParts {
+                method: "POST".into(),
+                path: "/planning/commands".into(),
+                body: Some(arguments.clone()),
+            }),
+            ToolBinding::RoundDelete => {
+                let id = arguments["goal_id"]
+                    .as_str()
+                    .filter(|id| crate::model::automation::valid_id(id))
+                    .ok_or("valid goal_id is required")?;
+                let index = arguments["round_idx"]
+                    .as_u64()
+                    .ok_or("zero-based round_idx is required")?;
+                let revision = arguments["expected_revision"]
+                    .as_u64()
+                    .ok_or("expected_revision is required")?;
+                Ok(RequestParts {
+                    method: "DELETE".into(),
+                    path: format!("/work/goals/{id}/rounds/{index}"),
+                    body: Some(json!({"expected_revision":revision})),
+                })
+            }
+            ToolBinding::WorkflowControl => {
+                let id = arguments["goal_id"].as_str().ok_or("goal_id is required")?;
+                if id.is_empty()
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                {
+                    return Err("invalid goal_id".into());
+                }
+                let action = arguments["action"].as_str().unwrap_or("move");
+                if !["move", "integrate"].contains(&action) {
+                    return Err("action must be move or integrate".into());
+                }
+                let body = arguments
+                    .get("decision")
+                    .filter(|v| v.is_object())
+                    .ok_or("decision object is required")?
+                    .clone();
+                Ok(RequestParts {
+                    method: "POST".into(),
+                    path: format!("/workflow/goals/{id}/{action}"),
+                    body: Some(body),
+                })
+            }
             ToolBinding::Api {
                 method,
                 path,
@@ -167,6 +216,65 @@ impl McpTool {
 pub fn tool_catalog() -> Vec<McpTool> {
     vec![
         McpTool {
+            name: "refine_planning",
+            description: "Read shared project boards, lanes, Goal cards, routing and durable action results. Every node sees the same project state.",
+            input_schema: empty_schema,
+            binding: ToolBinding::Api {
+                method: "GET",
+                path: "/planning",
+                path_params: &[],
+            },
+        },
+        McpTool {
+            name: "refine_planning_command",
+            description: "Create or edit shared boards/lanes/cards, move or release a Goal card, or migrate Todo Lists. Read revisions first and reuse request_id on retry. Returns an action receipt; pending actions execute on the Goal owner.",
+            input_schema: || {
+                json!({"type":"object","additionalProperties":false,"required":["operation","request_id"],"properties":{
+                    "operation":{"enum":["board.create","board.update","board.archive","board.delete","lane.create","lane.update","lane.reorder","lane.delete","card.create","card.attach","card.update","card.move","card.archive","card.detach","card.delete","card.apply","migrate"]},
+                    "request_id":{"type":"string"},"expected_revision":{"type":"integer","minimum":0},"board_id":{"type":"string"},"lane_id":{"type":"string"},"goal_id":{"type":"string"},"actor":{"type":"string"},"data":{"type":"object","properties":{
+                        "name":{"type":"string"},"description":{"type":"string"},"reporter":{"type":"string"},
+                        "priority":{"type":"string","enum":["low","medium","high"]},
+                        "routing":{"type":["string","null"],"description":"Explicit node ID, auto for least-loaded eligible node, or null to inherit card -> lane -> board."},
+                        "action":{"type":"string","enum":["none","accept_into_backlog","release"]},
+                        "archived":{"type":"boolean"},"position":{"type":"number","description":"Card ordering value, or a zero-based lane index for lane.update (saved atomically with other lane settings)."},
+                        "expected_goal_revision":{"type":"integer","minimum":0,"description":"Required when card.update edits Goal metadata or card.delete deletes a Draft Goal."},
+                        "lane_ids":{"type":"array","items":{"type":"string"},"description":"Complete lane order for lane.reorder."}
+                    }}
+                }})
+            },
+            binding: ToolBinding::PlanningCommand,
+        },
+        McpTool {
+            name: "refine_planning_action",
+            description: "Inspect a Project Planning action and its waiting reason, selected node and Skill invocations.",
+            input_schema: || json!({"type":"object","required":["id"],"properties":{"id":{"type":"string"}}}),
+            binding: ToolBinding::Api {
+                method: "GET",
+                path: "/planning/actions/{id}",
+                path_params: &["id"],
+            },
+        },
+        McpTool {
+            name: "refine_cancel_planning_action",
+            description: "Cancel a pending planning action. Completed moves and workflow transitions remain as history.",
+            input_schema: || json!({"type":"object","required":["id"],"properties":{"id":{"type":"string"}}}),
+            binding: ToolBinding::Api {
+                method: "POST",
+                path: "/planning/actions/{id}/cancel",
+                path_params: &["id"],
+            },
+        },
+        McpTool {
+            name: "refine_list_templates",
+            description: "List editable system prompt Templates, defaults, revisions and variables. Use refine_request for edits and previews through /templates.",
+            input_schema: empty_schema,
+            binding: ToolBinding::Api {
+                method: "GET",
+                path: "/templates",
+                path_params: &[],
+            },
+        },
+        McpTool {
             name: "refine_list_skills",
             description: "Read reusable Skill instructions, parameters and configuration revisions.",
             input_schema: empty_schema,
@@ -189,8 +297,52 @@ pub fn tool_catalog() -> Vec<McpTool> {
         McpTool {
             name: "refine_trigger_skill",
             description: "Run one Skill with a Custom trigger on the active node, independently of Goals. Discover required inputs at /skills/{skill_id}/inputs. Reuse request_id to retry transport without duplicating work.",
-            input_schema: || json!({"type":"object","properties":{"skill_id":{"type":"string"},"node_id":{"type":"string"},"request_id":{"type":"string"},"parameters":{"type":"object"}},"required":["skill_id"],"additionalProperties":false}),
+            input_schema: || json!({"type":"object","properties":{"skill_id":{"type":"string"},"hub_id":{"type":"string","description":"Limit the run to one associated Hub."},"node_id":{"type":"string"},"request_id":{"type":"string"},"parameters":{"type":"object"}},"required":["skill_id"],"additionalProperties":false}),
             binding: ToolBinding::SkillTrigger,
+        },
+        McpTool {
+            name: "refine_workflow_control",
+            description: "Move or explicitly integrate a Goal through shared outcome controls. Read the current workflow_revision first. No Skill is required; forced actions retain override evidence.",
+            input_schema: || json!({"type":"object","properties":{"goal_id":{"type":"string"},"action":{"enum":["move","integrate"]},"decision":{"type":"object","properties":{"to":{"type":"string"},"reason":{"type":"string"},"expected_revision":{"type":"integer"},"request_id":{"type":"string"},"force":{"type":"boolean"},"context":{"type":"string"},"actor":{"type":"string"},"invocation_id":{"type":"string"}},"required":["to","reason","expected_revision","request_id"]}},"required":["goal_id","decision"]}),
+            binding: ToolBinding::WorkflowControl,
+        },
+        McpTool {
+            name: "refine_delete_round",
+            description: "Explicitly delete a Goal Round and all its records, stop current agents, and park the Goal in Backlog. Read the Goal revision first. round_idx is zero-based; use workflow control to resubmit the remaining Round.",
+            input_schema: || json!({"type":"object","properties":{"goal_id":{"type":"string"},"round_idx":{"type":"integer","minimum":0},"expected_revision":{"type":"integer","minimum":0}},"required":["goal_id","round_idx","expected_revision"]}),
+            binding: ToolBinding::RoundDelete,
+        },
+        McpTool {
+            name: "refine_hub_metrics",
+            description: "Read the saved Metrics Hub snapshot for the target app, including day, week, month, quarter, and year views.",
+            input_schema: empty_schema,
+            binding: ToolBinding::Api {
+                method: "GET",
+                path: "/api/hub/metrics",
+                path_params: &[],
+            },
+        },
+        McpTool {
+            name: "refine_refresh_hub_metrics",
+            description: "Calculate and save Metrics Hub aggregates from retained Goal records. Does not launch an agent or change Goals.",
+            input_schema: empty_schema,
+            binding: ToolBinding::BodyApi {
+                method: "POST",
+                path: "/api/hub/metrics/refresh",
+                required: &[],
+                optional: &[],
+                fixed: &[],
+            },
+        },
+        McpTool {
+            name: "refine_hub_sites",
+            description: "List Hub sites. Manage assets, collections, records, indexes, queries and publication through /api/hub routes with refine_request.",
+            input_schema: empty_schema,
+            binding: ToolBinding::Api {
+                method: "GET",
+                path: "/api/hub/sites",
+                path_params: &[],
+            },
         },
         McpTool {
             name: "refine_system_status",

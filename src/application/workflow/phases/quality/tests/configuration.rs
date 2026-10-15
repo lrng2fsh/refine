@@ -25,22 +25,6 @@ fn quality_settings_persist_and_report_configured_state() {
 }
 
 #[test]
-fn quality_evaluation_fails_when_agent_omits_a_configured_test() {
-    let result = parse_quality_provider_output(
-        "GOAL1",
-        &["First outcome".to_string(), "Second outcome".to_string()],
-        r#"{"ok":true,"summary":"Done","results":[{"test":"First outcome","status":"passed","evidence":"Observed","command":""}]}"#,
-    )
-    .unwrap();
-
-    assert!(!result.ok);
-    assert_eq!(result.results.len(), 2);
-    assert_eq!(result.results[1].test, "Second outcome");
-    assert_eq!(result.results[1].status, "failed");
-    assert!(result.results[1].evidence.contains("omitted"));
-}
-
-#[test]
 fn quality_migrates_enabled_legacy_commands_without_a_silent_noop() {
     let temp_root = unique_temp_dir("quality-legacy-migration");
     let refine_dir = temp_root.join("state");

@@ -66,6 +66,11 @@ impl FileQualityService {
     }
 
     fn read_stored_settings(&self) -> RefineResult<StoredQualitySettings> {
+        if self.refine_dir.join("automation/config.json").exists() {
+            return Err(RefineError::InvalidInput(
+                "Quality configuration is managed through Skills".into(),
+            ));
+        }
         let path = self.settings_path();
         let existed = path.exists();
         let mut stored = if existed {
@@ -99,7 +104,12 @@ impl FileQualityService {
                 // Stage imported state without advancing the migration marker. If Node cleanup or
                 // the final write fails, retry sees both the staged commands and remaining legacy
                 // state, so enforced Quality cannot disappear between attempts.
-                self.write_stored_settings(&stored)?;
+                // Fresh projects have no standalone Quality configuration to migrate.
+                // Do not manufacture one merely to archive and retire it into durable state.
+                let persist = existed || !stored.legacy_commands.is_empty();
+                if persist {
+                    self.write_stored_settings(&stored)?;
+                }
                 #[cfg(test)]
                 if self.migration_failure_after_stage {
                     return Err(RefineError::Io(
@@ -115,7 +125,11 @@ impl FileQualityService {
                     node_service.save_registry(&registry)?;
                 }
                 stored.migration_version = SETTINGS_MIGRATION_VERSION;
-                self.write_stored_settings(&stored)
+                if persist {
+                    self.write_stored_settings(&stored)
+                } else {
+                    Ok(())
+                }
             })?;
         }
         Ok(stored.normalized())
@@ -140,49 +154,6 @@ impl FileQualityService {
 
     fn settings_path(&self) -> PathBuf {
         self.refine_dir.join(SETTINGS_FILE)
-    }
-
-    pub(crate) fn run_observed_command(
-        &self,
-        command: &str,
-        cwd: &Path,
-        metadata: Map<String, Value>,
-    ) -> RefineResult<ObservedExecution> {
-        let runtime_root = self.runtime_root.clone().ok_or_else(|| {
-            RefineError::Degraded("runtime root is required for Quality".to_string())
-        })?;
-        let security = FileSecurityService::from_project_settings(&runtime_root, &self.refine_dir)?;
-        security.authorize_host_command("quality", command)?;
-        let (shell, args) = shell_program_args(command);
-        let observed_shell = shell.clone();
-        crate::infrastructure::git::worktrees::validate_workspace_launch(&metadata, Some(cwd))?;
-        let output = FileProcessSupervisor::with_allowed_commands(
-            runtime_root,
-            security.allowed_commands.iter().cloned(),
-        )
-        .run_to_completion(ManagedProcessSpec {
-            owner: ProcessOwner::Quality,
-            command: shell,
-            args,
-            cwd: Some(cwd.display().to_string()),
-            env: Vec::new(),
-            stdin: None,
-            limits: Some(ProcessResourceLimits {
-                kill_on_parent_exit: true,
-                ..Default::default()
-            }),
-            authorization_command: Some(command.to_string()),
-            sensitive: false,
-            metadata,
-        })?;
-        output.require_complete_capture()?;
-        Ok(ObservedExecution {
-            process_id: output.process.id,
-            shell: observed_shell,
-            exit_code: output.process.exit_code,
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
     }
 
     pub(crate) fn ensure_operation_active(
@@ -225,9 +196,10 @@ impl FileQualityService {
                 FileWorkItemService::for_node(&self.refine_dir, &request.node_id)
                     .verify_workflow_attempt(
                         &request.owner_id,
-                        WorkflowAttemptAuthority {
+                        WorkflowStepAuthority {
                             round_idx: request.round_idx,
                             workflow_revision,
+                            generation: request.process_metadata.get("workflow_step_generation").and_then(Value::as_u64).ok_or_else(|| RefineError::Degraded("Quality is missing its authorized step occurrence; inspect retained evidence".into()))?,
                         },
                         workflow_state,
                         &request.node_id,

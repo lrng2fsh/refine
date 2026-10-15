@@ -12,6 +12,8 @@ async function renderGoalDetail(r) {
 
 let _goalModalRoot = null;
 let _goalRoundFormDraft = null;
+const _goalRoundTabs = new Map();
+const GOAL_AUTOMATED_STEPS = ["plan", "implement", "quality", "governance"];
 // The goal and workflow most recently drawn. The detail controls are bound once
 // and outlive the render that bound them, so they resolve the goal and its
 // available transitions through here instead of closing over one render's values
@@ -99,6 +101,11 @@ async function loadGoalDetail(goalId) {
     const { goal } = await api("GET", "/api/goals/" + goalId);
     if (!isNodeContextGenerationCurrent(nodeGeneration)
         || state.currentGoal !== goalId || goal?.id !== goalId) return;
+    if (goal.status === "draft") {
+      closeGoalDetailModal();
+      location.hash = `#/planning?card=${encodeURIComponent(goal.id)}`;
+      return;
+    }
     drawGoalDetail(goal);
   } catch (e) {
     if (!isNodeContextGenerationCurrent(nodeGeneration) || state.currentGoal !== goalId) return;
@@ -122,6 +129,7 @@ async function loadGoalDetail(goalId) {
 // from done). Failed Goals normally go back to todo and rerun; candidate-stage
 // failures use the latest workflow transition to requeue the isolated branch.
 const GOAL_WORKFLOW = {
+  draft: { forward: { label: "Backlog →", next: "backlog" } },
   backlog:      { forward: { label: "Todo →",     next: "todo"   } },
   todo:         { back:    { label: "← Backlog",  next: "backlog" } },
   // plan / implement / quality / governance: automation owns these states.
@@ -292,18 +300,16 @@ function drawGoalDetail(goal) {
   });
   const rounds = goal.rounds || [];
   const latest = rounds[rounds.length - 1] || null;
-  const failureBanner = computeFailureBanner(goal, latest);
-  const governanceBanner = computeGovernanceBanner(goal, latest);
   const featureBlockingNotice = computeFeatureBlockingNotice(goal);
   const nodeDisplayName = goal.node_display_name || goal.node_id || "Unknown";
   const nodeOwnerTitle = goal.node_id
     ? `Node owner: ${nodeDisplayName} (${goal.node_id})`
     : `Node owner: ${nodeDisplayName}`;
 
-  const isLatestEditable = (goal.status === "backlog" ||
-                            goal.status === "todo");
-  const canSubmitNewRound = (goal.status === "review" ||
-                             goal.status === "failed");
+  const canEditRequest = ["draft", "backlog", "todo"].includes(goal.status);
+  const isLatestEditable = !!latest && canEditRequest;
+  const canSubmitNewRound = goal.status === "review" || goal.status === "failed" ||
+    (!latest && canEditRequest);
   const hasPreservedDraft = hasPreservedRoundFormDraft(goal.id);
   const cancelEnabled = !["done", "cancelled"].includes(goal.status);
   // During implementation this attaches to the workflow-owned Goal Agent.
@@ -315,15 +321,17 @@ function drawGoalDetail(goal) {
     ? "Attach to the running Goal Agent"
     : "Open a diagnostic Agent with this Goal's recorded context";
 
-  // Dynamic workflow buttons: each state shows the previous/next state
-  // it can move to as back / forward buttons. The user-driven workflow
-  // skips system-owned statuses. Forward from review goes through the
-  // `approve` endpoint. Review rejection uses the new-round form rather than
-  // an unversioned status update.
+  // Review approval remains a separate integration action. Explicit step
+  // assignments use the menu below.
+  const primaryStep = {
+    draft: "backlog",
+    backlog: "todo",
+    review: "done",
+    failed: "todo",
+    cancelled: "failed",
+  }[goal.status] || "todo";
   const workflow = workflowForGoal(goal, latest);
-  const backBtn = workflow.back ? `
-    <button id="btn-state-back" data-testid="goal-state-back">${htmlEscape(workflow.back.label)}</button>
-  ` : "";
+  const planningLink = goal.planning ? `<a href="#/planning?board=${encodeURIComponent(goal.planning.board_id)}">Open on project board</a>` : "";
   const forwardBtn = workflow.forward ? `
     <button id="btn-state-forward" data-testid="goal-state-forward">${htmlEscape(workflow.forward.label)}</button>
   ` : "";
@@ -333,6 +341,7 @@ function drawGoalDetail(goal) {
   // `<details>` open state is local UI state the server knows nothing about, so
   // it has to be rendered back or the next refresh closes it under the user.
   const actionMenuOpen = !!container.querySelector("#goal-action-menu")?.open;
+  const stepMenuOpen = !!container.querySelector(".goal-step-menu")?.open;
   const noteComposerOpen = !!container.querySelector(".note-composer")?.open;
   _goalDetailView = { goal, workflow };
   recordFeatureBlockingNotice(goal, featureBlockingNotice);
@@ -344,16 +353,27 @@ function drawGoalDetail(goal) {
         <span class="priority-pill priority-${goal.priority || "low"}" data-testid="goal-priority-pill">priority: ${goal.priority || "low"}</span>
       </div>
       <div class="actions" style="margin-bottom:10px" data-testid="goal-workflow-actions">
-        ${backBtn}
-        ${forwardBtn}
         <div class="goal-action-group">
-          <button class="goal-action-primary" id="btn-open-agent" data-testid="goal-open-agent"
+          <button type="button" class="goal-action-primary" data-goal-step="${primaryStep}" data-testid="goal-step-primary">${workflowStatusLabel(primaryStep)}</button>
+          <details class="nav-menu goal-action-menu goal-step-menu" data-testid="goal-step-menu"${stepMenuOpen ? " open" : ""}>
+            <summary class="btn goal-action-more" aria-label="Set workflow step" data-testid="goal-step-toggle"></summary>
+            <div class="nav-menu-panel goal-action-panel">
+            ${["backlog", "todo", "plan", "implement", "quality", "governance", "review", "done", "failed", "cancelled"].map(step =>
+              `<button type="button" class="nav-menu-item" data-goal-step="${step}" data-testid="goal-step-${step}">${workflowStatusLabel(step)}</button>`).join("")}
+            <p class="muted small">Moves stop active agents. Done changes status without merging code.</p>
+            </div>
+          </details>
+        </div>
+        ${planningLink}${goal.status === "review" ? forwardBtn : ""}
+        <button class="secondary" type="button" id="btn-watch-logs" data-testid="goal-action-watch-logs">View Logs</button>
+        <div class="goal-action-group">
+          <button class="goal-action-primary secondary" id="btn-open-agent" data-testid="goal-open-agent"
                   ${canOpenAgent ? "" : "disabled"}
                   title="${htmlEscape(openAgentTitle)}">${eventAgents ? "Skill runs" : "Open Agent"}</button>
           <details class="nav-menu goal-action-menu" id="goal-action-menu"${actionMenuOpen ? " open" : ""}>
-            <summary class="btn goal-action-more" aria-label="More Goal actions" data-testid="goal-action-menu-toggle"></summary>
+            <summary class="btn goal-action-more secondary" aria-label="More Goal actions" data-testid="goal-action-menu-toggle"></summary>
             <div class="nav-menu-panel goal-action-panel">
-              <button class="nav-menu-item" type="button" id="btn-watch-logs" data-testid="goal-action-watch-logs">Watch Logs</button>
+
               <button class="nav-menu-item" type="button" id="btn-reporter" data-testid="goal-action-reporter">Reporter</button>
               <button class="nav-menu-item" type="button" id="btn-assignee" data-testid="goal-action-assignee">Assignee</button>
               <button class="nav-menu-item" type="button" id="btn-rename" data-testid="goal-action-rename">Rename</button>
@@ -374,25 +394,7 @@ function drawGoalDetail(goal) {
         ${goal.branch_name ? ` · branch <code>${goal.branch_name}</code>` : ""}
       </div>
       ${renderGoalFeatureAssociation(goal)}
-
-      ${failureBanner ? `
-        <div class="banner ${failureBanner.severity}" data-testid="goal-failure-banner">
-          <span class="banner-msg" data-testid="goal-failure-banner-message">${htmlEscape(failureBanner.message)}</span>
-          <span class="banner-actions">${failureBanner.actionsHtml}</span>
-        </div>` : ""}
-      ${governanceBanner ? `
-        <div class="banner ${governanceBanner.severity}" data-testid="goal-governance-banner">
-          <span class="banner-msg" data-testid="goal-governance-banner-message">${htmlEscape(governanceBanner.message)}</span>
-        </div>` : ""}
-      ${featureBlockingNotice ? `
-        <div class="banner ${featureBlockingNotice.severity}" data-testid="goal-feature-blocking-banner">
-          <span class="banner-msg" data-testid="goal-feature-blocking-banner-message">${htmlEscape(featureBlockingNotice.message)}</span>
-        </div>` : ""}
-
-      ${latest ? renderFailureSummary(goal, latest) : ""}
-      ${latest ? renderGovernanceSummary(latest) : ""}
-      ${latest ? renderQualitySummary(latest) : ""}
-
+      ${goal.description ? `<section data-testid="goal-description"><h3>Description</h3><p style="white-space:pre-wrap;overflow-wrap:anywhere">${htmlEscape(goal.description)}</p></section>` : ""}
       <h3>Rounds (${rounds.length})</h3>
       ${rounds.length === 0 ? `<p class="muted">No rounds yet.</p>` :
         rounds.map((rnd, idx) => renderRound(
@@ -400,9 +402,10 @@ function drawGoalDetail(goal) {
           idx === rounds.length - 1,
           prevRoundOpen,
           prevPlanHistoryOpen,
+          goal,
         )).join("")}
 
-      ${(isLatestEditable || hasPreservedDraft) ? `
+      ${(isLatestEditable || (latest && hasPreservedDraft)) ? `
         <div class="card" style="margin-top:14px">
           <h3>Edit latest round</h3>
           ${renderRoundForm("edit", latest, {
@@ -414,8 +417,8 @@ function drawGoalDetail(goal) {
 
       ${canSubmitNewRound ? `
         <div class="card" style="margin-top:14px">
-          <h3>${goal.status === "failed" ? "Submit recovery round" : "Submit follow-up round"}</h3>
-          ${renderRoundForm("submit", null)}
+          <h3>${!latest ? "Add first round" : goal.status === "failed" ? "Submit recovery round" : "Submit follow-up round"}</h3>
+          ${renderRoundForm("submit", null, { draft: !latest ? _goalRoundFormDraft : null })}
         </div>` : ""}
 
       <details class="card notes-card" data-goal-id="${goal.id}" data-testid="goal-notes" style="margin-top:14px" ${notesOpen ? "open" : ""}>
@@ -448,9 +451,68 @@ function drawGoalDetail(goal) {
 }
 
 function bindGoalDetailControls() {
+  document.querySelectorAll('[data-round-panel="prompts"]:not([hidden]) [data-goal-prompts]').forEach(root => loadGoalPrompts(root));
+  $$(".round-tabs [role=tab]").forEach(tab => {
+    const select = (target, focus = false) => {
+      const body = target.closest(".round-body");
+      _goalRoundTabs.set(body.dataset.roundTabKey, target.dataset.roundTab);
+      body.querySelectorAll(".round-tabs > [role=tab]").forEach(button => {
+        const active = button === target;
+        button.setAttribute("aria-selected", String(active));
+        button.tabIndex = active ? 0 : -1;
+      });
+      body.querySelectorAll("[data-round-panel]").forEach(panel => {
+        panel.hidden = panel.dataset.roundPanel !== target.dataset.roundTab;
+      });
+      if (target.dataset.roundTab === "prompts") loadGoalPrompts(body.querySelector("[data-goal-prompts]"));
+      if (focus) target.focus();
+    };
+    bindOnce(tab, "click", () => select(tab));
+    bindOnce(tab, "keydown", event => {
+      const tabs = Array.from(tab.parentElement.querySelectorAll("[role=tab]"));
+      const index = tabs.indexOf(tab);
+      const next = event.key === "ArrowRight" ? (index + 1) % tabs.length
+        : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length
+        : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
+      if (next === null) return;
+      event.preventDefault();
+      select(tabs[next], true);
+    });
+  });
   const liveGoal = () => _goalDetailView.goal || {};
   const liveWorkflow = () => _goalDetailView.workflow || {};
 
+  $$("[data-goal-step]").forEach(el => bindOnce(el, "click", async () => {
+    const goal = liveGoal();
+    const step = el.dataset.goalStep;
+    const menu = el.closest(".goal-action-group")?.querySelector("details");
+    if (menu) menu.open = false;
+    try {
+      await api("POST", `/api/workflow/goals/${encodeURIComponent(goal.id)}/move`, {
+        to: step, reason: "User selected workflow step", force: true,
+        expected_revision: goal.workflow_revision || 0, request_id: hubId(), actor: state.lastReporter || "operator",
+      });
+      toast(`Moved to ${workflowStatusLabel(step)}`, "info");
+      await loadGoalDetail(goal.id);
+    } catch (error) { await showActionError(error); }
+  }));
+  $$("[data-round-delete]").forEach(el => bindOnce(el, "click", async event => {
+    event.preventDefault();
+    event.stopPropagation();
+    const goal = liveGoal();
+    const index = Number(el.dataset.roundDelete);
+    const confirmed = await modalConfirm(
+      `Delete Round ${index + 1} and all of its records? Current agent work will stop and the Goal will return to Backlog. You can then select Todo or another workflow step for the remaining Round.`,
+      { title: "Delete Round", okLabel: "Delete Round", danger: true },
+    );
+    if (!confirmed) return;
+    try {
+      await api("DELETE", `/api/goals/${encodeURIComponent(goal.id)}/rounds/${index}`, { expected_revision: goal.workflow_revision || 0 });
+      _goalRoundFormDraft = null;
+      toast("Round deleted", "info");
+      await loadGoalDetail(goal.id);
+    } catch (error) { await showActionError(error); }
+  }));
   bindOnce($("#btn-open-agent"), "click", () => {
     const goal = liveGoal();
     if (goal.rounds?.at(-1)?.event_configuration && ["plan", "implement", "quality", "governance"].includes(goal.status)) {
@@ -458,7 +520,7 @@ function bindGoalDetailControls() {
     } else { openAgentDock({ goalId: goal.id, goalStatus: goal.status }); }
   });
   bindOnce($("#btn-watch-logs"), "click", () => {
-    closeGoalActionMenu();
+    closeGoalDetailModal({ navigateAway: true });
     openGoalLogTail({ goalId: liveGoal().id, goalName: liveGoal().name });
   });
   // Workflow back / forward buttons. Forward from `review` calls the
@@ -829,6 +891,17 @@ function renderImplementationChecklist(items, implementation) {
 
 function renderImplementationPlan(rnd, idx, prevPlanHistoryOpen = {}) {
   const plan = rnd?.implementation_plan;
+  const recordedPlans = roundStepEvents(rnd, "plan").map(record => record.event)
+    .sort((a, b) => (b.generation || 0) - (a.generation || 0))
+    .map(event => Object.values(event.results || {}).filter(result =>
+      result.role === "plan" && result.outcome === "success" && result.summary))
+    .find(results => results.length);
+  if (recordedPlans) {
+    return `<section class="implementation-plan" data-testid="goal-implementation-plan" aria-labelledby="implementation-plan-title-${idx}">
+      <h4 id="implementation-plan-title-${idx}">Implementation Plan</h4>
+      ${recordedPlans.map(result => `<div class="round-plan-text" data-testid="goal-implementation-plan-summary">${htmlEscape(result.summary)}</div>`).join("")}
+    </section>`;
+  }
   if (!plan) return "";
   const finalPlan = plan.final_plan?.result;
   const proposal = plan.proposal?.result;
@@ -837,7 +910,7 @@ function renderImplementationPlan(rnd, idx, prevPlanHistoryOpen = {}) {
   const phase = plan.phase || "unknown";
   const planState = plan.state || "in_progress";
   const phaseLabel = planState === "in_progress" ? phase : planState;
-  return `<section class="card implementation-plan" data-testid="goal-implementation-plan" aria-labelledby="implementation-plan-title-${idx}" style="margin-top:12px">
+  return `<section class="implementation-plan" data-testid="goal-implementation-plan" aria-labelledby="implementation-plan-title-${idx}" style="margin-top:12px">
     <div class="row" style="align-items:center;gap:8px">
       <h4 id="implementation-plan-title-${idx}" style="margin:0">Implementation Plan</h4>
       <span class="status-pill ${planState === "completed" ? "done" : planState === "failed" ? "failed" : "plan"}" data-testid="goal-implementation-plan-phase">${htmlEscape(phaseLabel)}</span>
@@ -854,103 +927,187 @@ function renderImplementationPlan(rnd, idx, prevPlanHistoryOpen = {}) {
   </section>`;
 }
 
-function renderRound(rnd, idx, isLatest, prevRoundOpen = {}, prevPlanHistoryOpen = {}) {
+function renderRound(rnd, idx, isLatest, prevRoundOpen = {}, prevPlanHistoryOpen = {}, goal = {}) {
   // Preserve the user's open/closed choice across re-renders. New rounds
   // (no prior entry in the snapshot) default to "open on latest" — the
   // historical behavior.
   const key = String(idx);
   const roundOpen = key in prevRoundOpen ? prevRoundOpen[key] : isLatest;
+  const plan = renderImplementationPlan(rnd, idx, prevPlanHistoryOpen);
+  const tabKey = JSON.stringify([goal.id || "", goal.round_edit_revision || 0, rnd.created || "", idx]);
+  const savedTab = _goalRoundTabs.get(tabKey);
+  const selected = savedTab === "report" ? "implement" : savedTab || (plan ? "plan" : "request");
+  const panels = {
+    request: `<div class="round-request" data-testid="goal-round-detail-prompt">${htmlEscape(rnd.prompt || "")}</div>`,
+    ...Object.fromEntries(GOAL_AUTOMATED_STEPS.map(step => [step,
+      renderRoundStep(rnd, idx, step, goal, prevPlanHistoryOpen)])),
+    failed: renderRoundFailures(goal, rnd, isLatest),
+    prompts: renderGoalPrompts(goal.id, idx),
+    activity: renderRoundHistory(goal, rnd, idx, isLatest),
+  };
   return `
     <details class="round" data-round-idx="${idx}" data-testid="goal-round" ${roundOpen ? "open" : ""}>
       <summary class="round-head" data-testid="goal-round-summary">
         <strong>Round ${idx + 1}</strong>
-        ${isLatest ? `<span class="status-pill review">latest</span>` : ""}
-        ${isLatest && rnd.rule_state && rnd.rule_state !== "unclassified"
-          ? `<span class="status-pill ${reviewStateClass(rnd.rule_state)}">governance: ${htmlEscape(rnd.rule_state)}</span>`
-          : ""}
-        ${isLatest && rnd.quality_state && rnd.quality_state !== "unclassified"
-          ? `<span class="status-pill ${reviewStateClass(rnd.quality_state, "quality")}">quality: ${htmlEscape(rnd.quality_state)}</span>`
-          : ""}
+        <span class="muted small" data-testid="goal-round-state">${htmlEscape(isLatest ? (goal.status || "latest") : rnd.failure_message ? "failed" : "previous")}${isLatest ? " · latest" : ""}</span>
         <span class="spacer"></span>
         <span class="muted small">
           reporter ${htmlEscape(rnd.reporter || "(none)")}
           · assignee ${htmlEscape(rnd.assignee || "(none)")}
           · ${fmtTime(rnd.created)}
         </span>
+        <button type="button" class="secondary round-delete" data-round-delete="${idx}" data-testid="goal-round-delete" aria-label="Delete Round ${idx + 1}" title="Delete Round ${idx + 1}">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M6 6l1 15h10l1-15M10 11v6M14 11v6"/></svg>
+        </button>
       </summary>
-      <div class="round-body">
-        <dl class="pair">
-          <dt>prompt</dt><dd data-testid="goal-round-detail-prompt">${htmlEscape(rnd.prompt || "").replace(/\n/g, "<br>")}</dd>
-        </dl>
-        ${renderImplementationPlan(rnd, idx, prevPlanHistoryOpen)}
-        ${rnd.implementation_report ? `
-          <div class="card implementation-report" data-testid="goal-implementation-report" style="margin-top:12px">
-            <div class="row" style="align-items:center;gap:8px">
-              <h4 style="margin:0">Implementation report</h4>
-              <span class="muted small">what changed, why, and verification</span>
-              <span class="spacer"></span>
-              ${rnd.implementation_reported_at
-                ? `<span class="muted small" data-testid="goal-implementation-reported-at">${fmtTime(rnd.implementation_reported_at)}</span>`
-                : ""}
-            </div>
-            <div data-testid="goal-implementation-report-body" style="margin-top:8px;white-space:pre-wrap">${htmlEscape(rnd.implementation_report)}</div>
-          </div>` : ""}
+      <div class="round-body" data-round-tab-key="${htmlEscape(tabKey)}">
+        <div class="round-tabs" role="tablist" aria-label="Round ${idx + 1} content">
+          ${Object.keys(panels).map(name => `<button type="button" role="tab" id="round-${idx}-tab-${name}" data-round-tab="${name}" aria-controls="round-${idx}-panel-${name}" aria-selected="${name === selected}" tabindex="${name === selected ? 0 : -1}">${name[0].toUpperCase() + name.slice(1)}</button>`).join("")}
+        </div>
+        ${Object.entries(panels).map(([name, content]) => `<div class="round-tab-panel" role="tabpanel" id="round-${idx}-panel-${name}" data-round-panel="${name}" aria-labelledby="round-${idx}-tab-${name}" tabindex="0"${name === selected ? "" : " hidden"}>${content}</div>`).join("")}
       </div>
     </details>
   `;
 }
 
-// A Goal can fail after every gate it reached passed — an integration that
-// found the branch tip moved, for one — so the reason gets its own card above
-// the gate summaries rather than being inferred from them.
-function goalFailureEvidence(goal, round) {
-  if (!round) return null;
-  const stateBoundary = latestStateBoundary(round);
-  // Failure transitions are normally logged immediately after their cause, so
-  // a strict post-transition boundary would discard the error users need.
-  // The latest error is already scoped to this round by the backend.
-  const errorLog = goal?.status === "failed"
-    ? round.latest_error_log || null
-    : currentRoundLog(round.latest_error_log, stateBoundary);
-  const workflowLog = currentRoundLog(round.latest_workflow_log, stateBoundary);
-  const fallbackLog = currentRoundLog(
-    round.latest_log?.severity && round.latest_log.severity !== "info"
-      ? round.latest_log
-      : null,
-    stateBoundary,
-  );
-  const log = errorLog || workflowLog || fallbackLog;
-  const message = round.failure_message || log?.message || "";
-  if (!message || (goal?.status !== "failed" && !round.failure_message)) return null;
-  return {
-    category: round.failure_category || log?.category || "workflow",
-    message,
-    at: round.failure_at || log?.datetime || "",
-    log_details: log?.details || null,
-  };
+// The recorded Event source identifies the workflow step, independently of the
+// Skill role (for example, Quality can run while Governance refreshes a candidate).
+function goalWorkflowStep(value) {
+  const text = String(value || "").toLowerCase();
+  const step = text.match(/^workflow\.([a-z]+)\./)?.[1] || text;
+  return GOAL_AUTOMATED_STEPS.includes(step) ? step : null;
 }
 
-function renderFailureSummary(goal, round) {
-  const failure = goalFailureEvidence(goal, round);
-  if (!failure) {
-    return "";
+function roundEvidenceSources(round) {
+  const sources = [];
+  const visit = (record, history = "") => {
+    if (!record || typeof record !== "object") return;
+    sources.push({ record, history });
+    if (record.workflow_candidate_refresh?.previous_gate_evidence) {
+      sources.push({ record: record.workflow_candidate_refresh.previous_gate_evidence,
+        history: "Before candidate refresh" });
+    }
+    // Retry snapshots belong to this authored Round. They remain historical
+    // artifacts, never a substitute for the current candidate's verdict.
+    (record.prior_attempts || []).slice().reverse().forEach(previous => visit(previous, "Previous execution"));
+  };
+  visit(round);
+  return sources;
+}
+
+function roundStepEvents(round, step) {
+  const seen = new Set();
+  const records = [];
+  for (const { record, history } of roundEvidenceSources(round)) {
+    for (const [id, event] of Object.entries(record.event_results || {})) {
+      const key = JSON.stringify([id, event.generation]);
+      if (seen.has(key)) continue;
+      // Older receipts recorded only Skill roles. Use those only when the
+      // workflow source is absent; an explicit source always takes precedence.
+      const results = Object.fromEntries(Object.entries(event.results || {})
+        .filter(([, result]) => result.role === step));
+      if (event.source ? goalWorkflowStep(event.source) !== step : !Object.keys(results).length) continue;
+      seen.add(key);
+      records.push({ id, event: event.source ? event : { ...event, results }, history });
+    }
   }
-  const details = diagnosticDetailsText({
-    category: failure.category,
-    message: failure.message,
-    occurred_at: failure.at || null,
-    evidence: failure.log_details,
-  });
-  return `
-    <div class="card" style="margin:0 0 14px" data-testid="goal-failure-summary">
-      <h3>Failure</h3>
-      <div class="row" style="gap:8px;flex-wrap:wrap">
-        ${failure.category ? `<span class="status-pill failed" data-testid="goal-failure-category">${htmlEscape(failure.category)}</span>` : ""}
-        ${failure.at ? `<span class="muted small" data-testid="goal-failure-at">${fmtTime(failure.at)}</span>` : ""}
-      </div>
-      <p style="margin-bottom:6px" data-testid="goal-failure-message">${htmlEscape(failure.message)}</p>
-      <details data-testid="goal-failure-details"><summary>Details</summary><pre>${htmlEscape(details)}</pre></details>
-    </div>`;
+  return records.sort((a, b) => (b.event.generation || 0) - (a.event.generation || 0));
+}
+
+function renderRoundStepArtifacts(round, idx, step, prevPlanHistoryOpen = {}) {
+  const label = step[0].toUpperCase() + step.slice(1);
+  const events = roundStepEvents(round, step);
+  const legacy = roundEvidenceSources(round).find(({ record }) =>
+    step === "plan" ? record.implementation_plan
+      : step === "implement" ? record.implementation_report
+      : step === "quality" ? record.quality_state && record.quality_state !== "unclassified"
+      : renderGovernanceSummary(record));
+  let output = events.map(({ event, history }) => `<section class="round-step-artifact" data-testid="goal-step-artifact">
+    <h4>${htmlEscape(label)} results${history ? ` · ${htmlEscape(history)}` : ""}</h4>
+    <p class="muted small">${htmlEscape(event.source || "Legacy Skill results")} · ${htmlEscape(event.state || "recorded")}${event.candidate_commit ? ` · candidate <code>${htmlEscape(event.candidate_commit)}</code>` : ""}</p>
+    ${Object.values(event.results || {}).map(result => `<div class="round-step-result">
+      <p class="muted small">${htmlEscape(result.binding_id || result.role || "Skill")} · ${htmlEscape(result.outcome || "recorded")}</p>
+      ${result.summary ? `<div class="round-report-text"${step === "plan" ? ' data-testid="goal-implementation-plan-summary"' : ""}>${htmlEscape(result.summary)}</div>` : ""}
+      ${result.evidence?.length ? `<h4>Evidence</h4><ul>${result.evidence.map(item => `<li>${htmlEscape(diagnosticDetailsText(item))}</li>`).join("")}</ul>` : ""}
+      ${result.artifacts && Object.keys(result.artifacts).length ? `<h4>Artifacts</h4><pre class="round-evidence">${htmlEscape(diagnosticDetailsText(result.artifacts))}</pre>` : ""}
+    </div>`).join("")}
+  </section>`).join("");
+  // Legacy reports are still useful for rounds predating Skill result records.
+  if (legacy && (!events.length || !legacy.history)) {
+    const { record, history } = legacy;
+    output = `${history ? `<p class="muted small">${htmlEscape(history)}</p>` : ""}` + (
+      step === "plan" ? renderImplementationPlan({ implementation_plan: record.implementation_plan }, idx, prevPlanHistoryOpen)
+        : step === "implement" ? `<section class="implementation-report" data-testid="goal-implementation-report"><h4>Implementation report</h4>
+          ${record.implementation_reported_at ? `<p class="muted small" data-testid="goal-implementation-reported-at">${fmtTime(record.implementation_reported_at)}</p>` : ""}
+          <div class="round-report-text" data-testid="goal-implementation-report-body">${htmlEscape(record.implementation_report)}</div></section>`
+        : step === "quality" ? renderQualitySummary(record) : renderGovernanceSummary(record)) + output;
+  }
+  return output || `<p class="muted">No ${label} artifacts have been recorded for this Round yet.</p>`;
+}
+
+function roundStepLogs(round, step, controls = []) {
+  let current = null;
+  let intervalKnown = false;
+  const selected = [];
+  const timeline = [
+    ...controls.filter(control => control.at && control.to).map(control => ({ at: control.at, control })),
+    ...(round.logs || []).map(log => ({ at: log.datetime || "", log })),
+  ].sort((a, b) => (Date.parse(a.at) || 0) - (Date.parse(b.at) || 0));
+  for (const entry of timeline) {
+    if (entry.control) {
+      current = goalWorkflowStep(entry.control.to);
+      intervalKnown = true;
+      continue;
+    }
+    const log = entry.log;
+    const details = log.details && typeof log.details === "object" ? log.details : {};
+    const transition = log.category === "state"
+      ? String(log.message || "").match(/^Workflow status changed: ([a-z-]+) -> ([a-z-]+)$/) : null;
+    if (transition) {
+      current = goalWorkflowStep(transition[2]);
+      intervalKnown = true;
+      if (goalWorkflowStep(transition[1]) === step || current === step) selected.push(log);
+      continue;
+    }
+    const explicit = goalWorkflowStep(details.workflow_state) || goalWorkflowStep(details.workflow_step)
+      || goalWorkflowStep(details.source) || goalWorkflowStep(details.status);
+    if (log.category === "workflow" && details.status) {
+      current = goalWorkflowStep(details.status);
+      intervalKnown = true;
+    }
+    const category = goalWorkflowStep(log.category) || (String(log.category || "").startsWith("governance_") ? "governance" : null);
+    if ((explicit || (intervalKnown ? current : category)) === step) selected.push(log);
+  }
+  return selected;
+}
+
+function renderRoundLogEntries(logs, empty = "No log entries recorded for this Round.") {
+  return logs.length ? `<section class="round-log" data-testid="goal-round-log"><h3>Event history</h3>${logs.map(log => `<div class="round-log-entry"><div class="muted small">${htmlEscape(log.datetime || "")} · ${htmlEscape(log.severity || "info")}${log.category ? ` · ${htmlEscape(log.category)}` : ""}</div><div>${htmlEscape(log.message || "")}</div>${log.details ? `<pre class="round-evidence">${htmlEscape(diagnosticDetailsText(log.details))}</pre>` : ""}</div>`).join("")}</section>` : `<p class="muted small">${htmlEscape(empty)}</p>`;
+}
+
+function renderRoundStep(round, idx, step, goal = {}, prevPlanHistoryOpen = {}) {
+  const label = step[0].toUpperCase() + step.slice(1);
+  return `<div class="round-step" data-workflow-step="${step}">
+    <section class="round-step-artifacts" aria-label="${label} artifacts">${renderRoundStepArtifacts(round, idx, step, prevPlanHistoryOpen)}</section>
+    <section class="round-step-activity" aria-label="${label} activity"><h3>Activity</h3>
+      ${renderRoundLogEntries(roundStepLogs(round, step, (goal.workflow_controls || []).filter(control => control.source_round === idx + 1)), `No ${label} activity has been recorded for this Round yet.`)}
+    </section>
+  </div>`;
+}
+
+function renderRoundHistory(goal, round, idx, isLatest) {
+  const logs = round.logs || [];
+  const roundGoal = { ...goal, status: isLatest ? goal.status : round.failure_message ? "failed" : "done",
+    workflow_controls: (goal.workflow_controls || []).filter(control => control.source_round === idx + 1),
+    pending_workflow_outcome: isLatest ? goal.pending_workflow_outcome : null };
+  const notice = isLatest ? computeFeatureBlockingNotice(goal) : null;
+  return `<div class="round-history" data-testid="goal-round-history">
+    ${notice ? `<p class="muted small">${htmlEscape(notice.message)}</p>` : ""}
+    ${renderQualitySummary(round)}
+    ${renderGovernanceSummary(round)}
+    ${typeof renderWorkflowOutcome === "function" ? renderWorkflowOutcome(roundGoal) : ""}
+    ${renderRoundLogEntries(logs)}
+  </div>`;
 }
 
 function renderGovernanceSummary(round) {
@@ -959,27 +1116,24 @@ function renderGovernanceSummary(round) {
     return "";
   }
   const actions = round.governance_rule_actions || [];
-  const states = governance.states;
+  const state = governance.state;
   return `
-    <div class="card" style="margin:0 0 14px" data-testid="goal-governance-summary">
+    <div class="round-diagnostic" data-testid="goal-governance-summary">
       <h3>Governance</h3>
       <div class="row" style="gap:8px;flex-wrap:wrap">
-        <span class="status-pill ${reviewStateClass(states.rules)}" data-testid="goal-governance-rules">rules: ${htmlEscape(states.rules)}</span>
-        <span class="status-pill ${reviewStateClass(states.product)}" data-testid="goal-governance-product">product: ${htmlEscape(states.product)}</span>
-        <span class="status-pill ${reviewStateClass(states.constitution)}" data-testid="goal-governance-constitution">constitution: ${htmlEscape(states.constitution)}</span>
-        <span class="status-pill ${reviewStateClass(states.meta)}" data-testid="goal-governance-meta">meta: ${htmlEscape(states.meta)}</span>
+        <span class="status-pill ${reviewStateClass(state)}" data-testid="goal-governance-decision">${htmlEscape(state)}</span>
       </div>
       ${round.governance_message ? `<p style="margin-bottom:6px" data-testid="goal-governance-message">${htmlEscape(round.governance_message)}</p>` : ""}
-      ${round.governance_details ? `<details data-testid="goal-governance-details"><summary>Details</summary><pre>${htmlEscape(diagnosticDetailsText(round.governance_details))}</pre></details>` : ""}
+      ${round.governance_details ? `<pre class="round-evidence" data-testid="goal-governance-details">${htmlEscape(diagnosticDetailsText(round.governance_details))}</pre>` : ""}
       ${actions.length ? `
-        <details style="margin-top:8px" data-testid="goal-governance-actions">
-          <summary>Rule actions (${actions.length})</summary>
+        <section style="margin-top:16px" data-testid="goal-governance-actions">
+          <h4>Rule actions (${actions.length})</h4>
           ${actions.map((a) => `
-            <div class="log-entry info" data-testid="goal-governance-action">
+            <div class="round-log-entry" data-testid="goal-governance-action">
               <div>${htmlEscape(a.action || "")}${a.text ? `: ${htmlEscape(a.text)}` : ""}</div>
               ${a.reason ? `<div class="meta">${htmlEscape(a.reason)}</div>` : ""}
             </div>`).join("")}
-        </details>` : ""}
+        </section>` : ""}
     </div>`;
 }
 
@@ -988,14 +1142,14 @@ function renderQualitySummary(round) {
     return "";
   }
   return `
-    <div class="card" style="margin:0 0 14px" data-testid="goal-quality-summary">
+    <div class="round-diagnostic" data-testid="goal-quality-summary">
       <h3>Quality</h3>
       <div class="row" style="gap:8px;flex-wrap:wrap">
         <span class="status-pill ${reviewStateClass(round.quality_state, "quality")}" data-testid="goal-quality-state">quality: ${htmlEscape(normalizeReviewState(round.quality_state))}</span>
         ${round.quality_checked_at ? `<span class="muted small" data-testid="goal-quality-checked-at">${fmtTime(round.quality_checked_at)}</span>` : ""}
       </div>
       ${round.quality_message ? `<p style="margin-bottom:6px" data-testid="goal-quality-message">${htmlEscape(round.quality_message)}</p>` : ""}
-      ${round.quality_details ? `<details data-testid="goal-quality-details"><summary>Details</summary><pre>${htmlEscape(diagnosticDetailsText(round.quality_details))}</pre></details>` : ""}
+      ${round.quality_details ? `<pre class="round-evidence" data-testid="goal-quality-details">${htmlEscape(diagnosticDetailsText(round.quality_details))}</pre>` : ""}
     </div>`;
 }
 
@@ -1034,7 +1188,7 @@ function renderRoundForm(
     <form id="${htmlEscape(formId)}" data-kind="${kind}" data-testid="goal-round-form">
       <div class="muted small" style="margin-bottom:8px">
         Submitting as <strong class="js-reporter-name">${htmlEscape(reporter)}</strong>
-        — change in the top-right reporter selector.
+        — change in the Reporter picker in the left rail.
       </div>
       ${disabled ? `
         <p class="muted small">
@@ -1054,7 +1208,7 @@ function renderRoundForm(
 function renderPickReporterNotice() {
   return `
     <p class="muted">
-      Pick a reporter in the top-right selector to enable this form.
+      Pick a reporter in the Reporter picker in the left rail to enable this form.
     </p>
   `;
 }
@@ -1068,14 +1222,14 @@ function bindRoundFormSubmit() {
   bindOnce(form, "submit", async (e) => {
     e.preventDefault();
     const reporter = state.lastReporter || "";
-    if (!reporter) return toast("Pick a reporter in the top-right selector", "error");
+    if (!reporter) return toast("Pick a reporter in the Reporter picker in the left rail", "error");
     const fd = new FormData(form);
     const prompt = (fd.get("prompt") || "").toString().trim();
     if (!prompt) return toast("Provide a prompt", "error");
     const kind = form.dataset.kind;
     try {
       const assignee = liveGoal().assignee || reporter;
-      if (kind === "submit") {
+      if (kind === "submit" || !(liveGoal().rounds || []).length) {
         await api("POST", `/api/goals/${liveGoal().id}/rounds`, { reporter, assignee, prompt });
         toast("New round submitted", "info");
       } else {
@@ -1091,6 +1245,7 @@ function bindRoundFormSubmit() {
 }
 
 function computeFailureBanner(goal, latest) {
+  if (!latest) return null;
   const stateBoundary = latestStateBoundary(latest);
   const workflowLog = currentRoundLog(latest?.latest_workflow_log, stateBoundary);
   if (goal.status === "failed") {

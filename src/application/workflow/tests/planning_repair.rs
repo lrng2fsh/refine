@@ -1,6 +1,6 @@
 use super::*;
 use crate::application::workflow::engine::context::WorkflowContext;
-use crate::model::goal::ProposedImplementationPlan;
+use crate::application::workflow::phases::implementation_planning::run_planning_skills;
 use serde_json::Value;
 
 fn native_script(body: &str) -> String {
@@ -21,7 +21,7 @@ fn run_planning(
     script_body: &str,
     multiple: bool,
     retry: bool,
-) -> (RefineResult<ProposedImplementationPlan>, Value) {
+) -> (RefineResult<()>, Value) {
     use std::os::unix::fs::PermissionsExt;
     let temp_root = unique_temp_dir(prefix);
     let target_root = temp_root.join("repo");
@@ -123,16 +123,10 @@ fn run_planning(
             )
             .unwrap();
     }
-    let goal = work_items.show_goal_detail("GOAL1").unwrap();
-    let mut result =
-        run_governed_implementation_planning(&context, &goal, &agent_context, &workspace, branch);
+    let mut result = run_planning_skills(&context, &agent_context, &workspace);
 
     if retry {
         let error = result.unwrap_err();
-        assert_eq!(
-            work_items.show_goal_detail("GOAL1").unwrap()["rounds"][0]["implementation_plan"]["state"],
-            "failed"
-        );
         let workflow = WorkflowEngine::with_target_root(&runtime_root, &target_root);
         assert_eq!(
             workflow.settle_goal_failure("GOAL1", authority, "plan", &error),
@@ -153,7 +147,7 @@ fn run_planning(
         let authority = work_items
             .claim_workflow_attempt("GOAL1", GoalStatus::Plan, round_idx, revision, &request)
             .unwrap();
-        let mut context = WorkflowContext::new(
+        context = WorkflowContext::new(
             &runtime_root,
             &target_root,
             "GOAL1".into(),
@@ -166,16 +160,12 @@ fn run_planning(
         );
         context.branch = Some(branch.into());
         context.worktree_path = Some(workspace.display().to_string());
-        let goal = work_items.show_goal_detail("GOAL1").unwrap();
-        result = run_governed_implementation_planning(
-            &context,
-            &goal,
-            &agent_context,
-            &workspace,
-            branch,
-        );
+        result = run_planning_skills(&context, &agent_context, &workspace);
     }
     let mut detail = work_items.show_goal_detail("GOAL1").unwrap();
+    detail["planning_context"] =
+        crate::application::workflow::phases::implementation_planning::planning_context(&context)
+            .unwrap();
     let history = events.invocations(0, 100).unwrap();
     detail["invocations"] = json!(
         history["items"]
@@ -215,69 +205,39 @@ fn run_planning(
 
 #[cfg(unix)]
 #[test]
-fn plan_skill_repairs_invalid_artifact_and_retains_diagnostics() {
+fn plan_skill_accepts_optional_context_without_a_checklist() {
     let (result, detail) = run_planning(
-        "event-plan-repair",
-        "if not prompt.startswith('Repair only'): result['artifacts']['plan']={'summary':'Missing checklist'}",
+        "event-plan-context",
+        "result['artifacts']={'plan':{'summary':'Use the existing behavior'}}",
         false,
         false,
     );
+    result.unwrap();
+    let reports = detail["planning_context"].as_array().unwrap();
     assert_eq!(
-        result.unwrap().checklist[0].id,
-        "workflow.plan.enter:default-plan:P1"
-    );
-    let attempts = detail["invocations"][0]["attempts"].as_array().unwrap();
-    assert_eq!(attempts.len(), 2);
-    assert!(
-        attempts[0]["diagnostic"]
-            .as_str()
-            .unwrap()
-            .contains("checklist")
-    );
-    assert!(
-        attempts[0]["raw_output"]
-            .as_str()
-            .unwrap()
-            .contains("Missing checklist")
-    );
-    assert!(attempts[1]["diagnostic"].is_null());
-}
-
-#[cfg(unix)]
-#[test]
-fn plan_skill_exhausts_bounded_repairs_without_accepting_an_invalid_plan() {
-    let (result, detail) = run_planning(
-        "event-plan-exhausted",
-        "result['artifacts']['plan']={'summary':'Missing checklist'}",
-        false,
-        false,
-    );
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("missing field `checklist`")
+        reports[0]["artifacts"]["plan"]["summary"],
+        "Use the existing behavior"
     );
     assert_eq!(
         detail["invocations"][0]["attempts"]
             .as_array()
             .unwrap()
             .len(),
-        3
-    );
-    assert_eq!(
-        detail["rounds"][0]["implementation_plan"]["failure"]["category"],
-        "invalid_output"
+        1
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn multiple_plan_skills_contribute_separate_namespaced_checklists() {
-    let (result, detail) = run_planning("event-multiple-plans", "", true, false);
-    let plan = result.unwrap();
-    assert_eq!(plan.checklist.len(), 2);
-    assert_ne!(plan.checklist[0].id, plan.checklist[1].id);
+fn multiple_plan_skills_need_only_report_their_decisions() {
+    let (result, detail) = run_planning(
+        "event-multiple-plans",
+        "result.pop('summary', None)",
+        true,
+        false,
+    );
+    result.unwrap();
+    assert_eq!(detail["planning_context"].as_array().unwrap().len(), 2);
     assert_eq!(
         detail["invocations"][0]["results"]
             .as_object()
@@ -285,7 +245,7 @@ fn multiple_plan_skills_contribute_separate_namespaced_checklists() {
             .len(),
         2
     );
-    assert!(detail["rounds"][0]["implementation_plan"]["criticism"].is_null());
+    assert!(detail["rounds"][0]["implementation_plan"].is_null());
 }
 
 #[cfg(unix)]
@@ -293,34 +253,29 @@ fn multiple_plan_skills_contribute_separate_namespaced_checklists() {
 fn a_requeued_goal_re_enters_planning_and_retains_prior_event_failure() {
     let (result, detail) = run_planning(
         "event-requeue-plan",
-        "result['artifacts']['plan']={}",
+        "result['outcome']='failure'",
         false,
         true,
     );
-    assert_eq!(result.unwrap().checklist.len(), 1);
+    result.unwrap();
     let history = detail["invocations"].as_array().unwrap();
     assert_eq!(history.len(), 2);
-    assert!(history.iter().any(|i| i["state"] == "error"));
+    assert!(history.iter().any(|i| i["state"] == "failed"));
     assert!(history.iter().any(|i| i["state"] == "succeeded"));
-    assert!(detail["rounds"][0]["implementation_plan"]["failure"].is_null());
 }
 
 #[cfg(unix)]
 #[test]
-fn plan_skill_cannot_mutate_the_checkout_and_retains_its_response() {
+fn plan_skill_can_edit_the_checkout_and_retains_its_response() {
     let (result, detail) = run_planning(
         "event-plan-mutation",
-        "pathlib.Path('app.txt').write_text('unauthorized change')",
+        "pathlib.Path('app.txt').write_text('planned change')",
         false,
         false,
     );
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("changed the checkout")
-    );
-    assert_eq!(detail["file"], "unauthorized change");
+    result.unwrap();
+    assert_eq!(detail["file"], "planned change");
+    assert_eq!(detail["invocations"][0]["state"], "succeeded");
     assert_eq!(
         detail["invocations"][0]["attempts"]
             .as_array()

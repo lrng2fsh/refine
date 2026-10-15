@@ -39,6 +39,8 @@ impl GoalPriority {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Goal {
+    #[serde(default)]
+    pub description: String,
     pub id: String,
     pub name: String,
     pub status: GoalStatus,
@@ -94,7 +96,7 @@ pub struct GoalRound {
     /// Versioned context pinned before this round's implementation agent starts.
     #[serde(default)]
     pub agent_context: Option<serde_json::Value>,
-    /// Workflow-owned, versioned evidence for this round's implementation planning pipeline.
+    /// Historical structured planning reports, retained for compatibility and context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub implementation_plan: Option<ImplementationPlan>,
     /// Structured guidance selection for current rounds; legacy strings remain readable.
@@ -172,9 +174,6 @@ impl WorkflowQualityTiming {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RoundGovernance {
     pub rule_state: Option<String>,
-    pub meta_rule_state: Option<String>,
-    pub product_state: Option<String>,
-    pub constitution_state: Option<String>,
     pub governance_message: Option<String>,
     pub governance_details: Option<JsonObject>,
     pub governance_checked_at: Option<Timestamp>,

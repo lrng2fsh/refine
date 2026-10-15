@@ -65,7 +65,7 @@ impl FileRunnerWorkerService {
         };
         let now = chrono::Utc::now().timestamp_millis();
         if let Some(worker) = live.first() {
-            let health = assess_worker(&self.runtime_root, worker, target.as_deref(), now);
+            let health = assess_worker(&self.runtime_root, worker, target.as_deref());
             if health.healthy {
                 let _ =
                     std::fs::remove_file(self.runtime_root.join("workflow-target-transition.json"));
@@ -76,6 +76,10 @@ impl FileRunnerWorkerService {
                         ));
                     }
                     record.pending = false;
+                    // Backoff counts consecutive failed replacements, not every
+                    // recovery in this installation's lifetime.
+                    record.attempts = 0;
+                    record.retry_after_ms = 0;
                     record.failure = "replacement scheduler tick verified".into();
                     write_recovery(&path, record)?;
                 }
@@ -93,7 +97,15 @@ impl FileRunnerWorkerService {
                 .as_ref()
                 .is_none_or(|r| !r.pending || r.stopped && r.worker.id != worker.id)
             {
-                let attempts = recovery.as_ref().map(|r| r.attempts).unwrap_or(0);
+                eprintln!(
+                    "refine workflow recovery: worker={} state={} reason={}",
+                    worker.id, health.state, health.reason
+                );
+                let attempts = recovery
+                    .as_ref()
+                    .filter(|r| r.pending)
+                    .map(|r| r.attempts)
+                    .unwrap_or(0);
                 recovery = Some(WorkflowRecovery {
                     pending: true,
                     worker: worker.clone(),
@@ -117,7 +129,11 @@ impl FileRunnerWorkerService {
                 pending: true,
                 worker: group.process,
                 stopped: false,
-                attempts: recovery.as_ref().map(|r| r.attempts).unwrap_or(0),
+                attempts: recovery
+                    .as_ref()
+                    .filter(|r| r.pending)
+                    .map(|r| r.attempts)
+                    .unwrap_or(0),
                 retry_after_ms: 0,
                 failure: "workflow process exited; checking its owned executions".into(),
             });
@@ -136,6 +152,9 @@ impl FileRunnerWorkerService {
                 match self.stop_workflow_incarnation(&record.worker) {
                     Ok(()) => {
                         record.stopped = true;
+                        // Backoff throttles failed stops, not a successful ownership handoff.
+                        // The next tick may launch; a failed launch sets its own delay.
+                        record.retry_after_ms = 0;
                         record.failure =
                             "old worker and owned groups exited; awaiting replacement tick".into();
                     }

@@ -2,6 +2,7 @@ mod agents;
 mod config;
 mod config_input;
 mod skills;
+mod templates;
 #[cfg(test)]
 pub(crate) use config::dispatch_config;
 mod daemon_transport;
@@ -9,8 +10,10 @@ mod discovery;
 mod features;
 mod fleet;
 mod goals;
+mod hub;
 mod logs;
 mod nodes;
+mod planning;
 mod projects;
 mod sync;
 mod system;
@@ -151,6 +154,7 @@ pub fn dispatch(cli: Cli) -> RefineResult<()> {
         } => return sync::dispatch_daemon(preview, authority, paths),
         Commands::Goal { action } => return dispatch_goal_daemon(action),
         Commands::Feature { action } => return dispatch_feature_daemon(action),
+        Commands::Planning { action } => return planning::planning(action),
         Commands::Todo { action } => return dispatch_todo(action),
         Commands::Workflow { action } => return dispatch_workflow_daemon(action),
         Commands::Node { action } => return dispatch_node_daemon(action),
@@ -187,7 +191,9 @@ pub fn dispatch(cli: Cli) -> RefineResult<()> {
     };
 
     match cli.command {
+        Commands::Hub { action } => hub::dispatch(action),
         Commands::Skills { action } => skills::skills(action),
+        Commands::Templates { action } => templates::templates(action),
         command @ Commands::Config { .. } => config::dispatch_command(command),
         command @ Commands::Website { .. } => website::dispatch_command(command),
         command @ Commands::System { .. } => system::dispatch_command(command),
@@ -201,6 +207,7 @@ pub fn dispatch(cli: Cli) -> RefineResult<()> {
         command @ Commands::Sync { .. } => sync::dispatch_command(command),
         command @ Commands::Goal { .. } => goals::dispatch_command(command),
         command @ Commands::Feature { .. } => features::dispatch_command(command),
+        Commands::Planning { action } => planning::planning(action),
         command @ Commands::Todo { .. } => todos::dispatch_command(command),
         command @ Commands::Workflow { .. } => workflow::dispatch_command(command),
     }
@@ -583,9 +590,13 @@ fn direct_work_item_service(target_root: &Path) -> RefineResult<FileWorkItemServ
 
 pub(super) fn explicit_target_root_path(command: &Commands) -> Option<&PathBuf> {
     match command {
-        Commands::Skills { .. } => None,
+        Commands::Planning { .. }
+        | Commands::Skills { .. }
+        | Commands::Templates { .. }
+        | Commands::Hub { .. } => None,
         Commands::Config { action } => match action {
             ConfigAction::Show { target_root, .. } => target_root.as_ref(),
+            ConfigAction::Providers { .. } => None,
             ConfigAction::Settings { action } => match action {
                 ConfigSettingsAction::Show { target_root }
                 | ConfigSettingsAction::Set { target_root, .. } => target_root.as_ref(),
@@ -615,6 +626,7 @@ pub(super) fn explicit_target_root_path(command: &Commands) -> Option<&PathBuf> 
             | GoalAction::NoteEdit { target_root, .. }
             | GoalAction::NoteDelete { target_root, .. }
             | GoalAction::Round { target_root, .. }
+            | GoalAction::RoundDelete { target_root, .. }
             | GoalAction::Start { target_root, .. }
             | GoalAction::Cancel { target_root, .. }
             | GoalAction::Retry { target_root, .. }
@@ -653,7 +665,11 @@ pub(super) fn explicit_target_root_path(command: &Commands) -> Option<&PathBuf> 
             | TodoAction::Undo { target_root, .. } => target_root.as_ref(),
         },
         Commands::Workflow { action } => match action {
-            WorkflowAction::Pause { .. } | WorkflowAction::Resume { .. } => None,
+            WorkflowAction::Pause { .. }
+            | WorkflowAction::Resume { .. }
+            | WorkflowAction::Show { .. }
+            | WorkflowAction::Move { .. }
+            | WorkflowAction::Integrate { .. } => None,
         },
         Commands::Node { action } => match action {
             NodeAction::List { target_root }

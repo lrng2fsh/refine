@@ -146,6 +146,9 @@ function browserRuntime(storage = new Map(), persistentStorage = new Map()) {
   };
   const boundListeners = new WeakMap();
   const context = vm.createContext({
+    captureNodeContextGeneration: () => 0,
+    isNodeContextGenerationCurrent: generation => generation === 0,
+    AbortController,
     // The real helpers live in dom-morph.js and need a browser DOM plus
     // Idiomorph. These stand in with the pre-morph semantics this fake DOM
     // models: replace the content, then run the bind step.
@@ -219,8 +222,8 @@ function browserRuntime(storage = new Map(), persistentStorage = new Map()) {
   vm.runInContext(fs.readFileSync(path.join(staticRoot, "common.js"), "utf8"), context);
   vm.runInContext(fs.readFileSync(path.join(staticRoot, "features/terminal-clipboard.js"), "utf8"), context);
   vm.runInContext(fs.readFileSync(path.join(staticRoot, "features/terminal-keyboard.js"), "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(staticRoot, "features/system-recovery.js"), "utf8"), context);
   vm.runInContext(fs.readFileSync(path.join(staticRoot, "features/toolbar.js"), "utf8"), context);
-  vm.runInContext(fs.readFileSync(path.join(staticRoot, "features/toolbar-todo.js"), "utf8"), context);
   vm.runInContext(`
     const testToasts = [];
     const productionToast = toast;
@@ -410,7 +413,6 @@ function browserRuntime(storage = new Map(), persistentStorage = new Map()) {
       },
       minimizeToolbar,
       toggleToolbar,
-      toggleToolbarFullscreen,
       beginToolbarResize(clientY, pointerId = 1) {
         const handle = document.querySelector("#toolbar-dock-resize");
         handle?.listeners.get("pointerdown")?.({
@@ -469,9 +471,7 @@ test("Toolbar starts empty and creates independent general Agent tabs lazily", a
 
   assert.deepEqual([...browser.runtime.tabIds()], []);
   browser.runtime.draw();
-  assert.match(browser.html(), /data-testid="toolbar-add"/);
-  assert.match(browser.html(), /Agent in Worktree/);
-  assert.match(browser.html(), /Planing Agent/);
+  assert.match(browser.html(), /Use Tools to open/);
 
   const first = await browser.runtime.create("agent");
   const second = await browser.runtime.create("agent");
@@ -529,164 +529,11 @@ test("Agent, Agent in Worktree, and Planning Agent each open a fresh instance", 
   );
 });
 
-test("Toolbar add button precedes the tab strip and exposes the exact lazy menu", async () => {
+test("retired Todo tool cannot create a toolbar tab", async () => {
   const browser = browserRuntime();
-  browser.runtime.setApi(async (_method, requestPath, body) => {
-    if (requestPath !== "/api/terminal/session") {
-      return { entries: [], entries_by_path: {} };
-    }
-    return {
-      id: `session-${body.profile}`,
-      process_id: `process-${body.profile}`,
-      cwd: "/repo",
-      profile: body.profile,
-      provider: body.profile === "terminal" ? null : "codex",
-    };
-  });
-  browser.runtime.draw();
-  const initial = browser.html();
-  assert.ok(initial.indexOf("toolbar-dock-label") < initial.indexOf("toolbar-add-menu"));
-  assert.ok(initial.indexOf("toolbar-add-menu") < initial.indexOf("toolbar-tabs"));
-  assert.match(initial, /data-testid="toolbar-add-icon"/);
-  assert.doesNotMatch(initial, />\[\+\]</);
-  const toolbarCss = fs.readFileSync(
-    path.join(__dirname, "../src/surfaces/web/static/css/toolbar.css"),
-    "utf8",
-  );
-  assert.match(toolbarCss, /\.toolbar-add-menu\s*\{[^}]*position:\s*relative/s);
-  assert.match(toolbarCss, /\.toolbar-add-options\s*\{[^}]*position:\s*absolute/s);
-  assert.doesNotMatch(toolbarCss, /\.toolbar-add-options\s*\{[^}]*position:\s*fixed/s);
-  assert.match(toolbarCss, /\.toolbar-dock:not\(\.open\) \.toolbar-add-options/);
-  assert.match(toolbarCss, /\.toolbar-dock-bar \.toolbar-tabs\s*\{[^}]*min-height:\s*36px/s);
-  assert.deepEqual(
-    [...initial.matchAll(/data-add-toolbar-tab="[^"]+">([^<]+)<\/button>/g)].map((match) => match[1]),
-    ["Agent", "Agent in Worktree", "System", "Files", "Todo List", "Terminal", "Planing Agent"],
-  );
-
-  for (const mode of ["agent", "standalone", "system", "files", "todo", "terminal", "plan"]) {
-    await browser.runtime.create(mode);
-  }
-  assert.deepEqual(
-    [...browser.runtime.tabIds()].map((id) => browser.runtime.tab(id).mode),
-    ["agent", "standalone", "system", "files", "todo", "terminal", "plan"],
-  );
-  assert.equal((browser.html().match(/data-testid="toolbar-tab-close"/g) || []).length, 7);
-  assert.equal((browser.html().match(/data-testid="toolbar-tab-close-icon"/g) || []).length, 7);
-  assert.doesNotMatch(browser.html(), />\[x\]</);
-});
-
-test("clicking outside the Toolbar add menu closes it while inside clicks keep it open", () => {
-  const browser = browserRuntime();
-  browser.runtime.draw();
-
-  browser.runtime.openAddMenu();
-  browser.runtime.clickInsideAddMenu();
-  assert.equal(browser.runtime.addMenuOpen(), true);
-
-  browser.runtime.clickOutsideAddMenu();
-  assert.equal(browser.runtime.addMenuOpen(), false);
-});
-
-test("Todo List tab uses the selected Reporter and shared todo API for every action", async () => {
-  const browser = browserRuntime();
-  const requests = [];
-  let lists = [];
-  browser.runtime.setApi(async (method, requestPath, body) => {
-    requests.push({ method, path: requestPath, body });
-    const reporter = body?.reporter || new URL(`http://refine${requestPath}`).searchParams.get("reporter");
-    if (method === "GET") {
-      return { reporter, lists: reporter === "Buddy" ? lists : [] };
-    }
-    if (method === "POST" && requestPath === "/api/todos/lists") {
-      lists = [{
-        id: "list-1",
-        reporter,
-        name: body.name,
-        items: [],
-      }];
-      return { ok: true, reporter, lists, list: lists[0] };
-    }
-    if (method === "PATCH" && requestPath === "/api/todos/lists/list-1") {
-      lists[0].name = body.name;
-      return { ok: true, reporter, lists, list: lists[0] };
-    }
-    if (method === "POST" && requestPath === "/api/todos/lists/list-1/items") {
-      const item = { id: "item-1", text: body.text, done: false };
-      lists[0].items = [item];
-      return { ok: true, reporter, lists, list: lists[0], item };
-    }
-    if (method === "PATCH" && requestPath.endsWith("/items/item-1")) {
-      Object.assign(lists[0].items[0], body);
-      return {
-        ok: true,
-        reporter,
-        lists,
-        list: lists[0],
-        item: lists[0].items[0],
-      };
-    }
-    if (method === "DELETE" && requestPath.endsWith("/items/item-1")) {
-      lists[0].items = [];
-      return { ok: true, reporter, lists, list: lists[0] };
-    }
-    if (method === "DELETE" && requestPath === "/api/todos/lists/list-1") {
-      lists = [];
-      return { ok: true, reporter, lists };
-    }
-    throw new Error(`unexpected request ${method} ${requestPath}`);
-  });
-
-  browser.runtime.setReporter("Buddy");
-  const tabId = await browser.runtime.create("todo");
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(browser.runtime.tab(tabId).label, "Todo List");
-  assert.match(browser.html(), /data-testid="toolbar-todo-panel"/);
-  assert.equal(requests[0].path, "/api/todos?reporter=Buddy");
-
-  await browser.runtime.createTodoList("Release");
-  assert.match(browser.html(), /data-testid="todo-list-nav"/);
-  assert.match(browser.html(), /data-testid="todo-list-option"/);
-  assert.match(browser.html(), /data-testid="todo-list-title">Release/);
-  assert.match(browser.html(), /data-testid="todo-list-menu-toggle"/);
-  assert.match(browser.html(), /data-testid="todo-list-name"/);
-  assert.match(browser.html(), /data-testid="todo-add-item"/);
-  assert.doesNotMatch(browser.html(), /data-testid="todo-list-selector"/);
-  assert.doesNotMatch(browser.html(), /Saved for this Reporter/);
-  await browser.runtime.renameTodoList("list-1", "Ready for review");
-  await browser.runtime.addTodoItem("list-1", "Verify candidate");
-  assert.match(browser.html(), /Verify candidate/);
-  assert.match(browser.html(), /aria-label="Mark complete: Verify candidate"/);
-  assert.match(browser.html(), />Edit</);
-  assert.match(browser.html(), />Delete</);
-  await browser.runtime.updateTodoItem("list-1", "item-1", { done: true });
-  assert.match(browser.html(), /data-testid="todo-all-done"/);
-  assert.match(browser.html(), /Completed <span>1<\/span>/);
-  assert.match(browser.html(), /aria-label="Mark incomplete: Verify candidate"/);
-  await browser.runtime.updateTodoItem("list-1", "item-1", { text: "Verify exact results" });
-  assert.match(browser.html(), /Verify exact results/);
-  await browser.runtime.deleteTodoItem("list-1", "item-1");
-  await browser.runtime.deleteTodoList("list-1");
-
-  const mutations = requests.filter((request) => request.method !== "GET");
-  assert.deepEqual(
-    mutations.map((request) => [request.method, request.path]),
-    [
-      ["POST", "/api/todos/lists"],
-      ["PATCH", "/api/todos/lists/list-1"],
-      ["POST", "/api/todos/lists/list-1/items"],
-      ["PATCH", "/api/todos/lists/list-1/items/item-1"],
-      ["PATCH", "/api/todos/lists/list-1/items/item-1"],
-      ["DELETE", "/api/todos/lists/list-1/items/item-1"],
-      ["DELETE", "/api/todos/lists/list-1"],
-    ],
-  );
-  assert.ok(mutations.every((request) => request.body.reporter === "Buddy"));
-
-  browser.runtime.setReporter("Alex");
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(browser.runtime.todoState().reporter, "Alex");
-  assert.equal(browser.runtime.todoState().lists.length, 0);
-  assert.equal(requests.at(-1).path, "/api/todos?reporter=Alex");
+  const tab = await browser.runtime.create("todo");
+  assert.equal(tab, undefined);
+  assert.doesNotMatch(browser.html(), /toolbar-todo-panel/);
 });
 
 test("closing a worktree Agent confirms stop, preserves its worktree, and forgets the tab", async () => {
@@ -1248,40 +1095,6 @@ test("a stopping Agent tab closes locally without issuing a duplicate Stop", asy
   assert.equal(stopRequestsBeforeSettlement, 1);
 });
 
-test("toolbar resizing survives a stopping Agent redraw", async () => {
-  const browser = browserRuntime();
-  let resolveStop;
-  const stopResponse = new Promise((resolve) => { resolveStop = resolve; });
-  browser.runtime.setApi(async (_method, requestPath, body) => {
-    if (requestPath === "/api/terminal/session") {
-      return {
-        id: "goal-session",
-        process_id: "goal-process",
-        cwd: "/repo/worktree",
-        profile: body.profile,
-        provider: "codex",
-      };
-    }
-    if (requestPath.endsWith("/stop")) return stopResponse;
-    if (requestPath.endsWith("/resize")) return { ok: true };
-    throw new Error(`unexpected request: ${requestPath}`);
-  });
-
-  await browser.runtime.openGoal("GOAL1");
-  const events = browser.events()[0];
-  const stopping = browser.runtime.stop("GOAL1");
-  const initialHeight = browser.runtime.toolbarBodyHeight();
-
-  browser.runtime.beginToolbarResize(500);
-  events.emit("terminal_status", { attention_state: "", attention_message: "" });
-  browser.runtime.moveToolbarResize(400);
-  browser.runtime.endToolbarResize(400);
-
-  assert.equal(browser.runtime.toolbarBodyHeight(), initialHeight + 100);
-  resolveStop({ ok: true, termination: { confirmed_exit: true } });
-  await stopping;
-});
-
 test("clicking a stopped terminal tab starts it once", async () => {
   const browser = browserRuntime();
   const requests = [];
@@ -1376,8 +1189,7 @@ test("terminal retains valid geometry while hidden and refits after layout trans
   assert.equal(restoredBackend.body.cols, restoredSize.cols);
   assert.equal(restoredBackend.body.rows, restoredSize.rows);
 
-  browser.runtime.setOutputSize(1400, 600);
-  browser.runtime.toggleToolbarFullscreen();
+  browser.runtime.resizeOutput(1400, 600);
   await new Promise((resolve) => setTimeout(resolve, 100));
   const fullscreenSize = sizes.at(-1);
   const fullscreenBackend = requests.filter((request) => request.path.endsWith("/resize")).at(-1);
@@ -1386,8 +1198,7 @@ test("terminal retains valid geometry while hidden and refits after layout trans
   assert.equal(fullscreenBackend.body.cols, fullscreenSize.cols);
   assert.equal(fullscreenBackend.body.rows, fullscreenSize.rows);
 
-  browser.runtime.setOutputSize(900, 340);
-  browser.runtime.toggleToolbarFullscreen();
+  browser.runtime.resizeOutput(900, 340);
   await new Promise((resolve) => setTimeout(resolve, 100));
   const exitedFullscreenSize = sizes.at(-1);
   const exitedFullscreenBackend = requests.filter((request) => request.path.endsWith("/resize")).at(-1);

@@ -41,14 +41,9 @@ fn cancelled_todo_entry_rejects_scheduler_admission_without_materializing_implem
             "cancelled blocking Entry admitted implementation: {result:?}"
         );
         let error = result.unwrap_err().to_string();
-        assert!(
-            error.contains(&entry.id)
-                && error.contains("workflow-todo-enter-gate")
-                && error.contains("Cancelled"),
-            "{error}"
-        );
+        assert!(error.contains("no longer authorizes todo"), "{error}");
         let goal = f.work().show_goal_detail("FRESH").unwrap();
-        assert_eq!(goal["status"], "todo");
+        assert_eq!(goal["status"], "failed");
         assert!(
             !f.service
                 .refine_dir
@@ -96,7 +91,7 @@ fn authored_todo_start_runs_lifecycle_skills_before_materializing_the_implementa
             assert_eq!(goal["status"], "plan", "{source} queued={queued_entry}");
             let invocation = f.invocation(source);
             assert_eq!(invocation.state, InvocationState::Succeeded);
-            assert_eq!(invocation.attempts.len(), 2);
+            assert_eq!(invocation.attempts.len(), 1);
             let owner = invocation.context.lifecycle.as_ref().unwrap();
             let implementation = PathBuf::from(ctx.worktree_path.as_ref().unwrap());
             assert_ne!(owner.path, implementation);
@@ -110,9 +105,9 @@ fn authored_todo_start_runs_lifecycle_skills_before_materializing_the_implementa
 }
 
 #[test]
-fn claimed_todo_lifecycle_rechecks_superseded_claims_and_cancellation_on_resume() {
+fn todo_lifecycle_rechecks_superseded_occurrences_and_cancellation_on_resume() {
     for completed in [false, true] {
-        for change in ["claim", "cancel"] {
+        for change in ["reassign", "cancel"] {
             let f = Fixture::new();
             let _smoke = SmokeSkill::install(&f.service, &f.temp);
             f.gate("workflow.todo.exit", BindingMode::Blocking);
@@ -154,12 +149,22 @@ fn claimed_todo_lifecycle_rechecks_superseded_claims_and_cancellation_on_resume(
             if change == "cancel" {
                 f.work().cancel_goal_summary("FRESH").unwrap();
             } else {
-                let summary = f.work().show_goal_summary("FRESH").unwrap();
-                let path = f.service.refine_dir.join(summary.goal.json_path);
-                let mut goal: Value = read_json(&path).unwrap();
-                goal["rounds"][0]["workflow_attempt_authority"]["workflow_revision"] =
-                    json!(revision + 1);
-                write_json(&path, &goal).unwrap();
+                let goal = f.work().show_goal_detail("FRESH").unwrap();
+                f.work()
+                    .control_workflow(
+                        "FRESH",
+                        &crate::application::work_items::WorkflowControl {
+                            to: GoalStatus::Backlog,
+                            reason: "Explicit different-step reassignment".into(),
+                            context: String::new(),
+                            expected_revision: goal["workflow_revision"].as_u64().unwrap(),
+                            request_id: "reassign-backlog".into(),
+                            actor: "Operator".into(),
+                            force: false,
+                            invocation_id: None,
+                        },
+                    )
+                    .unwrap();
             }
             let restarted =
                 FileEventService::with_runtime_root(&f.service.refine_dir, f.temp.join("runtime"));
@@ -223,7 +228,7 @@ fn todo_admission_rechecks_entry_workspace_after_exit_skills_complete() {
     let retained = f.temp.join("retained-entry-workspace");
     let script = f.temp.join("lifecycle-smoke.py");
     let replacement = format!(
-        "if result['binding_id'] == 'workflow-todo-exit-gate':\n pathlib.Path({}).rename({})\nresult['outcome'] = 'success'",
+        "if execution['binding_id'] == 'workflow-todo-exit-gate':\n pathlib.Path({}).rename({})\nresult['outcome'] = 'success'",
         serde_json::to_string(&entry.context.cwd).unwrap(),
         serde_json::to_string(&retained).unwrap(),
     );

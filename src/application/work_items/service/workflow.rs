@@ -1,8 +1,6 @@
 use super::*;
 use serde_json::json;
 
-use crate::application::agent_io::prompts::{PromptTemplate, render};
-
 impl FileWorkItemService {
     pub(crate) fn settle_event_transition(
         &self,
@@ -21,10 +19,46 @@ impl FileWorkItemService {
                 "Event transition was superseded".into(),
             ));
         }
-        let stale = pending["revision"] != value["workflow_revision"];
+        // The requested Goal snapshot also retains its record CAS precondition;
+        // occurrence authority alone must not overwrite intervening metadata.
+        let stale = pending["revision"] != value["workflow_revision"]
+            || pending["generation"].as_u64().map_or(
+                pending["revision"] != value["workflow_revision"],
+                |generation| {
+                    generation != value["event_generation"].as_u64().unwrap_or(0)
+                        || pending["node_id"] != value["node_id"]
+                        || pending["candidate_commit"] != value["candidate_commit"]
+                },
+            );
         if failed || stale {
             value["pending_event_transition"]["state"] =
                 json!(if stale { "superseded" } else { "failed" });
+            value
+                .as_object_mut()
+                .unwrap()
+                .entry("event_transition_history")
+                .or_insert(json!([]))
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "id":pending["id"], "from":pending["from"], "to":pending["to"],
+                    "state":if stale {"superseded"}else{"failed"}, "at":now_timestamp(),
+                }));
+            if failed
+                && !stale
+                && !crate::application::events::outcomes::prepare_error(
+                    &self.refine_dir,
+                    &mut value,
+                    "event_transition",
+                    "A required workflow event failed",
+                )?
+                && !matches!(
+                    current.goal.status,
+                    GoalStatus::Done | GoalStatus::Cancelled
+                )
+            {
+                value["status"] = json!("failed");
+            }
             write_json_atomically(&path, &value)?;
             return Ok(());
         }
@@ -39,7 +73,7 @@ impl FileWorkItemService {
     pub fn retry_goal_quality_summary(&self, goal_id: &str) -> RefineResult<GoalSummaryProjection> {
         let current = self.show_goal_summary(goal_id)?;
         validate_goal_operation(&current.goal.status, &GoalOperation::RetryQuality)?;
-        self.set_goal_status_unchecked(goal_id, &GoalStatus::Quality)?;
+        self.retry_workflow_step(goal_id, GoalStatus::Quality)?;
         self.show_goal_summary(goal_id)
     }
 
@@ -49,248 +83,38 @@ impl FileWorkItemService {
     ) -> RefineResult<GoalSummaryProjection> {
         let current = self.show_goal_summary(goal_id)?;
         validate_goal_operation(&current.goal.status, &GoalOperation::RetryGovernance)?;
-        self.set_goal_status_unchecked(goal_id, &GoalStatus::Governance)?;
+        self.retry_workflow_step(goal_id, GoalStatus::Governance)?;
         self.show_goal_summary(goal_id)
     }
 
-    pub(crate) fn queue_governance_recovery_summary(
-        &self,
-        goal_id: &str,
-        round_idx: usize,
-        retiring_authority: Option<WorkflowAttemptAuthority>,
-        attempt: u32,
-        analysis: &str,
-        prompt: &str,
-    ) -> RefineResult<GoalSummaryProjection> {
-        self.queue_automatic_recovery_summary(
-            goal_id,
-            round_idx,
-            retiring_authority,
-            attempt,
-            &GoalStatus::Governance,
-            "governance",
-            analysis,
-            prompt,
-        )
-    }
-
-    pub(crate) fn queue_quality_recovery_summary(
-        &self,
-        goal_id: &str,
-        round_idx: usize,
-        retiring_authority: Option<WorkflowAttemptAuthority>,
-        attempt: u32,
-        analysis: &str,
-        prompt: &str,
-    ) -> RefineResult<GoalSummaryProjection> {
-        self.queue_automatic_recovery_summary(
-            goal_id,
-            round_idx,
-            retiring_authority,
-            attempt,
-            &GoalStatus::Quality,
-            "quality",
-            analysis,
-            prompt,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn queue_automatic_recovery_summary(
-        &self,
-        goal_id: &str,
-        round_idx: usize,
-        retiring_authority: Option<WorkflowAttemptAuthority>,
-        attempt: u32,
-        source_status: &GoalStatus,
-        kind: &str,
-        analysis: &str,
-        prompt: &str,
-    ) -> RefineResult<GoalSummaryProjection> {
-        let _goal_lock = self.acquire_goal_mutation_lock(goal_id)?;
-        let current = self.show_goal_summary(goal_id)?;
-        self.ensure_goal_owned(&current)?;
-        if current.goal.status != *source_status {
-            return Err(RefineError::Conflict(format!(
-                "Goal {goal_id} changed from {} to {} before automatic recovery",
-                source_status.as_str(),
-                current.goal.status.as_str()
-            )));
-        }
-        validate_automated_goal_transition(&current.goal.status, &GoalStatus::Todo)?;
-        let (goal_path, mut value) = self.read_goal_value_unchecked_locked(&current)?;
-        let object = value.as_object_mut().ok_or_else(|| {
-            RefineError::Serialization(format!("Goal {} is not a JSON object", goal_path.display()))
-        })?;
-        let rounds = object
-            .get_mut("rounds")
-            .and_then(Value::as_array_mut)
-            .ok_or_else(|| RefineError::NotFound(format!("Goal {goal_id} has no rounds")))?;
-        if rounds.len() != round_idx + 1 {
-            return Err(RefineError::Conflict(format!(
-                "Goal {goal_id} round changed before automatic {kind} recovery"
-            )));
-        }
-        let reuse_inert = last_round_is_unstarted_recovery(rounds, retiring_authority);
-        let now = now_timestamp();
-        let source = rounds
-            .get_mut(round_idx)
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| {
-                RefineError::Serialization("source Round is not an object".to_string())
-            })?;
-        source.insert(format!("{kind}_recovery_analysis"), json!(analysis));
-        source.insert(format!("{kind}_recovery_attempt"), json!(attempt));
-        source.insert("updated".to_string(), json!(now.clone()));
-
-        let mut successor = new_round_value("Refine", "Refine", prompt);
-        successor["automatic_retry"] = json!({
-            "kind": kind,
-            "source_round": round_idx + 1,
-            "attempt": attempt,
-            "generated_at": now
-        });
-        append_or_reuse_recovery_round(rounds, successor, reuse_inert);
-        object.insert("status".to_string(), json!(GoalStatus::Todo.as_str()));
-        object.insert("updated".to_string(), json!(now));
-        write_json_atomically(&goal_path, &value)?;
-        self.show_goal_summary(goal_id)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn queue_missing_reconciled_candidate_recovery_summary(
-        &self,
-        goal_id: &str,
-        round_idx: usize,
-        retiring_authority: Option<WorkflowAttemptAuthority>,
-        recorded_reconciliation_state: &str,
-        candidate_commit: &str,
-        target_branch: &str,
-        target_commit: &str,
-    ) -> RefineResult<GoalSummaryProjection> {
-        let _goal_lock = self.acquire_goal_mutation_lock(goal_id)?;
-        let current = self.show_goal_summary(goal_id)?;
-        self.ensure_goal_owned(&current)?;
-        if current.goal.status != GoalStatus::Todo {
-            return Err(RefineError::Conflict(format!(
-                "Goal {goal_id} changed from todo to {} before reconciliation recovery",
-                current.goal.status.as_str()
-            )));
-        }
-
-        let (goal_path, mut value) = self.read_goal_value_unchecked_locked(&current)?;
-        let object = value.as_object_mut().ok_or_else(|| {
-            RefineError::Serialization(format!("Goal {} is not a JSON object", goal_path.display()))
-        })?;
-        for (field, expected) in [
-            ("candidate_commit", candidate_commit),
-            ("target_branch", target_branch),
-        ] {
-            let recorded = object
-                .get(field)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or("");
-            if recorded != expected {
-                return Err(RefineError::Conflict(format!(
-                    "Goal {goal_id} {field} changed from {expected} to {recorded} before reconciliation recovery"
-                )));
-            }
-        }
-        let rounds = object
-            .get_mut("rounds")
-            .and_then(Value::as_array_mut)
-            .ok_or_else(|| RefineError::NotFound(format!("Goal {goal_id} has no rounds")))?;
-        if rounds.len() != round_idx + 1 {
-            return Err(RefineError::Conflict(format!(
-                "Goal {goal_id} round changed from {} to {} before reconciliation recovery",
-                round_idx + 1,
-                rounds.len()
-            )));
-        }
-        let reuse_inert = last_round_is_unstarted_recovery(rounds, retiring_authority);
-
-        let now = now_timestamp();
-        let source_round = rounds
-            .get_mut(round_idx)
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| {
-                RefineError::Serialization(format!(
-                    "round {} for Goal {goal_id} is not an object",
-                    round_idx + 1
-                ))
-            })?;
-        let current_reconciliation_state = source_round
-            .get("workflow_reconciliation")
-            .and_then(Value::as_object)
-            .and_then(|evidence| evidence.get("state"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if current_reconciliation_state != recorded_reconciliation_state {
-            return Err(RefineError::Conflict(format!(
-                "Goal {goal_id} reconciliation changed from {recorded_reconciliation_state} to {current_reconciliation_state} before recovery"
-            )));
-        }
-        let failure_message = format!(
-            "Recorded reconciliation state {recorded_reconciliation_state} no longer matches {target_branch}: candidate {candidate_commit} is absent from target {target_commit}"
+    fn retry_workflow_step(&self, goal_id: &str, status: GoalStatus) -> RefineResult<()> {
+        let (_lock, path, mut value) = self.read_goal_value(goal_id)?;
+        let from = workflow_attempts::goal_status(
+            value
+                .as_object()
+                .ok_or_else(|| RefineError::Serialization("Invalid Goal".into()))?,
         );
-        source_round.insert(
-            "failure_category".to_string(),
-            Value::String("reconciliation_candidate_absent".to_string()),
-        );
-        source_round.insert(
-            "failure_message".to_string(),
-            Value::String(failure_message),
-        );
-        source_round.insert("failure_at".to_string(), Value::String(now.clone()));
-        source_round.insert("workflow_attempt_authority".to_string(), Value::Null);
-        source_round.insert(
-            "workflow_recovery".to_string(),
-            json!({
-                "state": "superseded",
-                "reason": "reconciliation_candidate_absent",
-                "recorded_reconciliation_state": recorded_reconciliation_state,
-                "candidate_commit": candidate_commit,
-                "target_branch": target_branch,
-                "target_commit": target_commit,
-                "successor_round": successor_round_number(round_idx, reuse_inert),
-                "updated_at": now
-            }),
-        );
-        source_round.insert("updated".to_string(), Value::String(now.clone()));
-
-        let source_round = (round_idx + 1).to_string();
-        let prompt = render(
-            PromptTemplate::GoalWorkflowRecoverReconciliation,
-            &[
-                ("candidate_commit", candidate_commit),
-                ("source_round", &source_round),
-                ("reconciliation_state", recorded_reconciliation_state),
-                ("target_branch", target_branch),
-                ("target_commit", target_commit),
-            ],
-        );
-        let mut successor = new_round_value("Refine", "Refine", &prompt);
-        successor["workflow_recovery"] = json!({
-            "state": "queued",
-            "reason": "reconciliation_candidate_absent",
-            "source_round": round_idx + 1,
-            "recorded_reconciliation_state": recorded_reconciliation_state,
-            "candidate_commit": candidate_commit,
-            "target_branch": target_branch,
-            "target_commit": target_commit,
-            "queued_at": now
-        });
-        append_or_reuse_recovery_round(rounds, successor, reuse_inert);
-        // The recovery Round is only runnable from todo; restate it so a Goal
-        // whose status drifted repairs itself instead of stalling.
-        object.insert("status".to_string(), json!(GoalStatus::Todo.as_str()));
-        object.insert("updated".to_string(), Value::String(now));
-        write_json_atomically(&goal_path, &value)?;
-        self.show_goal_summary(goal_id)
+        validate_goal_operation(
+            &from,
+            &if status == GoalStatus::Quality {
+                GoalOperation::RetryQuality
+            } else {
+                GoalOperation::RetryGovernance
+            },
+        )?;
+        value.as_object_mut().unwrap().entry("workflow_controls").or_insert(json!([])).as_array_mut()
+            .ok_or_else(|| RefineError::Serialization("Invalid workflow controls".into()))?.push(json!({
+                "request_id": uuid::Uuid::new_v4().to_string(), "from": from, "to": status,
+                "reason": "Explicit step retry", "actor": "operator", "at": now_timestamp(), "forced": false
+            }));
+        if let Some(round) = value["rounds"].as_array_mut().and_then(|r| r.last_mut()) {
+            archive_round_for_retry(round, &status)?;
+        }
+        self.write_goal_status_value(&path, &mut value, &status)
     }
 
     pub fn undo_goal_summary(&self, goal_id: &str) -> RefineResult<GoalSummaryProjection> {
+        let _goal_lock = self.acquire_goal_mutation_lock(goal_id)?;
         let current = self.show_goal_summary(goal_id)?;
         if current.goal.status == GoalStatus::Review {
             return Err(RefineError::InvalidInput(
@@ -309,15 +133,22 @@ impl FileWorkItemService {
                 ));
             }
         };
-        self.set_goal_status_unchecked(goal_id, &target)?;
+        self.assign_goal_status_locked(goal_id, &target, "Explicit undo")?;
         self.show_goal_summary(goal_id)
     }
 
     pub fn start_goal_workflow(&self, goal_id: &str) -> RefineResult<GoalSummaryProjection> {
+        let _goal_lock = self.acquire_goal_mutation_lock(goal_id)?;
         let current = self.show_goal_summary(goal_id)?;
         match current.goal.status {
-            GoalStatus::Backlog => self.transition_goal_status(goal_id, GoalStatus::Todo),
-            GoalStatus::Todo => Ok(current),
+            GoalStatus::Backlog | GoalStatus::Todo => {
+                self.authored_goal_commitment(goal_id)?;
+                if current.goal.status == GoalStatus::Backlog {
+                    self.transition_goal_status(goal_id, GoalStatus::Todo)
+                } else {
+                    Ok(current)
+                }
+            }
             _ => Err(RefineError::InvalidInput(format!(
                 "Goal {goal_id} can only be queued from backlog or todo"
             ))),
@@ -431,7 +262,6 @@ impl FileWorkItemService {
         target: GoalStatus,
     ) -> RefineResult<()> {
         self.ensure_goal_index_owned(current)?;
-        validate_manual_goal_transition(&current.status, &target)?;
 
         let goal_path = self.refine_dir.join(&current.json_path);
         let bytes = fs::read(&goal_path).map_err(|error| {
@@ -481,15 +311,17 @@ impl FileWorkItemService {
                 current.id
             )));
         }
+        if durable_status == target {
+            return Ok(());
+        }
+        validate_manual_goal_transition(&durable_status, &target)?;
+        record_step_assignment(object, &durable_status, &target, "Explicit step assignment")?;
         object.insert(
             "status".to_string(),
             Value::String(target.as_str().to_string()),
         );
         if target != GoalStatus::Failed {
             clear_latest_round_failure(object);
-        }
-        if !is_automated_status(&target) {
-            clear_latest_round_workflow_attempt(object);
         }
         object.insert("updated".to_string(), Value::String(now_timestamp()));
 
@@ -508,8 +340,28 @@ impl FileWorkItemService {
                 "done Goals cannot be cancelled".to_string(),
             ));
         }
-        self.set_goal_status_unchecked_locked(goal_id, &GoalStatus::Cancelled)?;
+        self.assign_goal_status_locked(goal_id, &GoalStatus::Cancelled, "Explicit cancellation")?;
         self.show_goal_summary(goal_id)
+    }
+
+    fn assign_goal_status_locked(
+        &self,
+        goal_id: &str,
+        target: &GoalStatus,
+        reason: &str,
+    ) -> RefineResult<()> {
+        let current = self.show_goal_summary(goal_id)?;
+        self.ensure_goal_owned(&current)?;
+        let (path, mut value) = self.read_goal_value_unchecked_locked(&current)?;
+        let object = value.as_object_mut().ok_or_else(|| {
+            RefineError::Serialization(format!("Goal {goal_id} is not a JSON object"))
+        })?;
+        let from = workflow_attempts::goal_status(object);
+        if from == *target {
+            return Ok(());
+        }
+        record_step_assignment(object, &from, target, reason)?;
+        self.write_goal_status_value(&path, &mut value, target)
     }
 
     pub(crate) fn fail_goal_after_process_stop_if_current(
@@ -540,4 +392,36 @@ impl FileWorkItemService {
         self.set_goal_status_unchecked_locked(goal_id, &GoalStatus::Failed)?;
         self.show_goal_summary(goal_id)
     }
+}
+
+fn record_step_assignment(
+    goal: &mut Map<String, Value>,
+    from: &GoalStatus,
+    to: &GoalStatus,
+    reason: &str,
+) -> RefineResult<()> {
+    let source_round = goal.get("rounds").and_then(Value::as_array).map(Vec::len);
+    if matches!(
+        to,
+        GoalStatus::Todo
+            | GoalStatus::Plan
+            | GoalStatus::Implement
+            | GoalStatus::Quality
+            | GoalStatus::Governance
+    ) && let Some(round) = goal
+        .get_mut("rounds")
+        .and_then(Value::as_array_mut)
+        .and_then(|rounds| rounds.last_mut())
+    {
+        archive_round_for_retry(round, to)?;
+    }
+    goal.entry("workflow_controls")
+        .or_insert(json!([]))
+        .as_array_mut()
+        .ok_or_else(|| RefineError::Serialization("Invalid workflow controls".into()))?
+        .push(
+            json!({"request_id":uuid::Uuid::new_v4().to_string(), "from":from, "to":to, "source_round":source_round,
+            "actor":"operator", "reason":reason, "at":now_timestamp(), "forced":false}),
+        );
+    Ok(())
 }

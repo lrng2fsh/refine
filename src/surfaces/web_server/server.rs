@@ -58,6 +58,31 @@ impl InProcessWebServer {
             return self.handle_event_capability(request, &raw_path);
         }
 
+        if request.path == "/planning" || request.path.starts_with("/planning/") {
+            return self.handle_planning(request);
+        }
+        if request.path.starts_with("/todos")
+            && self
+                .current_refine_dir()
+                .ok()
+                .flatten()
+                .is_some_and(|r| r.join("planning/migration.json").exists())
+        {
+            return ApiResponse::json(
+                410,
+                json!({"error":"Todo Lists have moved to Project Planning. Use /planning."}),
+            );
+        }
+        if request.path == "/templates" || request.path.starts_with("/templates/") {
+            return self.handle_templates(request);
+        }
+
+        if request.path.starts_with("/workflow/goals/") {
+            return self.handle_workflow_control(request);
+        }
+        if request.path == "/hub" || request.path.starts_with("/hub/") {
+            return self.handle_hub(request);
+        }
         if request.path == mcp::MCP_ROUTE {
             return self.handle_mcp(&request);
         }
@@ -77,7 +102,18 @@ impl InProcessWebServer {
         }
 
         if request.method == "GET" && request.path == "/activity" {
-            return self.handle_activity_list(&raw_path);
+            return self.handle_activity_list(&raw_path, None);
+        }
+
+        if request.method == "POST" && request.path == "/activity/tail" {
+            return self.handle_activity_list(
+                &raw_path,
+                request
+                    .body
+                    .as_ref()
+                    .and_then(|body| body.get("cursors"))
+                    .cloned(),
+            );
         }
 
         if request.method == "POST" && request.path == "/activity/cleanup" {
@@ -534,6 +570,13 @@ impl InProcessWebServer {
             return self.handle_project_worktree_cleanup(request);
         }
 
+        if request.method == "GET" && request.path == "/providers" {
+            return self.handle_providers_get();
+        }
+        if request.method == "PUT" && request.path == "/providers" {
+            return self.handle_providers_save(request);
+        }
+
         if request.method == "GET" && request.path == "/settings" {
             return self.handle_settings_get();
         }
@@ -792,6 +835,13 @@ impl InProcessWebServer {
             return self.handle_goal_note(request);
         }
 
+        if request.method == "DELETE"
+            && request.path.starts_with("/work/goals/")
+            && request.path.contains("/rounds/")
+        {
+            return self.handle_goal_round_delete(request);
+        }
+
         if request.method == "POST"
             && request.path.starts_with("/work/goals/")
             && request.path.ends_with("/rounds")
@@ -819,6 +869,13 @@ impl InProcessWebServer {
             && request.path.ends_with("/logs")
         {
             return self.handle_goal_round_log_append(request);
+        }
+
+        if request.method == "GET"
+            && request.path.starts_with("/work/goals/")
+            && request.path.ends_with("/prompts")
+        {
+            return self.handle_goal_prompts(request);
         }
 
         if request.method == "GET"
@@ -991,7 +1048,12 @@ fn should_refresh_projection_after_mutation(path: &str) -> bool {
     // The MCP surface refreshes the cache through the inner tool dispatch when a
     // tool actually mutates state, so the outer `/mcp` POST itself is exempt.
     !path.starts_with("/terminal/")
+        // Hub data has its own disposable indexes and is not part of the Goal
+        // projection. Queries and record writes must not rebuild that cache.
+        && path != "/hub"
+        && !path.starts_with("/hub/")
         && path != "/work/goals"
+        && path != "/activity/tail"
         && path != "/sync"
         && path != "/cache/rebuild"
         && !path.starts_with("/system/source/")
@@ -1008,3 +1070,15 @@ fn node_id_from_fleet_path(path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn hub_reads_and_writes_do_not_rebuild_unrelated_goal_projections() {
+    for path in [
+        "/api/hub/sites",
+        "/api/hub/sites/reports/collections/events/query",
+        "/hub/sites/reports/collections/events/records/one",
+    ] {
+        assert!(!should_refresh_projection_after_mutation(path));
+    }
+}

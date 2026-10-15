@@ -85,7 +85,7 @@ fn execution_outcomes_and_gate_permission_are_independent() {
 struct ProviderEnv(Option<std::ffi::OsString>);
 
 #[test]
-fn blocking_gate_rejects_spoofed_identity_and_malformed_artifacts() {
+fn blocking_gate_checks_identity_but_does_not_grade_artifacts() {
     let fixture = Fixture::new();
     let mut invocation = prepared(&fixture, "workflow.plan.enter");
     let binding = invocation.bindings[0].clone();
@@ -110,7 +110,7 @@ fn blocking_gate_rejects_spoofed_identity_and_malformed_artifacts() {
     invocation
         .results
         .insert(binding.binding.id.clone(), accepted);
-    assert_eq!(invocation.gate_assessment(), GateAssessment::Fault);
+    assert_eq!(invocation.gate_assessment(), GateAssessment::Satisfied);
 }
 #[cfg(unix)]
 impl Drop for ProviderEnv {
@@ -138,7 +138,60 @@ fn provider(fixture: &Fixture, script: &str) -> ProviderEnv {
 
 #[cfg(unix)]
 #[test]
-fn malformed_plan_shapes_repair_from_retained_output_without_repeating_work() {
+fn startup_skill_can_use_its_invocation_identity_without_returning_identity_fields() {
+    let _env = crate::infrastructure::agents::invocation::smoke_ai_env_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let fixture = Fixture::new();
+    let _restore = provider(
+        &fixture,
+        r#"
+import json,sys,pathlib
+prompt=' '.join(sys.argv[1:])
+decode=json.JSONDecoder().raw_decode
+execution=decode(prompt.split('Skill execution:\n',1)[1])[0]
+contract=decode(prompt.split('Refine completion contract (supplied by the system):\n',1)[1])[0]
+assert 'from the Skill execution context' in prompt
+assert not any(key in contract for key in ['invocation_id','binding_id','role'])
+pathlib.Path('request-id').write_text('startup-email-' + execution['invocation_id'])
+print(json.dumps(contract))
+"#,
+    );
+    let service = fixture.service();
+    let mut skill: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/surfaces/refine-hub/docs/runbooks/skills/fetch-goals-from-email-on-startup.json"
+    )))
+    .unwrap();
+    let trigger = skill.as_object_mut().unwrap().remove("trigger").unwrap();
+    service
+        .save(
+            "skills",
+            "fetch-goals-from-email-on-startup",
+            json!({"revision":service.config().unwrap().revision,"item":skill,"trigger":trigger}),
+        )
+        .unwrap();
+    let invocation = prepared(&fixture, "node.startup.ready");
+    let completed = service.execute(&invocation.id, || Ok(())).unwrap();
+    assert_eq!(completed.state, InvocationState::Succeeded, "{completed:?}");
+    assert_eq!(completed.results.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(fixture.0.join("request-id")).unwrap(),
+        format!("startup-email-{}", invocation.id)
+    );
+    let result = completed.results.values().next().unwrap();
+    assert_eq!(result.invocation_id, invocation.id);
+    assert_eq!(result.binding_id, invocation.bindings[0].binding.id);
+    assert_eq!(result.role, "task");
+    assert_eq!(
+        service.execute(&invocation.id, || Ok(())).unwrap(),
+        completed
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn arbitrary_plan_shapes_are_retained_without_grading() {
     let _env = crate::infrastructure::agents::invocation::smoke_ai_env_lock()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -159,8 +212,8 @@ if prompt.startswith('Repair only'):
 else:
  assert 'DO_WORK_ONCE_ONLY' in prompt
  with pathlib.Path('work-count').open('a') as f: f.write('work\n')
- if '{shape}' == 'extra_checklist_fields': contract['artifacts']['plan']['checklist'][0]['affected_behavior']=['unexpected']
- else: contract['artifacts']['plan']['criticism_resolutions']={{'C1':'resolved'}}
+ if '{shape}' == 'extra_checklist_fields': contract['artifacts']={{'plan':{{'checklist':[{{'affected_behavior':['context']}}]}}}}
+ else: contract['artifacts']={{'plan':{{'criticism_resolutions':{{'C1':'resolved'}}}}}}
 print(json.dumps(contract))
 "#
             ),
@@ -171,17 +224,147 @@ print(json.dumps(contract))
         service.save_invocation(&invocation).unwrap();
         let completed = service.execute(&invocation.id, || Ok(())).unwrap();
         assert_eq!(completed.state, InvocationState::Succeeded, "{completed:?}");
-        assert_eq!(completed.attempts.len(), 2);
-        assert!(completed.attempts[0]["diagnostic"].is_string());
-        assert_eq!(completed.attempts[1]["purpose"], "completion_repair");
+        assert_eq!(completed.attempts.len(), 1);
+        assert!(completed.attempts[0]["diagnostic"].is_null());
         assert_eq!(
             std::fs::read_to_string(fixture.0.join("work-count")).unwrap(),
             "work\n"
         );
-        assert_eq!(
-            std::fs::read_to_string(fixture.0.join("repair-count")).unwrap(),
-            "repair\n"
+        assert!(!fixture.0.join("repair-count").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_evidence_preserves_verdict_and_gate_without_another_provider_call() {
+    let _env = crate::infrastructure::agents::invocation::smoke_ai_env_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    for outcome in ["success", "failure", "error"] {
+        let fixture = Fixture::new();
+        let _restore = provider(
+            &fixture,
+            &format!(
+                r#"
+import json,sys,pathlib
+prompt=' '.join(sys.argv[1:])
+result=json.JSONDecoder().raw_decode(prompt.split('Refine completion contract (supplied by the system):\n',1)[1])[0]
+result['outcome']='{outcome}'
+result['evidence']=[{{'id':'P1','note':'did X'}}, 'unchanged', 42, None]
+with pathlib.Path('work-count').open('a') as f: f.write('work\n')
+print(json.dumps(result))
+"#
+            ),
         );
+        let service = fixture.service();
+        let invocation = prepared(&fixture, "workflow.implement.enter");
+        let completed = service.execute(&invocation.id, || Ok(())).unwrap();
+        assert_eq!(
+            completed.state,
+            match outcome {
+                "success" => InvocationState::Succeeded,
+                "failure" => InvocationState::Failed,
+                _ => InvocationState::Error,
+            },
+            "{completed:?}"
+        );
+        assert_eq!(
+            completed.gate_assessment(),
+            match outcome {
+                "success" => GateAssessment::Satisfied,
+                "failure" => GateAssessment::Finding,
+                _ => GateAssessment::Fault,
+            }
+        );
+        assert_eq!(completed.attempts.len(), 1);
+        assert!(completed.attempts[0]["diagnostic"].is_null());
+        let persisted = service.invocation(&invocation.id).unwrap();
+        let result = &persisted.results[&invocation.bindings[0].binding.id];
+        assert_eq!(result.outcome, outcome);
+        assert_eq!(
+            result.evidence,
+            [r#"{"id":"P1","note":"did X"}"#, "unchanged", "42", "null"]
+        );
+        let raw: serde_json::Value =
+            serde_json::from_str(persisted.attempts[0]["raw_output"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            raw["evidence"],
+            json!([{"id":"P1","note":"did X"}, "unchanged", 42, null])
+        );
+        assert_eq!(
+            service.execute(&invocation.id, || Ok(())).unwrap(),
+            completed
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("work-count")).unwrap(),
+            "work\n"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_structured_evidence_redecodes_old_rejections_without_a_provider_call() {
+    let _env = crate::infrastructure::agents::invocation::smoke_ai_env_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    for host_bound in [false, true] {
+        for outcome in ["success", "failure", "error"] {
+            let fixture = Fixture::new();
+            let checkout = Fixture::new();
+            checkout.repository();
+            let _restore = provider(
+                &fixture,
+                "import pathlib\npathlib.Path('unexpected-provider-call').touch()\nraise SystemExit(1)",
+            );
+            let service = fixture.service();
+            let mut invocation = prepared(&fixture, "workflow.implement.enter");
+            invocation.context.cwd = checkout.0.clone();
+            invocation.context.target_root = checkout.0.clone();
+            let binding = &invocation.bindings[0];
+            let mut report = json!({"outcome":outcome,
+                "evidence":[{"id":"P1","note":"completed work"}]});
+            if !host_bound {
+                report["invocation_id"] = json!(invocation.id);
+                report["binding_id"] = json!(binding.binding.id);
+                report["role"] = json!(binding.skill.role);
+            }
+            let raw = report.to_string();
+            let checkout_receipt = super::super::completion::observe(
+                &FileGitWorktreeService::new(&checkout.0),
+                &checkout.0,
+            )
+            .unwrap();
+            let mut receipt = json!({"binding_id":binding.binding.id,"attempt":0,
+                "process_id":"completed-provider","raw_output":raw,
+                "purpose":"work","checkout_recorded":true,"checkout":checkout_receipt,
+                "diagnostic":"evidence[0]: invalid type: map, expected a string"});
+            // Legacy receipts omit the host-binding marker entirely.
+            if host_bound {
+                receipt["host_bound_result"] = json!(true);
+            }
+            invocation.attempts.push(receipt);
+            service.save_invocation(&invocation).unwrap();
+
+            let completed = service.execute(&invocation.id, || Ok(())).unwrap();
+            assert_eq!(
+                completed.gate_assessment(),
+                match outcome {
+                    "success" => GateAssessment::Satisfied,
+                    "failure" => GateAssessment::Finding,
+                    _ => GateAssessment::Fault,
+                },
+                "{completed:?}"
+            );
+            let persisted = service.invocation(&invocation.id).unwrap();
+            assert_eq!(persisted.attempts.len(), 1);
+            assert_eq!(persisted.attempts[0]["raw_output"], raw);
+            assert!(persisted.attempts[0]["diagnostic"].is_null());
+            let result = &persisted.results[&binding.binding.id];
+            assert_eq!(result.outcome, outcome);
+            assert_eq!(result.evidence, [r#"{"id":"P1","note":"completed work"}"#]);
+            assert!(!checkout.0.join("unexpected-provider-call").exists());
+        }
     }
 }
 
@@ -192,20 +375,26 @@ fn restart_accepts_a_durable_provider_receipt_before_launching_more_work() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let fixture = Fixture::new();
+    let checkout = Fixture::new();
+    checkout.repository();
     let _restore = provider(
         &fixture,
         r#"
 import json,sys,pathlib
 prompt=' '.join(sys.argv[1:])
 result=json.JSONDecoder().raw_decode(prompt.split('Refine completion contract (supplied by the system):\n',1)[1])[0]
+result['evidence']=[{'id':'P1','note':'did X'}]
 with pathlib.Path('work-count').open('a') as f: f.write('work\n')
 print(json.dumps(result))
 "#,
     );
     let service = fixture.service();
     let mut invocation = prepared(&fixture, "workflow.plan.enter");
+    invocation.context.cwd = checkout.0.clone();
+    invocation.context.target_root = checkout.0.clone();
+    service.save_invocation(&invocation).unwrap();
     let binding = invocation.bindings[0].clone();
-    let contract = result_contract(&invocation.id, &binding.binding.id, &binding.skill.role);
+    let contract = crate::application::agent_io::contracts::skill_result::report_contract();
     let prompt = format!("Refine completion contract (supplied by the system):\n{contract}");
     let calls = std::cell::Cell::new(0);
     let interrupted = super::super::completion::run(
@@ -216,7 +405,7 @@ print(json.dumps(result))
         &contract,
         &Default::default(),
         Some(10),
-        true,
+        false,
         &|| {
             calls.set(calls.get() + 1);
             if calls.get() > 1 {
@@ -232,14 +421,65 @@ print(json.dumps(result))
     let retained = service.invocation(&invocation.id).unwrap();
     assert_eq!(retained.attempts.len(), 1);
     assert!(retained.results.is_empty());
+    assert!(retained.attempts[0]["checkout"].is_object());
+    let raw = retained.attempts[0]["raw_output"].clone();
+    let parsed: serde_json::Value = serde_json::from_str(raw.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["evidence"], json!([{"id":"P1","note":"did X"}]));
+    for changed_checkout in [false, true] {
+        if changed_checkout {
+            std::fs::write(checkout.0.join("later-edit"), "changed after receipt").unwrap();
+        }
+        let mut replay = service.invocation(&invocation.id).unwrap();
+        let error = super::super::completion::run(
+            &service,
+            &mut replay,
+            &binding,
+            &prompt,
+            &contract,
+            &Default::default(),
+            Some(10),
+            false,
+            &|| {
+                if changed_checkout {
+                    Ok(())
+                } else {
+                    Err(crate::error::RefineError::Conflict(
+                        "authority revoked".into(),
+                    ))
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(if changed_checkout {
+                "Retained completion checkout changed"
+            } else {
+                "authority revoked"
+            }),
+            "{error}"
+        );
+        assert_eq!(
+            service.invocation(&invocation.id).unwrap().attempts,
+            retained.attempts
+        );
+        if changed_checkout {
+            std::fs::remove_file(checkout.0.join("later-edit")).unwrap();
+        }
+    }
     let resumed = fixture
         .service()
         .execute(&invocation.id, || Ok(()))
         .unwrap();
     assert_eq!(resumed.state, InvocationState::Succeeded, "{resumed:?}");
     assert_eq!(resumed.attempts.len(), 1);
+    assert_eq!(resumed.gate_assessment(), GateAssessment::Satisfied);
+    assert_eq!(resumed.attempts[0]["raw_output"], raw);
     assert_eq!(
-        std::fs::read_to_string(fixture.0.join("work-count")).unwrap(),
+        resumed.results[&binding.binding.id].evidence,
+        [r#"{"id":"P1","note":"did X"}"#]
+    );
+    assert_eq!(
+        std::fs::read_to_string(checkout.0.join("work-count")).unwrap(),
         "work\n"
     );
 }
@@ -392,7 +632,7 @@ fn paused_and_capacity_waits_are_local_and_transition_bounded() {
 
 #[cfg(unix)]
 #[test]
-fn report_repair_cannot_modify_an_already_dirty_candidate() {
+fn malformed_report_retains_dirty_candidate_without_a_repair_launch() {
     let _env = crate::infrastructure::agents::invocation::smoke_ai_env_lock()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -429,7 +669,7 @@ if prompt.startswith('Repair only'):
  pathlib.Path('file').write_text('unauthorized repair edit')
 else:
  pathlib.Path('file').write_text('legitimate quality correction')
- result['artifacts']={}
+ result.pop('outcome')
 print(json.dumps(result))
 "#,
     );
@@ -440,11 +680,266 @@ print(json.dumps(result))
     service.save_invocation(&invocation).unwrap();
     let completed = service.execute(&invocation.id, || Ok(())).unwrap();
     assert_eq!(completed.state, InvocationState::Error);
-    assert_eq!(completed.attempts.len(), 2);
-    assert_eq!(completed.attempts[1]["observational_violation"], true);
+    assert_eq!(completed.attempts.len(), 1);
     assert_eq!(
         std::fs::read_to_string(target.join("file")).unwrap(),
-        "unauthorized repair edit"
+        "legitimate quality correction"
     );
     assert_eq!(index_before, git(&["write-tree"]));
+}
+
+#[test]
+fn interrupted_launch_without_receipt_does_not_invoke_provider_again() {
+    let fixture = Fixture::new();
+    let service = fixture.service();
+    let mut invocation = prepared(&fixture, "workflow.plan.enter");
+    let binding = invocation.bindings[0].clone();
+    invocation.context.metadata.insert(
+        "started_bindings".into(),
+        json!({binding.binding.id.clone(): "2026-09-11T00:00:00Z"}),
+    );
+    service.save_invocation(&invocation).unwrap();
+    let contract = result_contract(&invocation.id, &binding.binding.id, &binding.skill.role);
+    let error = super::super::completion::run(
+        &service,
+        &mut invocation,
+        &binding,
+        "must not launch",
+        &contract,
+        &Default::default(),
+        Some(10),
+        true,
+        &|| Ok(()),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("interrupted without a completion receipt"),
+        "{error}"
+    );
+    assert!(
+        service
+            .invocation(&invocation.id)
+            .unwrap()
+            .attempts
+            .is_empty()
+    );
+}
+
+#[test]
+fn every_workflow_role_uses_the_agent_decision_without_required_supporting_fields() {
+    for role in ["plan", "implement", "quality", "governance"] {
+        for outcome in ["success", "failure", "error"] {
+            let fixture = Fixture::new();
+            let mut invocation = prepared(&fixture, &format!("workflow.{role}.enter"));
+            let binding = invocation.bindings[0].clone();
+            let result: SkillResult = serde_json::from_value(json!({
+                "invocation_id":invocation.id, "binding_id":binding.binding.id,
+                "role":role, "outcome":outcome
+            }))
+            .unwrap();
+            invocation.results.insert(binding.binding.id, result);
+            invocation.state = execution::aggregate_state(&invocation);
+            assert_eq!(
+                invocation.gate_assessment(),
+                match outcome {
+                    "success" => GateAssessment::Satisfied,
+                    "failure" => GateAssessment::Finding,
+                    _ => GateAssessment::Fault,
+                },
+                "{role}: {outcome}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_and_governance_skills_may_edit_when_their_instructions_authorize_it() {
+    let _env = crate::infrastructure::agents::invocation::smoke_ai_env_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    for role in ["plan", "governance"] {
+        let fixture = Fixture::new();
+        fixture.repository();
+        let _restore = provider(
+            &fixture,
+            r#"
+import json,sys,pathlib
+prompt=' '.join(sys.argv[1:])
+assert 'Do not change Goal state, merge or push.' not in prompt
+assert 'This invocation is observational' not in prompt
+assert 'Use supported Refine commands for Goal changes.' in prompt
+result=json.JSONDecoder().raw_decode(prompt.split('Refine completion contract (supplied by the system):\n',1)[1])[0]
+pathlib.Path('authorized-edit.txt').write_text('Skill-authorized change\n')
+result['outcome']='success'
+print(json.dumps(result))
+"#,
+        );
+        let service = fixture.service();
+        let work = crate::application::work_items::FileWorkItemService::new(&service.refine_dir);
+        work.create_goal_summary("Skill-authorized work", Some("GOAL1"))
+            .unwrap();
+        work.append_goal_round_summary("GOAL1", "test", "Edit the requested file")
+            .unwrap();
+        let git = FileGitWorktreeService::new(&fixture.0);
+        let base = git.resolve_commit("HEAD").unwrap();
+        let branch = "refine/GOAL1/round-1";
+        let workspace = git.managed_worktree_path(branch).unwrap();
+        git.ensure_worktree_from_base(branch, &workspace, &base)
+            .unwrap();
+        work.update_goal_git_refs("GOAL1", branch, "main", &base, Some(&base))
+            .unwrap();
+        let mut invocation = prepared(&fixture, &format!("workflow.{role}.enter"));
+        invocation.context.cwd = workspace.clone();
+        invocation.context.workspace = Some(
+            crate::infrastructure::git::worktrees::ManagedWorktree {
+                repository: fixture.0.clone(),
+                path: workspace.clone(),
+                branch: branch.into(),
+                commit: None,
+                allow_rebase: false,
+                registration: None,
+            }
+            .pin()
+            .unwrap(),
+        );
+        invocation.context.candidate_commit = Some(base);
+        invocation.context.goal_id = Some("GOAL1".into());
+        invocation.context.round_idx = Some(0);
+        invocation.bindings[0].skill.prompt =
+            "Edit authorized-edit.txt as needed, then report your decision.".into();
+        service.save_invocation(&invocation).unwrap();
+        let completed = service.execute(&invocation.id, || Ok(())).unwrap();
+        assert_eq!(completed.state, InvocationState::Succeeded, "{completed:?}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("authorized-edit.txt")).unwrap(),
+            "Skill-authorized change\n"
+        );
+        assert_eq!(completed.attempts[0]["observational_violation"], false);
+        assert!(
+            super::super::completion::accepted_tree(&completed, &completed.bindings[0].binding.id)
+                .is_some()
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn admitted_workflow_continues_interrupted_work_once_in_the_same_round() {
+    let _env = crate::infrastructure::agents::invocation::smoke_ai_env_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let fixture = Fixture::new();
+    fixture.repository();
+    let _restore = provider(
+        &fixture,
+        r#"
+import json,sys,pathlib
+prompt=' '.join(sys.argv[1:])
+assert 'Previous execution was interrupted' in prompt
+result=json.JSONDecoder().raw_decode(prompt.split('Refine completion contract (supplied by the system):\n',1)[1])[0]
+with pathlib.Path('work-count').open('a') as f: f.write('work\n')
+print(json.dumps(result))
+"#,
+    );
+    let service = fixture.service();
+    let items = crate::application::work_items::FileWorkItemService::new(&service.refine_dir);
+    items
+        .create_goal_summary("Continue", Some("GOAL1"))
+        .unwrap();
+    items
+        .append_goal_round_summary("GOAL1", "Human", "Retain existing work")
+        .unwrap();
+    items
+        .set_goal_status_unchecked("GOAL1", &crate::model::workflow::GoalStatus::Plan)
+        .unwrap();
+    let git = FileGitWorktreeService::new(&fixture.0);
+    let branch = "refine/GOAL1/round-1";
+    let base = git.resolve_commit("main").unwrap();
+    let cwd = git
+        .ensure_worktree_from_base(branch, &git.managed_worktree_path(branch).unwrap(), &base)
+        .unwrap();
+    items
+        .update_goal_git_refs("GOAL1", branch, "main", &base, None)
+        .unwrap();
+    let goal = items.show_goal_detail("GOAL1").unwrap();
+    let mut invocation = service
+        .prepare(
+            "workflow.plan.enter",
+            InvocationContext {
+                node_id: "default".into(),
+                target_root: fixture.0.clone(),
+                cwd: cwd.clone().into(),
+                workspace: None,
+                lifecycle: None,
+                provider: "smoke-ai".into(),
+                goal_id: Some("GOAL1".into()),
+                round_idx: Some(0),
+                workflow_revision: goal["workflow_revision"].as_u64(),
+                candidate_commit: None,
+                data: json!({"goal":goal}),
+                metadata: Default::default(),
+            },
+            Default::default(),
+            "continue-plan",
+        )
+        .unwrap();
+    invocation.state = InvocationState::Running;
+    invocation.context.metadata.insert(
+        "started_bindings".into(),
+        json!({invocation.bindings[0].binding.id.clone():"interrupted"}),
+    );
+    service.save_invocation(&invocation).unwrap();
+    use crate::infrastructure::process::subprocess::{
+        FileProcessSupervisor, ManagedProcessSpec, ProcessOwner, ProcessSupervisor,
+    };
+    let old_owner = FileProcessSupervisor::new(fixture.0.join("runtime/agents"));
+    let old_process = old_owner
+        .launch(ManagedProcessSpec {
+            owner: ProcessOwner::Runner,
+            command: "/bin/sleep".into(),
+            args: vec!["60".into()],
+            cwd: None,
+            env: Vec::new(),
+            stdin: None,
+            limits: None,
+            authorization_command: None,
+            sensitive: false,
+            metadata: serde_json::from_value(json!({
+                "event_invocation_id": invocation.id, "goal_id":"GOAL1",
+                "isolated_process_group":true
+            }))
+            .unwrap(),
+        })
+        .unwrap();
+    let completed = service
+        .execute_with_metadata(&invocation.id, Some(&Default::default()), || Ok(()))
+        .unwrap();
+    assert!(!old_owner.group_pending(&old_process).unwrap());
+    assert_eq!(completed.state, InvocationState::Succeeded, "{completed:?}");
+    assert_eq!(
+        completed.context.metadata["interrupted_launches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(completed.context.round_idx, Some(0));
+    let repeated = service
+        .execute_with_metadata(&invocation.id, Some(&Default::default()), || Ok(()))
+        .unwrap();
+    assert_eq!(repeated, completed);
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&cwd).join("work-count")).unwrap(),
+        "work\n"
+    );
+    assert_eq!(
+        items.show_goal_detail("GOAL1").unwrap()["rounds"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }

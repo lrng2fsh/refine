@@ -165,6 +165,14 @@ impl FileSourcePromotionService {
             ));
         }
 
+        let selected = crate::application::projects::registry::FileProjectRegistryService::new(
+            &self.port_runtime_root,
+            None,
+        )
+        .status()?;
+        let template_root = selected.refine_dir.map(std::path::PathBuf::from);
+        let _templates =
+            crate::application::templates::TemplateScope::for_root(template_root.as_deref())?;
         let prompt = self.agent_prompt(executable, &operation)?;
         let mut metadata = serde_json::Map::new();
         metadata.insert("kind".to_string(), json!("source_upgrade_agent"));
@@ -175,15 +183,17 @@ impl FileSourcePromotionService {
         );
         metadata.insert("operation_id".to_string(), json!(&operation.id));
         metadata.insert("provider".to_string(), json!(provider));
-        let process = match HostAgentProviderService::with_runtime_root(&self.port_runtime_root)
-            .launch_managed(ProviderInvocation {
-                stall_timeout_seconds: None,
-                provider: provider.to_string(),
-                prompt,
-                session_id: None,
-                cwd: Some(snapshot.checkout_path.clone()),
-                process_metadata: metadata,
-            }) {
+        let mut provider_service =
+            HostAgentProviderService::with_runtime_root(&self.port_runtime_root);
+        provider_service.refine_dir = template_root;
+        let process = match provider_service.launch_managed(ProviderInvocation {
+            stall_timeout_seconds: None,
+            provider: provider.to_string(),
+            prompt,
+            session_id: None,
+            cwd: Some(snapshot.checkout_path.clone()),
+            process_metadata: metadata,
+        }) {
             Ok(process) => process,
             Err(error) => {
                 self.fail_agent_operation(
@@ -230,10 +240,14 @@ impl FileSourcePromotionService {
             self.port,
             operation.id
         );
-        Ok(format!(
-            "You are the dedicated Refine source-upgrade Agent for operation {}. Read the complete durable context at {context_path}. You are outside Goal claims and workflow capacity. Inspect evidence and choose the safe sequence yourself. Never run Git, process, installation, service-manager, or lifecycle mutations directly. Invoke the granular typed Refine capabilities below separately, inspect each JSON result, retry observations when safe, and record an explicit recovery choice when evidence blocks promotion. Do not use or look for an aggregate execute command.\n\nAvailable commands:\n{base} inspect\n{base} pause-admission\n{base} observe-work\n{base} refresh-source\n{base} prepare-candidate\n{base} handoff-promotion\n{base} verify-post-restart\n{base} restore-admission\n{base} recover\n\nA safe normal plan inspects, pauses admission, observes until preserved managed work is settled, refreshes and validates source, prepares the candidate handoff, then starts promotion. Dirty or diverged source, restoration errors, and partial identity evidence require using recovery evidence rather than forcing progress. Report only outcomes proven by capability JSON.",
-            operation.id
-        ))
+        crate::application::agent_io::prompts::render(
+            crate::application::agent_io::prompts::PromptTemplate::SourceUpgrade,
+            &[
+                ("operation_id", &operation.id),
+                ("context_path", context_path),
+                ("capability_command", &base),
+            ],
+        )
     }
 
     pub(crate) fn current_operation(

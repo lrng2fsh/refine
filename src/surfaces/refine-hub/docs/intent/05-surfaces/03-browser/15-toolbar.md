@@ -1,0 +1,100 @@
+# Tools (formerly Toolbar)
+
+## Key Ideas
+
+- **Lazy Utility Windows**: the Tools section starts empty and creates a tab only when the user asks for one.
+- **Native Agent Harnesses**: agent interaction uses the configured frontier-lab CLI in a real terminal rather than a Refine-owned chat imitation.
+- **Independent Agents**: every Agent command starts a distinct general-purpose agent session; agents are not coupled to Goal Agent turns or an automatic Supervisor role.
+- **Shared Terminal Surface**: Terminal, Agent, Agent in Worktree, Planning Agent, Goal, and Standalone use one terminal renderer and backend lifecycle.
+- **Recoverable State**: live sessions reattach after navigation or reload without making browser storage the source of process truth.
+
+## Purpose
+
+Tools and agents open as full-height windows selected in the left rail. Switching windows preserves their independent sessions and keeps the underlying main screen mounted. Refine orchestrates agents, workflow, and evidence, while native agent harnesses retain their conversation, tool-call, approval, and rendering UX.
+
+The Tools menu in the left rail offers:
+
+- Agent;
+- Agent in Worktree;
+- System;
+- Files;
+- Terminal;
+- Planning Agent.
+
+Each selection creates or opens only the requested surface. Repeated Agent selections create independent sessions with unique labels such as Agent, Agent 2, and Agent 3. Agent in Worktree and Standalone use isolated Refine worktrees. Goal tabs attach to the workflow-owned Goal Agent already implementing that Goal and never launch a duplicate. Opening a live Goal tab queues a bounded background attachment operation immediately, then waits for the exact runtime session to acknowledge one-way protection from its idle and completion watchdogs before presenting the terminal; an exit, mismatched session, or unavailable acknowledgment fails the operation instead of returning a stale snapshot. This exemption is specific to a workflow Goal Agent opened from the rail and does not change other terminal attachment paths.
+
+## Lifecycle
+
+- a fresh app session starts with no permanent tabs and no active process;
+- a page refresh restores that browser session's explicitly opened tabs and
+  verifies their process state;
+- each tab has a close action;
+- closing an interactive terminal removes its browser tab immediately and asks
+  the backend to stop its managed process without waiting for termination or
+  workflow settlement;
+- a tab whose process already exited or no longer exists closes locally without
+  requiring a successful stop request;
+- closing a Goal Agent tab uses the supported backend stop path, which preserves
+  process settlement, worktree and branch retention, Goal requeue, and audit
+  semantics after the browser surface detaches;
+- acknowledged Goal Agent timeout protection affects only automatic idle and
+  completion termination; valid completion, needs-input, explicit Stop and Goal
+  cancellation, natural exit, transcript capture, and workflow settlement keep
+  their existing authority;
+- when an explicit Stop is already in progress, closing its tab only detaches
+  the browser surface and never sends a duplicate Stop; the original
+  workflow-aware stop settlement continues and any late failure remains visible;
+- stopping an agent keeps the other tool windows interactive, and an
+  authoritative terminal-exit event releases the terminal UI even while
+  workflow stop settlement is still finishing;
+- when explicit cancellation already won, Stop reports the terminal cancelled
+  result and retained worktree evidence instead of promising that the Goal
+  returned to todo;
+- terminal sizing ignores hidden or unmeasurable layouts, retains the last valid
+  geometry, and refits the renderer and managed PTY together after restore,
+  viewport changes and rail collapse;
+- Tools stays in the rail; the former dock resize handle and fullscreen controls are removed;
+- an interrupted browser event stream is not evidence that the managed process exited;
+- terminal state remains tab-specific, including process identifier, provider, current directory, output, and worktree identity;
+- reselecting an Agent, Planning Agent, Goal, or Standalone terminal preserves
+  its session and scrollback while presenting its latest output at the bottom,
+  except while a selection, pending copy, or manual copy recovery is retained;
+  that context defers automatic restart and forced scrolling, including after
+  asynchronous reattachment, while explicit Restart remains available;
+- every Agent terminal receives the resolved active Refine executable and checkout so it can reliably use the correct CLI;
+- normal Agent and Planning Agent toolbar sessions begin with the existing Refine
+  Node, prioritizing investigation, current-Node management, and direct answers;
+- the browser explicitly identifies toolbar-launched terminal sessions, and the
+  shared server never infers toolbar guidance eligibility from an Agent profile;
+- those toolbar agents route requested repository changes into a new complete,
+  eligible Goal rather than implementing outside the workflow;
+- when continuing a failed Goal, those toolbar agents preserve its evidence and
+  retained work and choose a supported recovery action using current context and
+  user authorization: retry the existing Round, redirect, or create a new Round
+  when appropriate. A new Round is not a workaround for stale bookkeeping;
+- changing target apps stops live target-scoped interactive terminals before clearing project-specific browser state.
+
+
+The former automatic and toolbar-specific Supervisor Agent is retired. Upgrade cleanup stops its legacy managed processes and removes its durable session, state, locks, settings, API, and toolbar entry. Refine's process supervisor remains an infrastructure capability and is not an agent profile.
+
+Custom Skills launched from the Skills section or the command palette open their own agent tab, labeled with the Skill name. Parameters are resolved through the shared Skill service before launch. These sessions use the explicit Skill profile, carry no Goal association, and reuse the normal managed terminal lifecycle, transcript, reconnect, and stop controls.
+
+## Boundary
+
+The toolbar exposes shared backend capability. General Agents never directly
+edit durable Goal state, conceal failures, approve or merge for the user,
+destructively discard retained work, or begin ongoing supervision without a
+request. Project Planning is a separate main surface with shared boards.
+The toolbar does not implement workflow transitions, duplicate
+Goal ownership, agent turn scheduling, or an alternate conversation protocol.
+The node-first operating contract applies only to normal Agent and Planning Agent
+toolbar sessions; it does not alter Goal diagnostics, Agent in Worktree, or the
+planning, implementation, Quality, and Governance workflow agents.
+
+Future versions may add fleet-level views for active Goals, pending approvals, process health, Goal evidence, and multiple native agents while retaining lazy creation and explicit lifecycle ownership.
+
+System and Goal log tabs share the flat reader described in [Logs](11-log.md). System tails all application and raw process output only after Start tail; normal system notices continue with tail stopped. Filters distinguish source type from severity. Search reaches retained history, and reading older entries suspends automatic scroll following.
+
+System also shows a compact State sync: Healthy/Unhealthy label, independent of log tailing. It refreshes on connection, reconnection, project/node changes, and health events. Failed, stale, or unavailable health must never appear healthy; the initial read may briefly show Checking. Routine users do not need attempt IDs, timestamps, or diagnostic paths. The System Diagnostics view contains worker health and reasons, count freshness, sync errors, and conflict recovery; these never appear as Dashboard banners or panels. Connection diagnostics enter the normal System event stream without global alerts.
+
+Conflict recovery loads a read-only preview with both heads and per-path summaries. Authority is never preselected. Choosing live or remote, selecting path exceptions, and confirming the exact reviewed divergence remain separate deliberate actions. Changed divergence invalidates confirmation; stale previews require a fresh read. Successful recovery retains its result while health refreshes. Project/node changes fence late responses and reset decisions; navigating between pages does not discard the System tool's recovery context.

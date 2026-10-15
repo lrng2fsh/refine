@@ -67,17 +67,7 @@ pub(in crate::surfaces::web_server) fn configured_provider_from_settings(
                     .map(str::to_string)
             })
         })
-        .or_else(|| {
-            provider_status_value().ok().and_then(|status| {
-                status
-                    .get("selected_provider")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|provider| !provider.is_empty())
-                    .map(str::to_string)
-            })
-        })
-        .unwrap_or_else(|| "claude".to_string())
+        .unwrap_or_default()
 }
 
 pub(super) fn dashboard_attention_items(
@@ -85,6 +75,7 @@ pub(super) fn dashboard_attention_items(
     runner_reachable: bool,
     workflow_paused: bool,
     state_sync_health: Option<&crate::application::persistence_sync::health::StateSyncHealth>,
+    workflow_health: Option<&Value>,
 ) -> Vec<Value> {
     let mut items = indicators
         .iter()
@@ -123,10 +114,26 @@ pub(super) fn dashboard_attention_items(
             "message": "Workflow is paused."
         }));
     } else if !runner_reachable {
+        let reason = workflow_health
+            .and_then(|health| health.get("reason"))
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.trim().is_empty());
+        let message = match reason {
+            Some(reason) => {
+                let state = workflow_health
+                    .and_then(|health| health["state"].as_str())
+                    .unwrap_or("unavailable");
+                format!("Workflow worker unavailable ({state}): {reason}")
+            }
+            None => {
+                "Refine cannot reach the runtime worker. Check runtime status for details.".into()
+            }
+        };
         items.push(json!({
             "kind": "banner",
             "severity": "error",
-            "message": "Refine cannot reach the runtime worker. Re-check auth after restoring provider access."
+            "message": message,
+            "workflow_health": workflow_health
         }));
     }
     items
@@ -189,7 +196,9 @@ impl crate::application::agent_io::structured_output::Contract for TargetAppConf
     }
 }
 
-fn target_app_generation_prompt(target_root: &std::path::Path) -> String {
+fn target_app_generation_prompt(
+    target_root: &std::path::Path,
+) -> crate::error::RefineResult<String> {
     let target_root = target_root.display().to_string();
     let target_app_contract =
         <TargetAppConfigContract as crate::application::agent_io::structured_output::Contract>::contract_json();

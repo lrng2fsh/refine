@@ -51,22 +51,26 @@ impl FileTargetAppService {
             "target_root".to_string(),
             Value::String(self.target_root.display().to_string()),
         );
-        let provider = setting(settings, "agent_cli")
-            .trim()
-            .to_string()
-            .if_empty("claude");
+        let provider = setting(settings, "agent_cli").trim().to_string();
         let cwd = self.command_cwd(settings);
-        let prompt =
-            target_app_lifecycle_prompt(kind, instructions, settings, &self.target_root, &cwd);
-        let result = HostAgentProviderService::with_runtime_root(self.runtime_root.join("agents"))
-            .invoke(ProviderInvocation {
-                stall_timeout_seconds: None,
-                provider,
-                prompt,
-                session_id: None,
-                cwd: Some(cwd.display().to_string()),
-                process_metadata,
-            });
+        let result = (|| -> RefineResult<String> {
+            let _templates = crate::application::templates::TemplateScope::pin(
+                Some(&self.refine_dir),
+                &mut process_metadata,
+            )?;
+            let prompt =
+                target_app_lifecycle_prompt(kind, instructions, settings, &self.target_root, &cwd)?;
+            HostAgentProviderService::with_runtime_root(self.runtime_root.join("agents"))
+                .with_refine_dir(&self.refine_dir)
+                .invoke(ProviderInvocation {
+                    stall_timeout_seconds: None,
+                    provider,
+                    prompt,
+                    session_id: None,
+                    cwd: Some(cwd.display().to_string()),
+                    process_metadata,
+                })
+        })();
         match result {
             Ok(output) => TargetAppOperation {
                 id: new_operation_id(&format!("target-{kind}")),

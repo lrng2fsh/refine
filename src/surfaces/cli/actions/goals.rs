@@ -5,6 +5,9 @@ pub enum GoalAction {
     /// Create a new prompt-driven Goal.
     /// It starts in the backlog; add a round to describe the behavior, then `goal start` to begin work.
     Create {
+        /// Initial capture step. Execution must be explicitly released.
+        #[arg(long, default_value = "backlog", value_parser = ["draft", "backlog"])]
+        status: String,
         /// Human-readable Goal name.
         name: String,
         #[cfg_attr(test, arg(long, hide = true))]
@@ -123,6 +126,19 @@ pub enum GoalAction {
         /// Edit the most recent round instead of appending a new one.
         #[arg(long)]
         edit_latest: bool,
+    },
+    /// Delete a Round and its records, stop current work, and park the Goal in backlog.
+    RoundDelete {
+        id: String,
+        /// One-based Round number shown in the Goal modal.
+        #[arg(value_parser = clap::value_parser!(u64).range(1..))]
+        round: u64,
+        #[cfg_attr(test, arg(long, hide = true))]
+        #[cfg_attr(not(test), arg(skip = None))]
+        target_root: Option<PathBuf>,
+        /// Reject deletion if the Goal changed since this revision was inspected.
+        #[arg(long)]
+        expected_revision: Option<u64>,
     },
     /// Queue a Goal for the agent workflow: moves backlog work to todo so automation can start it.
     Start {

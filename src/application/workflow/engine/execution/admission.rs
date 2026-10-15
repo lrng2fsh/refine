@@ -1,6 +1,13 @@
 use super::*;
 
 impl WorkflowEngine {
+    pub(super) fn scheduling_generation(&self, goal_id: &str) -> RefineResult<u64> {
+        let root = self
+            .refine_dir()?
+            .ok_or_else(|| RefineError::InvalidInput("Missing workflow target".into()))?;
+        let goal = FileWorkItemService::new(root).show_goal_detail(goal_id)?;
+        Ok(goal["event_generation"].as_u64().unwrap_or(0))
+    }
     pub(super) fn target_still_attached(
         &self,
         registry: Option<&std::path::Path>,
@@ -33,6 +40,15 @@ impl WorkflowEngine {
                 prepare_refine_dir(target)?,
                 &self.runtime_root,
             );
+            if !self.workflow_paused()? {
+                crate::application::planning::FilePlanningService::new(
+                    prepare_refine_dir(target)?,
+                    target,
+                    &self.runtime_root,
+                )?
+                .process_pending()?;
+            }
+            events.dispatch_outcomes(target)?;
             if let Err(error) = events.dispatch_goal_events(target) {
                 eprintln!("refine Goal event materialization: {error}");
             }
@@ -70,7 +86,7 @@ impl WorkflowEngine {
         )
     }
 
-    pub(super) fn launchable_goals(&self, active: &BTreeSet<String>) -> RefineResult<Vec<String>> {
+    pub(crate) fn launchable_goals(&self, active: &BTreeSet<String>) -> RefineResult<Vec<String>> {
         let target_root = self.target_root.as_ref().ok_or_else(|| {
             RefineError::InvalidInput(
                 "target root is required to execute workflow work".to_string(),
@@ -80,7 +96,6 @@ impl WorkflowEngine {
         ActiveGoalIndex::ensure_built(&refine_dir)?;
         let index = ActiveGoalIndex::load_or_rebuild(&refine_dir)?;
         let policy = self.policy()?;
-        let events = crate::application::events::FileEventService::new(&refine_dir);
         let items = FileWorkItemService::new(&refine_dir);
         let mut observed = BTreeSet::new();
         for root in [self.runtime_root.clone(), self.runtime_root.join("agents")] {
@@ -104,16 +119,6 @@ impl WorkflowEngine {
         let mut goals = index
             .goals()
             .filter(|goal| {
-                matches!(
-                    goal.status,
-                    GoalStatus::Todo
-                        | GoalStatus::Plan
-                        | GoalStatus::Implement
-                        | GoalStatus::Governance
-                        | GoalStatus::Quality
-                )
-            })
-            .filter(|goal| {
                 crate::application::fleet::nodes::node_ids_match(
                     goal.node_id.as_deref().unwrap_or("default"),
                     &policy.active_node_id,
@@ -121,9 +126,6 @@ impl WorkflowEngine {
             })
             .filter(|goal| goal.round_count > 0)
             .filter(|goal| !active.contains(&goal.id) && !observed.contains(&goal.id))
-            .filter(|goal| !self.retry_delayed(&goal.id))
-            .filter(|goal| eligibility.feature_eligible(&goal.id))
-            .filter(|goal| eligibility.priority_eligible(goal))
             .cloned()
             .collect::<Vec<_>>();
         goals.sort_by(|a, b| {
@@ -136,15 +138,16 @@ impl WorkflowEngine {
         let mut load = self.observed_execution_load()?;
         let mut result = Vec::new();
         for goal in goals {
-            if goal.status == GoalStatus::Todo
-                && events
-                    .missing_workflow_requirement(
-                        &items.show_goal_detail(&goal.id)?,
-                        &policy.active_node_id,
-                    )?
-                    .is_some()
-            {
-                continue;
+            let assessment = items.show_goal_detail(&goal.id).and_then(|detail| {
+                self.workflow_blocking_reason(&goal, &detail, &eligibility, &policy.active_node_id)
+            });
+            match assessment {
+                Ok(None) => {}
+                Ok(Some(_)) => continue,
+                Err(error) => {
+                    eprintln!("refine Goal admission: {} needs recovery: {error}", goal.id);
+                    continue;
+                }
             }
             if !load.available(
                 &policy,

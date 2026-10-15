@@ -187,10 +187,24 @@ impl InProcessWebServer {
                     self.runtime_root.as_deref(),
                     body,
                 );
-                match self.agent_provider_service().invoke(ProviderInvocation {
+                let _templates =
+                    match crate::application::templates::TemplateScope::for_root(Some(&refine_dir))
+                    {
+                        Ok(scope) => scope,
+                        Err(error) => return error_response(error),
+                    };
+                let prompt = match target_app_generation_prompt(&service.target_root) {
+                    Ok(prompt) => prompt,
+                    Err(error) => return error_response(error),
+                };
+                match (match self.agent_provider_service() {
+                    Ok(service) => service,
+                    Err(error) => return error_response(error),
+                })
+                .invoke(ProviderInvocation {
                     stall_timeout_seconds: None,
                     provider: provider.clone(),
-                    prompt: target_app_generation_prompt(&service.target_root),
+                    prompt,
                     session_id: None,
                     cwd: Some(service.target_root.display().to_string()),
                     process_metadata: Default::default(),
@@ -218,9 +232,6 @@ impl InProcessWebServer {
                         Ok(Some(refine_dir)) => {
                             if let Err(error) = self.settings_service(&refine_dir).update(&settings)
                             {
-                                return error_response(error);
-                            }
-                            if let Err(error) = self.apply_current_runtime_settings() {
                                 return error_response(error);
                             }
                         }

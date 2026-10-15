@@ -19,7 +19,7 @@ pub fn commands_catalog() -> Value {
         "commands": subcommand_values(&command),
         "hints": {
             "next": "Run `refine next` for state-aware suggestions of what to do now.",
-            "runbooks": "Task-oriented guides live in docs/runbooks/.",
+            "runbooks": "Task-oriented guides live in src/surfaces/refine-hub/docs/runbooks/.",
             "api": "Discover daemon HTTP route groups and required capabilities with `refine system api-groups`."
         }
     })
@@ -205,46 +205,38 @@ mod tests {
     }
 
     #[test]
-    fn catalog_lists_the_complete_todo_command_family() {
+    fn catalog_lists_shared_planning_and_hides_retired_todo_commands() {
         let catalog = commands_catalog();
-        let todo = catalog["commands"]
-            .as_array()
-            .unwrap()
+        let commands = catalog["commands"].as_array().unwrap();
+        assert!(!commands.iter().any(|command| command["name"] == "todo"));
+        let planning = commands
             .iter()
-            .find(|command| command["name"] == "todo")
-            .expect("todo command present");
-        let names: Vec<&str> = todo["subcommands"]
-            .as_array()
-            .unwrap()
+            .find(|command| command["name"] == "planning")
+            .unwrap();
+        let subcommands = planning["subcommands"].as_array().unwrap();
+        let names: Vec<_> = subcommands
             .iter()
-            .map(|subcommand| subcommand["name"].as_str().unwrap())
+            .map(|command| command["name"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            names,
-            [
-                "list",
-                "create-list",
-                "rename-list",
-                "delete-list",
-                "add",
-                "edit",
-                "delete",
-                "done",
-                "undo"
-            ]
+        assert_eq!(names, ["list", "action", "cancel", "apply"]);
+        let apply = subcommands
+            .iter()
+            .find(|command| command["name"] == "apply")
+            .unwrap();
+        assert!(
+            apply["arguments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|argument| argument["name"] == "request_id" && argument["required"] == true)
         );
-        for subcommand in todo["subcommands"].as_array().unwrap() {
-            assert!(
-                subcommand["arguments"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|argument| {
-                        argument["name"] == "reporter" && argument["required"] == true
-                    }),
-                "missing required Reporter context: {subcommand:#}"
-            );
-        }
+        assert!(
+            !apply["arguments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|argument| argument["name"] == "reporter")
+        );
     }
 
     #[test]
@@ -285,7 +277,7 @@ mod tests {
     #[test]
     fn operational_runbooks_use_current_cli_and_layout_contracts() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let runbooks_dir = root.join("docs/runbooks");
+        let runbooks_dir = root.join("src/surfaces/refine-hub/docs/runbooks");
         let mut paths = fs::read_dir(&runbooks_dir)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -294,7 +286,9 @@ mod tests {
         paths.sort();
 
         let cli = Cli::command();
-        let index = fs::read_to_string(root.join("docs/runbooks/README.md")).unwrap();
+        let index =
+            fs::read_to_string(root.join("src/surfaces/refine-hub/docs/runbooks/README.md"))
+                .unwrap();
         let mut all = String::new();
         for path in paths {
             let document = fs::read_to_string(&path).unwrap();
@@ -306,7 +300,7 @@ mod tests {
                 let file_name = path.file_name().unwrap().to_string_lossy();
                 assert!(
                     index.contains(&format!("({file_name})")),
-                    "docs/runbooks/README.md does not list {file_name}"
+                    "src/surfaces/refine-hub/docs/runbooks/README.md does not list {file_name}"
                 );
             }
             all.push_str(&document);

@@ -195,7 +195,9 @@ impl FileReleaseService {
         let name = format!("Prepare {}", plan.proposed_tag);
         let goal = work_items.create_goal_summary(&name, None)?;
         let goal_id = goal.goal.id.clone();
-        let prompt = release_goal_prompt(plan);
+        let _templates =
+            crate::application::templates::TemplateScope::for_root(Some(&work_items.refine_dir))?;
+        let prompt = release_goal_prompt(plan)?;
         if let Err(error) = work_items
             .append_goal_round_summary(&goal_id, "Release workflow", &prompt)
             .and_then(|_| work_items.start_goal_workflow(&goal_id))
@@ -285,6 +287,19 @@ impl FileReleaseService {
                     ))
                 })
         };
+        let hub_notes = format!(
+            "src/surfaces/refine-hub/releases/{}.md",
+            plan.proposed_version
+        );
+        let legacy_hub_notes = format!("refine-hub/releases/{}.md", plan.proposed_version);
+        // Retain the notes path chosen during preparation, including pre-Hub releases.
+        let release_notes = if plan.documentation_files.contains(&hub_notes) {
+            hub_notes
+        } else if plan.documentation_files.contains(&legacy_hub_notes) {
+            legacy_hub_notes
+        } else {
+            "RELEASE_NOTES.md".to_string()
+        };
         Ok(TrustedPreparation {
             preparation_id: preparation_id.to_string(),
             goal_id: goal_id.clone(),
@@ -293,7 +308,7 @@ impl FileReleaseService {
             branch: required("branch_name")?,
             target_branch: required("target_branch")?,
             candidate_commit: required("candidate_commit")?,
-            release_notes: "RELEASE_NOTES.md".to_string(),
+            release_notes,
         })
     }
 
